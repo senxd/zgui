@@ -12,10 +12,18 @@ r = a.results
 summary = json.loads((r / 'summary.json').read_text())
 audit = json.loads((r / 'audit.json').read_text())
 trials = list(csv.DictReader((r / 'current.csv').open()))
-frameworks, modes = ['zgui', 'gpui', 'quickgui'], ['idle', 'stream', 'scroll', 'both']
+scene = audit.get('scene', 'lab')
+assert scene in ('lab', 'heavy')
+frameworks = audit['protocol'].get('frameworks', ['zgui', 'gpui', 'quickgui'])
+assert frameworks == (['zgui', 'gpui'] if scene == 'heavy' else ['zgui', 'gpui', 'quickgui'])
+modes = ['idle', 'stream', 'scroll', 'both']
+assert audit['protocol']['requested_seconds'] == 20 and audit['protocol']['repeats'] == 3
 assert audit['accepted'], 'only accepted runs are published'
-assert len(trials) == 36 and len(summary['groups']) == 12
+assert len(trials) == audit['trials'] == len(frameworks) * 12
+assert len(summary['groups']) == len(frameworks) * 4
+assert {(g['framework'], g['mode']) for g in summary['groups']} == {(f, m) for f in frameworks for m in modes}
 assert {(t['framework'], t['mode'], int(t['repeat'])) for t in trials} == {(f, m, n) for f in frameworks for m in modes for n in range(3)}
+assert all(int(t['exit_code']) == 0 or t['terminated_after_report'].lower() == 'true' for t in trials)
 # Recompute every published aggregate from the trials.
 for group in summary['groups']:
     rows = [t for t in trials if (t['framework'], t['mode']) == (group['framework'], group['mode'])]
@@ -40,6 +48,8 @@ env = audit['environment']
 metadata = {
     'date': audit['started_utc'][:10],
     'commit': audit['commit'],
+    'scene': scene,
+    'source_dirty': audit.get('source_dirty', False),
     'trials': audit['trials'],
     'samples': audit['samples'],
     'updates': audit['active_ticks_per_requested_second'],
@@ -47,10 +57,13 @@ metadata = {
     'host_note': 'A personal Mac in use: other applications kept running, so this host was not isolated.',
     'memory': 'Physical footprint (as Activity Monitor reports it: resident memory plus GPU memory the process owns on unified memory); resident size also recorded.',
     'protocol': audit['protocol'],
-    'frameworks': {'gpui': '0.2.2', 'quickgui': '811d6e2816d5229711f59683c4c9dfbb6fc74133', 'zgui': audit['commit']},
+    'frameworks': {f: {'gpui': '0.2.2', 'quickgui': '811d6e2816d5229711f59683c4c9dfbb6fc74133', 'zgui': audit['commit']}[f] for f in frameworks},
     'csv_sha256': hashlib.sha256((a.output / 'data.csv').read_bytes()).hexdigest(),
     'source_csv_sha256': hashlib.sha256((r / 'current.csv').read_bytes()).hexdigest(),
     'binaries': audit['binaries'],
 }
+if scene == 'heavy':
+    metadata['excluded_frameworks'] = {'quickgui': 'Adapter panicked at startup: text renderer batch index 32 exceeded its 32-batch pool.'}
+    metadata['source_note'] = 'Measured working tree based on 92fd6a4, before adapters were committed. The original diff hash omitted untracked adapter files; their hashes are documented separately in the result README. This is not a clean-commit measurement.'
 (a.output / 'measurement.json').write_text(json.dumps(metadata, indent=2) + '\n')
 print('Prepared accepted macOS results for', metadata['commit'])

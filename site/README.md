@@ -26,3 +26,17 @@ an awake Mac with nothing covering the windows:
     python3 scripts/build_macos_site.py docs/results/latest-macos-<date>-<commit>
 
 The builder publishes only accepted runs and recomputes every aggregate.
+
+## macOS heavy dashboard
+
+`site/macos-heavy` is a separate dataset, selected with `#macos-heavy`. It
+contains 24 accepted trials of zgui and GPUI on the heavy dashboard, not the
+three-framework lab scene. QuickGUI's heavy adapter panicked at startup and
+is excluded rather than represented by zero. The UI uses physical footprint
+and derives its chart and table frameworks from the selected data.
+
+Evidence: `docs/results/latest-macos-heavy-2026-09-27-92fd6a4`. The measurement
+was made on dirty source based on parent `92fd6a4`; the dashboard and download
+record preserve that distinction and the source-provenance limitation.
+Do not label that parent as the clean measured revision. The lab and heavy
+scenes remain separately selectable and should not be compared directly.
