@@ -87,7 +87,9 @@ ZGUI_MODE=both ZGUI_SECONDS=10 cargo run --release -p zgui-desktop --example com
 ZGUI_MODE=idle ZGUI_SECONDS=0 cargo run --release -p zgui-desktop --example component_workload
 ```
 
-The component workload uses the native GPU host and owned declarative views. `ZGUI_MODE` accepts `idle`, `stream`, `scroll`, or `both`; zero seconds keeps the window open. The older `zgui-demo` executable remains available for low-level renderer diagnostics, including `ZGUI_RENDERER=software` and display-free `--headless` checks.
+The component workload uses the native GPU host and owned declarative views. `ZGUI_MODE` accepts `idle`, `stream`, `scroll`, or `both`; zero seconds keeps the window open.
+
+A heavier scene, `heavy_workload` (with a GPUI adapter), is a 1280×800 live dashboard where most content changes every tick: 30 cards with scrolling sparklines, stat tiles, a scrolling 100,000-row status table and a streaming log. On an M5 Max, zgui used 45–47% less CPU than GPUI with live data and 70% less while scrolling, and 25–33 MiB more memory ([results](docs/results/latest-macos-heavy-2026-09-27-92fd6a4/README.md); `python3 scripts/run_macos_comparison.py --scene heavy`). The older `zgui-demo` executable remains available for low-level renderer diagnostics, including `ZGUI_RENDERER=software` and display-free `--headless` checks.
 
 See [benchmark commands and methodology](docs/benchmarking.md). The
 [parity-expansion comparison](docs/results/gpui-parity-workers4/README.md) records

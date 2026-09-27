@@ -9,8 +9,13 @@ is sampled two ways: resident size, and physical footprint (what Activity
 Monitor reports, including GPU memory the process owns on unified memory).
 Active trials must deliver 58-61 logical updates per requested second.
 
+`--scene heavy` runs the heavy dashboard instead (zgui_workload::heavy): a
+1280x800 window where most content changes every tick, for zgui and GPUI
+(QuickGUI's text renderer panics past 32 text batches on it).
+
 Windows open on screen: keep the Mac awake and the windows uncovered (a
-covered window may stop presenting). Writes docs/results/latest-macos-<date>-<commit>.
+covered window may stop presenting). Writes
+docs/results/latest-macos[-heavy]-<date>-<commit>.
 """
 import argparse, csv, datetime, hashlib, json, os, platform, re, signal, statistics, subprocess, time
 from pathlib import Path
@@ -19,11 +24,18 @@ ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORKS = ['zgui', 'gpui', 'quickgui']
 MODES = ['idle', 'stream', 'scroll', 'both']
 REQUESTED, WARMUP, SAMPLED, INTERVAL = 20, 5, 15, 0.05
-BINARIES = {
-    'zgui': ROOT / 'target/release/examples/component_workload',
-    'gpui': ROOT / 'comparisons/gpui/target/release/zgui-compare-gpui',
-    'quickgui': ROOT / 'comparisons/quickgui/target/release/zgui-compare-quickgui',
+SCENES = {
+    'lab': {
+        'zgui': ROOT / 'target/release/examples/component_workload',
+        'gpui': ROOT / 'comparisons/gpui/target/release/zgui-compare-gpui',
+        'quickgui': ROOT / 'comparisons/quickgui/target/release/zgui-compare-quickgui',
+    },
+    'heavy': {
+        'zgui': ROOT / 'target/release/examples/heavy_workload',
+        'gpui': ROOT / 'comparisons/gpui/target/release/heavy',
+    },
 }
+BINARIES = SCENES['lab']
 
 
 def run(cmd, **kw):
@@ -31,8 +43,9 @@ def run(cmd, **kw):
 
 
 def build(sampler):
-    run(['cargo', 'build', '--release', '--locked', '-p', 'zgui-desktop', '--example', 'component_workload'], cwd=ROOT)
-    for name in ['gpui', 'quickgui']:
+    example = BINARIES['zgui'].name
+    run(['cargo', 'build', '--release', '--locked', '-p', 'zgui-desktop', '--example', example], cwd=ROOT)
+    for name in FRAMEWORKS[1:]:
         run(['cargo', 'build', '--release', '--locked'], cwd=ROOT / 'comparisons' / name)
     run(['swiftc', '-O', str(ROOT / 'scripts/macsample.swift'), '-o', str(sampler)])
 
@@ -77,16 +90,30 @@ def trial(framework, mode, repeat, sampler, out):
     return row
 
 
+def source_diff_sha256():
+    """The uncommitted source: tracked changes and untracked files."""
+    paths = ['crates', 'comparisons', 'scripts']
+    digest = hashlib.sha256(run(['git', 'diff', 'HEAD', '--', *paths], cwd=ROOT).encode())
+    for path in sorted(run(['git', 'ls-files', '--others', '--exclude-standard', '--', *paths], cwd=ROOT).split()):
+        digest.update(path.encode() + b'\0' + (ROOT / path).read_bytes())
+    return digest.hexdigest()
+
+
 def main():
+    global BINARIES, FRAMEWORKS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--skip-build', action='store_true')
+    parser.add_argument('--scene', choices=sorted(SCENES), default='lab')
     args = parser.parse_args()
+    BINARIES = SCENES[args.scene]
+    FRAMEWORKS = list(BINARIES)
     sampler = Path('/tmp/zgui-macsample')
     if not args.skip_build:
         build(sampler)
     commit = run(['git', 'rev-parse', 'HEAD'], cwd=ROOT)
     started = datetime.datetime.now(datetime.timezone.utc)
-    out = ROOT / 'docs/results' / f'latest-macos-{started:%Y-%m-%d}-{commit[:7]}'
+    scene = '' if args.scene == 'lab' else f'-{args.scene}'
+    out = ROOT / 'docs/results' / f'latest-macos{scene}-{started:%Y-%m-%d}-{commit[:7]}'
     out.mkdir(parents=True, exist_ok=True)
     rows = []
     for repeat in range(3):
@@ -123,10 +150,14 @@ def main():
                 for name, path in BINARIES.items()}
     audit = {'accepted': accepted, 'trials': len(rows), 'samples': sum(r['samples'] for r in rows),
              'active_ticks_per_requested_second': {'min': min(active), 'max': max(active)},
-             'commit': commit, 'started_utc': started.isoformat(), 'finished_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             'scene': args.scene, 'commit': commit,
+             # Uncommitted source changes the binaries were built with, if any.
+             'source_dirty': bool(run(['git', 'status', '--porcelain', '--', 'crates', 'comparisons', 'scripts'], cwd=ROOT)),
+             'source_diff_sha256': source_diff_sha256(),
+             'started_utc': started.isoformat(), 'finished_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
              'environment': environment(), 'binaries': binaries,
              'protocol': {'requested_seconds': REQUESTED, 'warmup_seconds': WARMUP, 'sampled_seconds': SAMPLED,
-                          'interval_seconds': INTERVAL, 'repeats': 3, 'acceptance_updates_per_second': [58, 61]}}
+                          'interval_seconds': INTERVAL, 'repeats': 3, 'frameworks': FRAMEWORKS, 'acceptance_updates_per_second': [58, 61]}}
     (out / 'audit.json').write_text(json.dumps(audit, indent=1) + '\n')
     print(('ACCEPTED' if accepted else 'REJECTED'), out)
 
