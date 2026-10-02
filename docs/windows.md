@@ -21,6 +21,17 @@ The returned `Arc<winit::window::Window>` exposes current size, scale, and raw
 window handles; retaining it prolongs the native window lifetime, so release it
 when the integration is detached. `cx.native_window()` is a convenience accessor.
 
+For a foreign native event loop such as Chromium Embedded Framework, call
+`Application::run_with_pump(pump, build)` instead of invoking its pump from a UI
+task. On Windows the callback runs before native message dispatch while winit's
+application handler is installed and idle. A nested pump inside an application
+callback can repeatedly consume paints that winit defers, preventing the pump
+from ever reaching idle. An outer `pump_app_events` loop alone is also unsuitable:
+winit removes its handler between calls. Arrange periodic wakeups while idle,
+for example a UI task awaiting a 10 ms timer, to keep the foreign loop advancing.
+`cargo run -p zgui-desktop --example native_message_pump --locked` checks the
+native callback and shutdown path. This probe ran successfully on Windows.
+
 ## Limitations
 
 - `Application::application_id` opts into OS activation callbacks, which are not
