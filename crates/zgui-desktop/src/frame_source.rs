@@ -443,6 +443,8 @@ mod tests {
         assert_eq!(interval_for(None), DEFAULT_INTERVAL);
         assert_eq!(interval_for(Some(0.)), DEFAULT_INTERVAL);
         assert_eq!(interval_for(Some(f64::NAN)), DEFAULT_INTERVAL);
-        assert_eq!(interval_for(Some(120.)), Duration::from_secs_f64(1. / 120.));
+        for hz in [120., 144., 160., 165., 240., 360.] {
+            assert_eq!(interval_for(Some(hz)), Duration::from_secs_f64(1. / hz));
+        }
     }
 }

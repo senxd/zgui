@@ -210,7 +210,7 @@ impl InputDispatcher {
             self.route(scene, drag.source, drag.event(DragPhase::End, accepted));
         }
         if drop {
-            let hovered = self.hit_target(&scene.borrow(), drag.x, drag.y);
+            let hovered = self.hit_target(&scene.borrow(), drag.x, drag.y, false);
             self.state.borrow_mut().hovered = hovered;
             if let Some(hovered) = hovered {
                 self.route(scene, hovered, InputEvent::PointerEnter);

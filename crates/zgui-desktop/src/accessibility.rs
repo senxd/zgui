@@ -64,37 +64,40 @@ impl AccessibilityTree {
         let root = self.id(scene.root());
         let mut children: HashMap<NodeId, Vec<AccessibleId>> = HashMap::new();
         // Scene order, not hash-map iteration order, determines accessible traversal.
-        let ordered: Vec<_> = scene
-            .paint_items()
-            .filter(|p| p.effects.opacity > 0.0)
-            .filter_map(|p| semantics.get(p.id).map(|s| (p.id, s)))
-            .collect();
+        // Paint order already provides world bounds and visits parents first.
+        // Carry semantic ancestry once instead of walking it again for every
+        // descendant on every scrolling frame.
+        let mut ancestry = HashMap::new();
+        let mut parents = HashMap::new();
+        let mut ordered = Vec::new();
+        for item in scene.paint_items().filter(|p| p.effects.opacity > 0.0) {
+            let (parent, blocked) = scene
+                .parent(item.id)
+                .and_then(|parent| ancestry.get(&parent).copied())
+                .unwrap_or((scene.root(), false));
+            let semantic = semantics.get(item.id);
+            let disabled = blocked || semantic.is_some_and(|s| s.disabled);
+            ancestry.insert(
+                item.id,
+                (if semantic.is_some() { item.id } else { parent }, disabled),
+            );
+            if let Some(semantic) = semantic {
+                ordered.push((item.id, semantic, item.bounds, disabled));
+                parents.insert(item.id, parent);
+            }
+        }
         let visible: HashSet<_> = ordered
             .iter()
-            .map(|(id, _)| *id)
+            .map(|(id, ..)| *id)
             .chain(std::iter::once(scene.root()))
             .collect();
         self.ids.retain(|id, _| visible.contains(id));
         self.projection_revisions
             .retain(|id, _| visible.contains(id));
-        let mut parents = HashMap::new();
-        for (id, _) in &ordered {
-            if *id == scene.root() {
-                continue;
-            }
-            let mut parent = scene.parent(*id);
-            while let Some(p) = parent {
-                if visible.contains(&p) {
-                    break;
-                }
-                parent = scene.parent(p);
-            }
-            parents.insert(*id, parent.unwrap_or(scene.root()));
-        }
         // Apply logical ownership without changing physical clipping or bounds.
         // Each accepted edge keeps the graph acyclic; invalid overrides retain
         // their physical parent and never introduce duplicate native children.
-        for (id, semantic) in &ordered {
+        for (id, semantic, ..) in &ordered {
             if *id == scene.root() {
                 continue;
             }
@@ -118,7 +121,7 @@ impl AccessibilityTree {
                 parents.insert(*id, parent);
             }
         }
-        for (id, _) in &ordered {
+        for (id, ..) in &ordered {
             if *id == scene.root() {
                 continue;
             }
@@ -138,16 +141,11 @@ impl AccessibilityTree {
             bounds.height as f64 * scale,
         ));
         nodes.push((root, window));
-        for (id, semantic) in ordered {
+        for (id, semantic, r, disabled) in ordered {
             if id == scene.root() {
                 continue;
             }
             let native = self.id(id);
-            let disabled = semantic.disabled
-                || scene
-                    .ancestors(id)
-                    .any(|ancestor| semantics.get(ancestor).is_some_and(|s| s.disabled));
-            let r = scene.bounds(id);
             let revision = semantics
                 .node_revision(id)
                 .expect("projected semantic node");
@@ -164,8 +162,7 @@ impl AccessibilityTree {
             // have live cached nodes/positions before omitting this projection.
             if self.projection_revisions.get(&id) == Some(&revision)
                 && self.cache.get(&native).is_some_and(|cached| {
-                    cached.bounds() == Some(bounds)
-                        && cached.is_disabled() == disabled
+                    cached.is_disabled() == disabled
                         && cached
                             .children()
                             .iter()
@@ -175,6 +172,15 @@ impl AccessibilityTree {
                     self.cache.contains_key(run) && self.text_positions.contains_key(run)
                 })
             {
+                if let Some(cached) = self
+                    .cache
+                    .get(&native)
+                    .filter(|cached| cached.bounds() != Some(bounds))
+                {
+                    let mut moved = cached.clone();
+                    moved.set_bounds(bounds);
+                    nodes.push((native, moved));
+                }
                 continue;
             }
             let mut n = Node::new(semantic_role(semantic));
@@ -987,6 +993,13 @@ mod projection_key_tests {
         assert_eq!(native.bounds().unwrap().x0, 24.);
         assert_eq!(native.bounds().unwrap().y0, 18.);
         assert_eq!(native.bounds().unwrap().width(), 400.);
+        assert!(native.is_disabled());
+        assert_eq!(native.children(), run_ids.as_slice());
+        assert!(changed.nodes.iter().all(|(id, _)| !run_ids.contains(id)));
+        assert_eq!(
+            native.value(),
+            semantics.get(editor).unwrap().value.as_deref()
+        );
     }
 
     #[test]

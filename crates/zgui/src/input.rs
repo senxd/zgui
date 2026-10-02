@@ -1082,12 +1082,12 @@ impl InputDispatcher {
             focus_changed: old != self.focused(),
         }
     }
-    fn hit_target(&self, scene: &Scene, x: f32, y: f32) -> Option<NodeId> {
+    fn hit_target(&self, scene: &Scene, x: f32, y: f32, scroll: bool) -> Option<NodeId> {
         let mut fallback = None;
         for hit in scene.hit_test_all(x, y) {
             let mut node = Some(hit);
             while let Some(id) = node {
-                if self.options(id).is_some_and(|options| options.disabled) {
+                if !scroll && self.options(id).is_some_and(|options| options.disabled) {
                     return None;
                 }
                 if self.has_listeners(id) {
@@ -1097,7 +1097,14 @@ impl InputDispatcher {
                         fallback = Some(id);
                         break;
                     }
-                    return self.enabled(scene, id).then_some(id);
+                    if self.enabled(scene, id) {
+                        return Some(id);
+                    }
+                    // Disabled controls block activation, but their enabled
+                    // scroll ancestors must still receive wheel input.
+                    if !scroll {
+                        return None;
+                    }
                 }
                 node = scene.parent(id);
             }
@@ -1232,9 +1239,12 @@ impl InputDispatcher {
             | InputEvent::FileHover { x, y, .. }
             | InputEvent::FileDrop { x, y, .. }
             | InputEvent::FilesDrop { x, y, .. }
-            | InputEvent::FilesDropRejected { x, y, .. } => {
-                self.hit_target(&scene.borrow(), *x, *y)
-            }
+            | InputEvent::FilesDropRejected { x, y, .. } => self.hit_target(
+                &scene.borrow(),
+                *x,
+                *y,
+                matches!(event, InputEvent::Scroll { .. }),
+            ),
             _ => None,
         };
         if matches!(event, InputEvent::PointerMove { .. }) {
@@ -1470,6 +1480,88 @@ mod tests {
         );
         s.flush();
         (Rc::new(RefCell::new(s)), a, b)
+    }
+    #[test]
+    fn wheel_over_disabled_controls_reaches_enabled_ancestors() {
+        let (scene, disabled, modal) = setup();
+        let input = InputDispatcher::new();
+        let root = scene.borrow().root();
+        let total = Rc::new(RefCell::new(0.));
+        let output = total.clone();
+        let _scroll = input.register(root, NodeInput::default(), move |cx| {
+            if let InputEvent::Scroll { delta_y, .. } = cx.event {
+                *output.borrow_mut() += delta_y;
+            }
+        });
+        let _disabled = input.register(
+            disabled,
+            NodeInput {
+                disabled: true,
+                ..Default::default()
+            },
+            |_| panic!("disabled control received input"),
+        );
+        assert_eq!(
+            input
+                .dispatch(
+                    &scene,
+                    InputEvent::Scroll {
+                        x: 2.,
+                        y: 2.,
+                        delta_x: 0.,
+                        delta_y: 28.,
+                    }
+                )
+                .target,
+            Some(root)
+        );
+        assert_eq!(*total.borrow(), 28.);
+        assert_eq!(
+            input
+                .dispatch(
+                    &scene,
+                    InputEvent::PointerDown {
+                        x: 2.,
+                        y: 2.,
+                        button: PointerButton::Primary,
+                    }
+                )
+                .target,
+            None
+        );
+        // A disabled scroll container and a modal scope cannot leak wheel input.
+        input.set_disabled(&scene, root, true);
+        assert_eq!(
+            input
+                .dispatch(
+                    &scene,
+                    InputEvent::Scroll {
+                        x: 2.,
+                        y: 2.,
+                        delta_x: 0.,
+                        delta_y: 28.,
+                    }
+                )
+                .target,
+            None
+        );
+        input.set_disabled(&scene, root, false);
+        assert!(input.push_focus_scope(&scene, modal));
+        assert_eq!(
+            input
+                .dispatch(
+                    &scene,
+                    InputEvent::Scroll {
+                        x: 2.,
+                        y: 2.,
+                        delta_x: 0.,
+                        delta_y: 28.,
+                    }
+                )
+                .target,
+            None
+        );
+        assert_eq!(*total.borrow(), 28.);
     }
     #[test]
     fn click_tracker_time_distance_button_target_and_cycle_are_deterministic() {

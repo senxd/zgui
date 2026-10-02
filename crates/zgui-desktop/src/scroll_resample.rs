@@ -25,7 +25,29 @@ const WHEEL_RATE: f32 = 30.;
 /// `ZGUI_SCROLL_RESAMPLE=0` applies wheel input on arrival instead.
 pub(crate) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ZGUI_SCROLL_RESAMPLE").is_none_or(|v| v != "0"))
+    *ENABLED.get_or_init(|| {
+        if std::env::var_os("ZGUI_SCROLL_RESAMPLE").is_some_and(|v| v == "0") {
+            return false;
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            #[link(name = "user32")]
+            unsafe extern "system" {
+                fn SystemParametersInfoW(
+                    action: u32,
+                    parameter: u32,
+                    value: *mut i32,
+                    flags: u32,
+                ) -> i32;
+            }
+            let mut animations = 1;
+            // SPI_GETCLIENTAREAANIMATION: respect Windows' reduced-motion setting.
+            SystemParametersInfoW(0x1042, 0, &mut animations, 0);
+            return animations != 0;
+        }
+        #[cfg(not(target_os = "windows"))]
+        true
+    })
 }
 
 #[derive(Default)]
@@ -73,7 +95,6 @@ impl ScrollResampler {
                 // before it, not the whole idle gap.
                 let delay = self.delay();
                 self.points.clear();
-                self.applied = self.received;
                 self.points
                     .push_back((now.checked_sub(delay).unwrap_or(now), self.received));
             }
@@ -88,8 +109,14 @@ impl ScrollResampler {
         if self.wheel == (0., 0.) {
             self.wheel_at = Some(now);
         }
-        self.wheel.0 += delta.0;
-        self.wheel.1 += delta.1;
+        for (remaining, step) in [(&mut self.wheel.0, delta.0), (&mut self.wheel.1, delta.1)] {
+            // Reversing the wheel must respond on the next refresh, rather
+            // than first paying off momentum in the old direction.
+            if *remaining * step < 0. {
+                *remaining = 0.;
+            }
+            *remaining += step;
+        }
     }
     /// Deliver everything at once (no display refreshes are coming).
     pub fn flush(&mut self) -> Option<(f32, f32)> {
@@ -226,6 +253,16 @@ mod tests {
     }
 
     #[test]
+    fn a_new_stroke_keeps_motion_not_yet_displayed() {
+        let start = Instant::now();
+        let mut resampler = ScrollResampler::default();
+        resampler.push_precise(start, (3., 12.));
+        resampler.push_precise(start + 200 * MS, (2., 20.));
+        assert_eq!(resampler.sample(start + 300 * MS), Some((5., 32.)));
+        assert!(!resampler.pending());
+    }
+
+    #[test]
     fn wheel_notches_ease_in_and_finish() {
         let start = Instant::now();
         let mut resampler = ScrollResampler::default();
@@ -250,6 +287,27 @@ mod tests {
         resampler.push_precise(start, (3., 5.));
         resampler.push_wheel(start, (0., 28.));
         assert_eq!(resampler.flush(), Some((3., 33.)));
+        assert!(!resampler.pending());
+    }
+
+    #[test]
+    fn wheel_reversal_changes_direction_on_the_next_frame() {
+        let start = Instant::now();
+        let mut resampler = ScrollResampler::default();
+        resampler.push_wheel(start, (20., 84.));
+        let first = resampler.sample(start + 8 * MS).unwrap();
+        assert!(first.0 > 0. && first.1 > 0.);
+        resampler.push_wheel(start + 9 * MS, (0., -28.));
+        let reversed = resampler.sample(start + 16 * MS).unwrap();
+        assert!(reversed.0 > 0. && reversed.1 < 0.);
+        let mut total = reversed.1;
+        for frame in 3..=40 {
+            total += resampler
+                .sample(start + frame * 8 * MS)
+                .unwrap_or_default()
+                .1;
+        }
+        assert!((total + 28.).abs() < 1e-3);
         assert!(!resampler.pending());
     }
 }
