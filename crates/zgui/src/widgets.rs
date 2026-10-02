@@ -959,7 +959,9 @@ impl Ui {
     }
     /// Observe world bounds, including ancestor translations without layout work.
     /// Like content-size observations, registrations are owned by their nodes.
-    pub(crate) fn observe_bounds(&self, node: NodeId) -> Signal<Rect> {
+    /// Observe settled logical bounds, including transforms, for native child
+    /// surfaces that must follow a retained view at the display refresh rate.
+    pub fn observe_bounds(&self, node: NodeId) -> Signal<Rect> {
         if let Some(signal) = self.storage.observed_bounds.borrow().get(&node) {
             return signal.clone();
         }
