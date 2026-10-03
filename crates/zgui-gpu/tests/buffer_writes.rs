@@ -78,3 +78,20 @@ fn large_clears_zero_every_word() {
     queue.submit([encoder.finish()]);
     assert!(read(&device, &queue, &target).iter().all(|&w| w == 0));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn lazy_metal_encoders_release_empty_and_discarded_budget_reservations() {
+    let (device, queue) = device();
+    for _ in 0..5000 {
+        // Both paths must release their reservation without creating a real
+        // Metal command buffer, including unlabeled encoders.
+        drop(device.create_command_encoder(&Default::default()));
+        drop(device.create_command_encoder(&Default::default()).finish());
+    }
+    let target = filled(&device, &[1, 2, 3, 4]);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.clear_buffer(&target, 4, Some(8));
+    queue.submit([encoder.finish()]);
+    assert_eq!(read(&device, &queue, &target), [1, 0, 0, 4]);
+}

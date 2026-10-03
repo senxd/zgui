@@ -43,7 +43,7 @@ pub(crate) fn enabled() -> bool {
             let mut animations = 1;
             // SPI_GETCLIENTAREAANIMATION: respect Windows' reduced-motion setting.
             SystemParametersInfoW(0x1042, 0, &mut animations, 0);
-            return animations != 0;
+            animations != 0
         }
         #[cfg(not(target_os = "windows"))]
         true

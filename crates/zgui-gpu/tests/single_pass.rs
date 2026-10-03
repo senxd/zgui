@@ -340,10 +340,9 @@ fn blur_frames_defer_the_tail_after_the_last_filter_and_still_match() {
         let stats = single.render(&b.scene, &damage).unwrap();
         blurred += stats.blur_passes;
         if n > 0 {
-            // Draws up to the filter, its horizontal half, then presentation
-            // with the vertical half and everything after it.
+            // Scene, both cached blur passes, then composite at presentation.
             assert!(
-                stats.render_passes <= 3,
+                stats.render_passes <= 4,
                 "frame {n}: {} passes",
                 stats.render_passes
             );

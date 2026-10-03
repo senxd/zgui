@@ -64,6 +64,9 @@ metadata = {
 }
 if scene == 'heavy':
     metadata['excluded_frameworks'] = {'quickgui': 'Adapter panicked at startup: text renderer batch index 32 exceeded its 32-batch pool.'}
-    metadata['source_note'] = 'Measured working tree based on 92fd6a4, before adapters were committed. The original diff hash omitted untracked adapter files; their hashes are documented separately in the result README. This is not a clean-commit measurement.'
+    if audit.get('source_note'):
+        metadata['source_note'] = audit['source_note']
+    elif r.name == 'latest-macos-heavy-2026-09-27-92fd6a4':
+        metadata['source_note'] = 'Measured working tree based on 92fd6a4, before adapters were committed. The original diff hash omitted untracked adapter files; their hashes are documented separately in the result README. This is not a clean-commit measurement.'
 (a.output / 'measurement.json').write_text(json.dumps(metadata, indent=2) + '\n')
 print('Prepared accepted macOS results for', metadata['commit'])

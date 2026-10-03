@@ -41,6 +41,7 @@ pub struct Raster {
     scratch: Vec<u32>,
     background: u32,
     origin: (f32, f32),
+    mask: Option<zgui::scene::FadeMask>,
 }
 impl Raster {
     /// Register an additional validated font and invalidate retained glyph shapes.
@@ -72,6 +73,7 @@ impl Raster {
             scratch: Vec::new(),
             background: 0x10141c,
             origin: (0., 0.),
+            mask: None,
         }
     }
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -119,6 +121,7 @@ impl Raster {
                 self.pixels[y * self.width + x0..y * self.width + x1].fill(self.background);
             }
             for item in &items {
+                self.mask = item.mask;
                 let Some(clip) = intersect(dirty, item.clip.unwrap_or(full[0])) else {
                     continue;
                 };
@@ -141,7 +144,12 @@ impl Raster {
                     continue;
                 };
                 if item.effects.blur_radius > 0. {
-                    self.blur(visible, item.effects.blur_radius.ceil().min(64.) as usize);
+                    self.blur(
+                        visible,
+                        item.effects.blur_radius.ceil().min(64.) as usize,
+                        item.bounds,
+                        item.effects,
+                    );
                 }
                 match item.kind {
                     NodeKind::Rect(color) => self.rect(item.bounds, clip, *color, item.effects),
@@ -254,6 +262,7 @@ impl Raster {
             scratch: Vec::new(),
             background,
             origin: (x, y),
+            mask: None,
         };
         let mut black = make(0);
         let mut white = make(0xffffff);
@@ -266,6 +275,9 @@ impl Raster {
                 i.clip = i
                     .clip
                     .map(|r| Rect::new(r.x - x, r.y - y, r.width, r.height));
+                i.mask = i
+                    .mask
+                    .map(|(r, bands)| (Rect::new(r.x - x, r.y - y, r.width, r.height), bands));
                 i
             })
             .collect();
@@ -282,10 +294,18 @@ impl Raster {
             return;
         };
         if item.effects.blur_radius > 0. {
-            self.blur(visible, item.effects.blur_radius.ceil().min(64.) as usize)
+            self.blur(
+                visible,
+                item.effects.blur_radius.ceil().min(64.) as usize,
+                item.bounds,
+                item.effects,
+            )
         }
         let (x0, y0, x1, y1) = self.region(visible);
         for py in y0..y1 {
+            let opacity = item.effects.opacity
+                * edge_alpha(py as f32, item.bounds, item.effects.edge_fade)
+                * mask_alpha(py as f32, self.mask);
             for px in x0..x1 {
                 let sx = (px as f32 - output.x) as usize;
                 let sy = (py as f32 - output.y) as usize;
@@ -299,12 +319,7 @@ impl Raster {
                     ((((b >> shift) & 255) * 255 + alpha as u32 / 2) / alpha as u32).min(255) as u8
                 };
                 let color = Color(channel(16), channel(8), channel(0), alpha as u8);
-                blend(
-                    &mut self.pixels[py * self.width + px],
-                    color,
-                    item.effects.opacity
-                        * edge_alpha(py as f32, item.bounds, item.effects.edge_fade),
-                );
+                blend(&mut self.pixels[py * self.width + px], color, opacity);
             }
         }
     }
@@ -322,7 +337,8 @@ impl Raster {
         };
         let (x0, y0, x1, y1) = self.region(r);
         for y in y0..y1 {
-            let edge = edge_alpha(y as f32, bounds, effects.edge_fade);
+            let edge =
+                edge_alpha(y as f32, bounds, effects.edge_fade) * mask_alpha(y as f32, self.mask);
             for x in x0..x1 {
                 blend(
                     &mut self.pixels[y * self.width + x],
@@ -347,7 +363,9 @@ impl Raster {
             return;
         };
         let (x0, y0, x1, y1) = self.region(visible);
+        let pixels = image.pixels();
         for y in y0..y1 {
+            let opacity = effects.opacity * mask_alpha(y as f32, self.mask);
             for x in x0..x1 {
                 let (local_x, local_y) = inverse.point(x as f32 + 0.5, y as f32 + 0.5);
                 if local_x < bounds.x
@@ -362,11 +380,11 @@ impl Raster {
                 let sy = (((local_y - bounds.y) / bounds.height * image.height() as f32) as u32)
                     .min(image.height() - 1);
                 let i = ((sy * image.width() + sx) * 4) as usize;
-                let p = &image.pixels()[i..i + 4];
+                let p = &pixels[i..i + 4];
                 blend(
                     &mut self.pixels[y * self.width + x],
                     Color(p[0], p[1], p[2], p[3]),
-                    effects.opacity * edge_alpha(local_y, bounds, effects.edge_fade),
+                    opacity * edge_alpha(local_y - 0.5, bounds, effects.edge_fade),
                 );
             }
         }
@@ -390,6 +408,7 @@ impl Raster {
             if let Some(visible) = intersect(core.expand(shadow.blur_radius.max(0.) * 3.), clip) {
                 let (x0, y0, x1, y1) = self.region(visible);
                 for y in y0..y1 {
+                    let opacity = effects.opacity * mask_alpha(y as f32, self.mask);
                     for x in x0..x1 {
                         let d = rounded_distance(x as f32 + 0.5, y as f32 + 0.5, core, {
                             let corners = zgui_gpu::decoration::shadow_corners(
@@ -412,7 +431,7 @@ impl Raster {
                         blend(
                             &mut self.pixels[y * self.width + x],
                             shadow.color,
-                            alpha * effects.opacity,
+                            alpha * opacity,
                         );
                     }
                 }
@@ -433,11 +452,13 @@ impl Raster {
         };
         let (x0, y0, x1, y1) = self.region(visible);
         for y in y0..y1 {
+            let amount = effects.opacity
+                * edge_alpha(y as f32, bounds, effects.edge_fade)
+                * mask_alpha(y as f32, self.mask);
             for x in x0..x1 {
                 let d = rounded_distance(x as f32 + 0.5, y as f32 + 0.5, bounds, style.radius);
                 let outer = (0.5 - d).clamp(0., 1.);
                 let inner = (0.5 - d - style.border_width.max(0.)).clamp(0., 1.);
-                let amount = effects.opacity * edge_alpha(y as f32, bounds, effects.edge_fade);
                 let a = style.fill.3 as f32 / 255. * inner
                     + style.border_color.3 as f32 / 255. * (outer - inner);
                 if a > 0. {
@@ -524,12 +545,11 @@ impl Raster {
                     .min(y1 as f32)
                     .max(0.) as usize;
                 for y in top..bottom {
+                    let opacity = effects.opacity
+                        * edge_alpha(y as f32, bounds, effects.edge_fade)
+                        * mask_alpha(y as f32, self.mask);
                     for x in left..right {
-                        blend(
-                            &mut pixels[y * self.width + x],
-                            d.color,
-                            effects.opacity * edge_alpha(y as f32, bounds, effects.edge_fade),
-                        );
+                        blend(&mut pixels[y * self.width + x], d.color, opacity);
                     }
                 }
             }
@@ -543,6 +563,9 @@ impl Raster {
                 if py < y0 as i32 || py >= y1 as i32 {
                     continue;
                 }
+                let opacity = effects.opacity
+                    * edge_alpha(py as f32, bounds, effects.edge_fade)
+                    * mask_alpha(py as f32, self.mask);
                 for bx in 0..image.placement.width as usize {
                     let px = gx + bx as i32;
                     if px < x0 as i32 || px >= x1 as i32 {
@@ -567,7 +590,7 @@ impl Raster {
                     blend(
                         &mut self.pixels[py as usize * self.width + px as usize],
                         ink,
-                        effects.opacity * edge_alpha(py as f32, bounds, effects.edge_fade) * alpha,
+                        opacity * alpha,
                     );
                 }
             }
@@ -629,6 +652,9 @@ impl Raster {
                 if py < y0 as i32 || py >= y1 as i32 {
                     continue;
                 }
+                let opacity = effects.opacity
+                    * edge_alpha(py as f32, bounds, effects.edge_fade)
+                    * mask_alpha(py as f32, self.mask);
                 for bx in 0..image.placement.width as usize {
                     let px = gx + bx as i32;
                     if px < x0 as i32 || px >= x1 as i32 {
@@ -653,7 +679,7 @@ impl Raster {
                     blend(
                         &mut self.pixels[py as usize * self.width + px as usize],
                         ink,
-                        effects.opacity * edge_alpha(py as f32, bounds, effects.edge_fade) * alpha,
+                        opacity * alpha,
                     );
                 }
             }
@@ -705,6 +731,9 @@ impl Raster {
                 if py < y0 as i32 || py >= y1 as i32 {
                     continue;
                 }
+                let opacity = effects.opacity
+                    * edge_alpha(py as f32, bounds, effects.edge_fade)
+                    * mask_alpha(py as f32, self.mask);
                 for bx in 0..m.width {
                     let px = gx + bx as i32;
                     if px < x0 as i32 || px >= x1 as i32 {
@@ -713,10 +742,7 @@ impl Raster {
                     blend(
                         &mut self.pixels[py as usize * self.width + px as usize],
                         color,
-                        effects.opacity
-                            * edge_alpha(py as f32, bounds, effects.edge_fade)
-                            * bitmap[by * m.width + bx] as f32
-                            / 255.,
+                        opacity * bitmap[by * m.width + bx] as f32 / 255.,
                     );
                 }
             }
@@ -724,7 +750,7 @@ impl Raster {
         }
     }
     // Separable sliding-window box filter: O(area), independent of blur radius.
-    fn blur(&mut self, bounds: Rect, radius: usize) {
+    fn blur(&mut self, bounds: Rect, radius: usize, fade_bounds: Rect, effects: Effects) {
         if radius == 0 {
             return;
         }
@@ -776,7 +802,19 @@ impl Raster {
                     top += 1;
                 }
                 if y + y0 >= by0 && y + y0 < by1 {
-                    self.pixels[(y + y0) * self.width + x] = pack(sum, (bottom - top) as u64);
+                    let filtered = pack(sum, (bottom - top) as u64);
+                    blend(
+                        &mut self.pixels[(y + y0) * self.width + x],
+                        Color(
+                            (filtered >> 16) as u8,
+                            (filtered >> 8) as u8,
+                            filtered as u8,
+                            255,
+                        ),
+                        effects.opacity
+                            * edge_alpha((y + y0) as f32, fade_bounds, effects.edge_fade)
+                            * mask_alpha((y + y0) as f32, self.mask),
+                    );
                 }
             }
         }
@@ -831,6 +869,24 @@ fn edge_alpha(y: f32, bounds: Rect, fade: f32) -> f32 {
     } else {
         1.
     }
+}
+
+fn mask_alpha(y: f32, mask: Option<zgui::scene::FadeMask>) -> f32 {
+    let Some((bounds, bands)) = mask else {
+        return 1.;
+    };
+    let y = y + 0.5;
+    let top = if bands[0] > 0. {
+        (y - bounds.y) / bands[0]
+    } else {
+        1.
+    };
+    let bottom = if bands[1] > 0. {
+        (bounds.y + bounds.height - y) / bands[1]
+    } else {
+        1.
+    };
+    top.clamp(0., 1.).powi(2) * bottom.clamp(0., 1.).powi(2)
 }
 
 #[cfg(test)]
@@ -1023,6 +1079,173 @@ mod extended_tests {
 mod isolation_tests {
     use super::*;
     use zgui::scene::{Layout, Style, Transform};
+    #[test]
+    fn overlapping_fade_bands_multiply_independent_quadratic_ramps() {
+        let mut scene = Scene::new(8., 8.);
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(8.),
+                height: Some(8.),
+                clip: true,
+                fade_edges: [8., 8.],
+                ..Default::default()
+            },
+        );
+        scene.append(
+            parent,
+            NodeKind::Rect(Color(255, 255, 255, 255)),
+            Style {
+                width: Some(8.),
+                height: Some(8.),
+                ..Default::default()
+            },
+        );
+        let mut raster = Raster::new(8, 8);
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        let mut expected = 0x10141c;
+        blend(
+            &mut expected,
+            Color(255, 255, 255, 255),
+            (3.5_f32 / 8.).powi(2) * (4.5_f32 / 8.).powi(2),
+        );
+        assert_eq!(raster.pixels[3 * 8 + 4], expected);
+    }
+
+    #[test]
+    fn ancestor_fade_bands_follow_translated_images_and_isolated_layers() {
+        for isolated in [false, true] {
+            let mut scene = Scene::new(32., 32.);
+            let group = scene.append(
+                scene.root(),
+                NodeKind::Container(Layout::Overlay),
+                Style {
+                    width: Some(16.),
+                    height: Some(16.),
+                    clip: true,
+                    fade_edges: [4., 8.],
+                    ..Default::default()
+                },
+            );
+            scene.set_transform(group, Transform { x: 4., y: 6. });
+            scene.set_isolated(group, isolated);
+            let green = Color(0, 255, 0, 255);
+            scene.append(
+                group,
+                NodeKind::Image(std::sync::Arc::new(
+                    zgui::image::ImageData::new(1, 1, vec![0, 255, 0, 255]).unwrap(),
+                )),
+                Style {
+                    width: Some(16.),
+                    height: Some(16.),
+                    ..Default::default()
+                },
+            );
+            let mut raster = Raster::new(32, 32);
+            let damage = scene.flush().damage;
+            raster.render(&scene, &damage);
+            let mut top = 0x10141c;
+            blend(&mut top, green, (0.5_f32 / 4.).powi(2));
+            let mut bottom = 0x10141c;
+            blend(&mut bottom, green, (0.5_f32 / 8.).powi(2));
+            assert_eq!(raster.pixels[6 * 32 + 4], top, "isolated={isolated}");
+            assert_eq!(raster.pixels[21 * 32 + 4], bottom, "isolated={isolated}");
+            assert_eq!(raster.pixels[13 * 32 + 4], 0x00ff00);
+            scene.set_transform(group, Transform { x: 4., y: 10. });
+            let damage = scene.flush().damage;
+            raster.render(&scene, &damage);
+            let mut fresh = Raster::new(32, 32);
+            fresh.render(&scene, &[Rect::new(0., 0., 32., 32.)]);
+            assert_eq!(raster.pixels, fresh.pixels);
+        }
+    }
+
+    #[test]
+    fn backdrop_blur_blends_coverage_instead_of_overwriting_at_partial_opacity() {
+        let mut scene = Scene::new(16., 16.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(255, 255, 255, 255)),
+            Style {
+                width: Some(8.),
+                height: Some(16.),
+                ..Default::default()
+            },
+        );
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(16.),
+                height: Some(16.),
+                clip: true,
+                ..Default::default()
+            },
+        );
+        let panel = scene.append(
+            parent,
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(16.),
+                height: Some(16.),
+                ..Default::default()
+            },
+        );
+        let mut opaque = Raster::new(16, 16);
+        scene.set_effects(
+            panel,
+            Effects {
+                blur_radius: 4.,
+                ..Default::default()
+            },
+        );
+        let damage = scene.flush().damage;
+        opaque.render(&scene, &damage);
+        let mut style = scene.style(parent);
+        style.fade_edges = [4., 4.];
+        scene.set_style(parent, style);
+        scene.set_effects(
+            panel,
+            Effects {
+                blur_radius: 4.,
+                opacity: 0.5,
+                ..Default::default()
+            },
+        );
+        let mut half = Raster::new(16, 16);
+        let damage = scene.flush().damage;
+        half.render(&scene, &damage);
+        let filtered = opaque.pixels[8 * 16 + 7];
+        let mut expected = 0xffffff;
+        blend(
+            &mut expected,
+            Color(
+                (filtered >> 16) as u8,
+                (filtered >> 8) as u8,
+                filtered as u8,
+                255,
+            ),
+            0.5,
+        );
+        assert_ne!(filtered, 0xffffff);
+        assert_eq!(half.pixels[8 * 16 + 7], expected);
+        let mut faded = 0xffffff;
+        blend(
+            &mut faded,
+            Color(
+                (filtered >> 16) as u8,
+                (filtered >> 8) as u8,
+                filtered as u8,
+                255,
+            ),
+            0.5 * (0.5_f32 / 4.).powi(2),
+        );
+        assert_eq!(half.pixels[7], faded);
+    }
+
     #[test]
     fn opacity_is_applied_once_to_overlapping_children() {
         let mut scene = Scene::new(40., 30.);

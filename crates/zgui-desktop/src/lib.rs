@@ -46,6 +46,8 @@ pub use native_prompt::{PromptButtons, PromptLevel, PromptOptions, PromptRespons
 pub use url::{OpenUrlError, open_url};
 pub use window_info::{DisplayInfo, DisplaySelector, WindowBounds, WindowCapabilities, WindowInfo};
 mod focus_memory;
+mod frame_counter;
+pub use frame_counter::FrameCounter;
 mod frame_source;
 mod native_ime;
 pub mod presentation;
@@ -72,6 +74,7 @@ mod presentation_retry;
 #[doc = include_str!("../../../docs/window-controls.md")]
 mod window_control_examples {}
 
+pub use zgui_gpu::BlurAlgorithm;
 pub use zgui_gpu::text::FontData;
 
 mod file_drop;

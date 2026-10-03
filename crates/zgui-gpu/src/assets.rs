@@ -1,5 +1,6 @@
 //! Bounded image decoding and SVG rasterization, independent of a GPU device.
 use crate::GpuError;
+use image::ImageDecoder;
 use std::{io::Cursor, sync::Arc};
 use zgui::image::ImageData;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -15,14 +16,26 @@ pub fn decode_image(bytes: &[u8]) -> Result<Arc<ImageData>, GpuError> {
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
     limits.max_alloc = Some(MAX_BYTES as u64);
-    reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .map_err(|e| GpuError(e.to_string()))?
-        .into_rgba8();
-    if decoded.as_raw().len() > MAX_BYTES {
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().map_err(|e| GpuError(e.to_string()))?;
+    let (width, height) = decoder.dimensions();
+    // An RGB/greyscale decoder can fit its own limit while conversion to RGBA
+    // would allocate a larger, rejected output. Check before decoding pixels.
+    if (u64::from(width) * u64::from(height))
+        .checked_mul(4)
+        .is_none_or(|bytes| bytes > MAX_BYTES as u64)
+    {
         return Err(GpuError("decoded image exceeds 64 MiB".into()));
     }
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|e| GpuError(e.to_string()))?;
+    decoder
+        .set_limits(limits)
+        .map_err(|e| GpuError(e.to_string()))?;
+    let decoded = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| GpuError(e.to_string()))?
+        .into_rgba8();
     ImageData::new(decoded.width(), decoded.height(), decoded.into_raw())
         .map(Arc::new)
         .map_err(|e| GpuError(e.into()))

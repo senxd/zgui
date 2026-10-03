@@ -1,5 +1,5 @@
 use objc2::{
-    rc::{autoreleasepool, Retained},
+    rc::{Retained, autoreleasepool},
     runtime::ProtocolObject,
 };
 use objc2_foundation::{NSRange, NSString, NSUInteger};
@@ -13,7 +13,7 @@ use objc2_metal::{
     MTLVisibilityResultMode,
 };
 
-use super::{adapter, conv, TimestampQuerySupport};
+use super::{TimestampQuerySupport, adapter, conv};
 use crate::CommandEncoder as _;
 use alloc::{
     borrow::{Cow, ToOwned as _},
@@ -165,9 +165,6 @@ impl super::CommandEncoder {
             .expect("command buffer used outside begin_encoding/end_encoding");
         let queue = &self.queue_shared.raw;
         let retain_references = self.shared.settings.retain_command_buffer_references;
-        self.queue_shared
-            .command_buffer_created_not_submitted
-            .fetch_add(1, atomic::Ordering::AcqRel);
         let raw = autoreleasepool(move |_| {
             let cmd_buf_ref = if retain_references {
                 queue.commandBuffer()
@@ -517,11 +514,15 @@ impl crate::CommandEncoder for super::CommandEncoder {
         // Guard against exhausting Metal's command buffer budget. Use the hard
         // limit (`MAX_COMMAND_BUFFERS`) so we fail before Metal can hang inside
         // `new_command_buffer`.
-        let current = self
+        let reservation = self
             .queue_shared
             .command_buffer_created_not_submitted
-            .load(atomic::Ordering::Acquire);
-        if current >= adapter::MAX_COMMAND_BUFFERS {
+            .fetch_update(
+                atomic::Ordering::AcqRel,
+                atomic::Ordering::Acquire,
+                |current| (current < adapter::MAX_COMMAND_BUFFERS).then_some(current + 1),
+            );
+        if let Err(current) = reservation {
             log::warn!(
                 "metal: refusing to create new command buffer; {current} outstanding command \
                  buffers exceeds the limit of {}. Treating this as device lost. \
@@ -531,7 +532,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
             );
             return Err(crate::DeviceError::Lost);
         }
-        // zgui patch: created lazily by `command_buffer`.
+        // zgui patch: reserve atomically before lazy allocation. Otherwise many
+        // empty encoders could pass this guard and later exhaust Metal together.
         self.raw_cmd_buf = None;
         self.pending_label = Some(label.map(str::to_owned));
         Ok(())
@@ -548,12 +550,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
         if let Some(encoder) = self.state.compute.take() {
             encoder.endEncoding();
         }
-        self.pending_label = None;
-        let had_command_buffer = self.raw_cmd_buf.is_some();
+        let reserved = self.pending_label.take().is_some() || self.raw_cmd_buf.is_some();
         // Clear the Option first so the underlying `metal::CommandBuffer` is
         // dropped before we update the counter.
         self.raw_cmd_buf = None;
-        if had_command_buffer {
+        if reserved {
             self.queue_shared
                 .command_buffer_created_not_submitted
                 .fetch_sub(1, atomic::Ordering::AcqRel);
@@ -574,6 +575,13 @@ impl crate::CommandEncoder for super::CommandEncoder {
         debug_assert!(self.state.pending_timer_queries.is_empty());
 
         self.pending_label = None;
+        if self.raw_cmd_buf.is_none() {
+            // Empty encoders never allocate or submit a Metal buffer, but still
+            // own the reservation taken by begin_encoding.
+            self.queue_shared
+                .command_buffer_created_not_submitted
+                .fetch_sub(1, atomic::Ordering::AcqRel);
+        }
         Ok(super::CommandBuffer {
             raw: self.raw_cmd_buf.take(),
             queue_shared: Arc::clone(&self.queue_shared),

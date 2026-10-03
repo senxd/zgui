@@ -100,6 +100,7 @@ pub struct Semantics {
     nodes: HashMap<NodeId, SemanticEntry>,
     revision: u64,
     instance: u64,
+    topology_revision: u64,
 }
 impl Default for Semantics {
     fn default() -> Self {
@@ -113,6 +114,7 @@ impl Default for Semantics {
             nodes: HashMap::new(),
             revision: 0,
             instance,
+            topology_revision: 0,
         }
     }
 }
@@ -122,9 +124,15 @@ struct SemanticUpdate<'a> {
     entry: &'a mut SemanticEntry,
     global_revision: &'a mut u64,
     before: SemanticNode,
+    topology_revision: &'a mut u64,
 }
 impl Drop for SemanticUpdate<'_> {
     fn drop(&mut self) {
+        if self.entry.node.disabled != self.before.disabled
+            || self.entry.node.logical_parent != self.before.logical_parent
+        {
+            *self.topology_revision = self.topology_revision.wrapping_add(1);
+        }
         if self.entry.node != self.before {
             *self.global_revision = self.global_revision.wrapping_add(1);
             self.entry.revision = *self.global_revision;
@@ -137,6 +145,11 @@ impl Semantics {
     }
     pub fn set(&mut self, id: NodeId, node: SemanticNode) {
         if self.get(id) != Some(&node) {
+            if self.get(id).is_none_or(|old| {
+                old.disabled != node.disabled || old.logical_parent != node.logical_parent
+            }) {
+                self.topology_revision = self.topology_revision.wrapping_add(1);
+            }
             self.revision = self.revision.wrapping_add(1);
             self.nodes.insert(
                 id,
@@ -164,6 +177,7 @@ impl Semantics {
             let update = SemanticUpdate {
                 entry,
                 global_revision: &mut self.revision,
+                topology_revision: &mut self.topology_revision,
                 before,
             };
             f(&mut update.entry.node);
@@ -201,6 +215,7 @@ impl Semantics {
     }
     pub fn remove(&mut self, id: NodeId) {
         if self.nodes.remove(&id).is_some() {
+            self.topology_revision = self.topology_revision.wrapping_add(1);
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -208,6 +223,7 @@ impl Semantics {
         let count = self.nodes.len();
         self.nodes.retain(|id, _| scene.contains(*id));
         if self.nodes.len() != count {
+            self.topology_revision = self.topology_revision.wrapping_add(1);
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -216,6 +232,10 @@ impl Semantics {
     }
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+    /// Semantic membership, ownership and disabled ancestry; excludes value changes.
+    pub fn topology_revision(&self) -> (u64, u64) {
+        (self.instance, self.topology_revision)
     }
 }
 #[cfg(test)]

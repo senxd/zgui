@@ -280,11 +280,11 @@ impl Registry {
             if let Some(maps) = self.maps.get(node) {
                 for (_, map) in maps.iter().rev() {
                     for binding in map.bindings.iter().rev() {
-                        if binding
-                            .context
-                            .as_ref()
-                            .is_some_and(|context| !context.matches(&contexts))
-                            || !binding.sequence.starts_with(&strokes)
+                        if !binding.sequence.starts_with(&strokes)
+                            || binding
+                                .context
+                                .as_ref()
+                                .is_some_and(|context| !context.matches(&contexts))
                         {
                             continue;
                         }

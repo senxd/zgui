@@ -59,6 +59,9 @@ pub struct Runtime {
     inner: Rc<Inner>,
 }
 impl Runtime {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -293,13 +296,16 @@ impl<T: 'static> Signal<T> {
     where
         T: PartialEq,
     {
-        {
+        let previous = {
             let mut old = self.inner.value.borrow_mut();
             if *old == value {
                 return false;
             }
-            *old = value;
-        }
+            std::mem::replace(&mut *old, value)
+        };
+        // State can own resources whose destructors read or mutate signals.
+        // Publish the replacement and release its borrow before dropping them.
+        drop(previous);
         self.notify();
         true
     }
@@ -346,6 +352,48 @@ impl ServiceScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replacing_state_drops_old_resources_after_releasing_the_value_borrow() {
+        struct Value {
+            number: i32,
+            cleanup: Option<Box<dyn Fn()>>,
+        }
+        impl PartialEq for Value {
+            fn eq(&self, other: &Self) -> bool {
+                self.number == other.number
+            }
+        }
+        impl Drop for Value {
+            fn drop(&mut self) {
+                if let Some(cleanup) = self.cleanup.take() {
+                    cleanup();
+                }
+            }
+        }
+        let runtime = Runtime::new();
+        let signal = runtime.signal(Value {
+            number: 0,
+            cleanup: None,
+        });
+        let weak = Rc::downgrade(&signal.inner);
+        let observed = Rc::new(Cell::new(0));
+        let capture = observed.clone();
+        signal.set(Value {
+            number: 1,
+            cleanup: Some(Box::new(move || {
+                let signal = Signal {
+                    inner: weak.upgrade().unwrap(),
+                };
+                capture.set(signal.with_untracked(|value| value.number));
+            })),
+        });
+        assert!(signal.set(Value {
+            number: 2,
+            cleanup: None
+        }));
+        assert_eq!(observed.get(), 2);
+    }
+
     #[test]
     fn untracked_nested_and_caught_panic_restore_outer_dependencies() {
         let runtime = Runtime::new();

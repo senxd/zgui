@@ -184,9 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let window = cx.window.clone();
                 cx.tasks.spawn(async move {
-                    for step in 0_u32.. {
+                    for step in (0_u32..40).cycle() {
                         sleep(Duration::from_millis(ms)).await;
-                        let grow = f64::from(step % 40) * 6.;
+                        let grow = f64::from(step) * 6.;
                         window.set_inner_size(WIDTH + grow, HEIGHT + grow * 0.5);
                     }
                 });

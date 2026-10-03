@@ -52,6 +52,9 @@ impl TaskToken {
 #[derive(Clone)]
 pub struct TaskRunner(Rc<dyn Fn(LocalFuture) -> TaskToken>);
 impl TaskRunner {
+    pub(crate) fn spawn_owned(&self, future: impl Future<Output = ()> + 'static) -> TaskToken {
+        (self.0)(Box::pin(future))
+    }
     pub fn new(spawn: impl Fn(LocalFuture) -> TaskToken + 'static) -> Self {
         Self(Rc::new(spawn))
     }
@@ -275,6 +278,7 @@ pub struct View {
     trigger_id: Option<String>,
     menu_trigger: Option<Signal<bool>>,
     menu_checked: Option<bool>,
+    visibility: Vec<Signal<bool>>,
 }
 impl View {
     /// Set the controlled checked state of a menu item, including accessibility.
@@ -351,11 +355,18 @@ impl View {
             trigger_id: None,
             menu_trigger: None,
             menu_checked: None,
+            visibility: Vec::new(),
         }
     }
     /// Show an interactive overlay scrollbar on a scroll viewport or virtual list.
     pub fn scrollbar(mut self, visible: bool) -> Self {
         self.scrollbar = Some(visible);
+        self
+    }
+    /// Observe clipped/offscreen visibility and native presentation. The signal
+    /// updates on geometry/presentation changes, without per-frame scene walks.
+    pub fn observe_visibility(mut self, visible: Signal<bool>) -> Self {
+        self.visibility.push(visible);
         self
     }
     /// Enable bounded keyboard row navigation on a virtual list.
@@ -465,6 +476,7 @@ impl View {
     }
     // Wrapper properties refine the component's actual root without an extra layout box.
     fn refine(self, mut inner: View) -> View {
+        inner.visibility.extend(self.visibility);
         if self.trigger_id.is_some() {
             inner.trigger_id = self.trigger_id;
         }
@@ -1012,7 +1024,10 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                     // Construct first: a failed row constructor leaves old rows intact.
                     let mut added = Vec::new();
                     for (key, index) in &keys {
-                        if entries.contains_key(key) {
+                        if entries
+                            .get(key)
+                            .is_some_and(|(node, _)| ui.scene.borrow().contains(*node))
+                        {
                             continue;
                         }
                         let index_signal = ui.signal(*index);
@@ -2132,6 +2147,18 @@ fn mount_element(
         ui.input.set_options(root, options);
     }
     update_button_labels(ui, root);
+    if !view.visibility.is_empty() {
+        let visible = ui.observe_visibility(root);
+        let presented = ui.observe_presentation();
+        let observers = view.visibility;
+        ui.bind(root, move || {
+            let visible = visible.get();
+            let presented = presented.get();
+            for observer in &observers {
+                observer.set(visible && presented);
+            }
+        });
+    }
     root
 }
 #[allow(clippy::too_many_arguments)]
@@ -2821,6 +2848,9 @@ pub mod prelude {
     };
     pub use crate::cursor::Cursor;
     pub use crate::decoration::{Background, BorderStyle, Corners};
+    pub use crate::motion::{
+        Completion, Easing, MotionPolicy, MotionValue, Presence, Spring, Transition,
+    };
     pub use crate::rich_text::Decoration;
     pub use crate::style::{ObjectFit, Styled, Styles, rgb, rgba};
     pub use crate::svg::SvgData;
