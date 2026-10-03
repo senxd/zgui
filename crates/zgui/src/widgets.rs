@@ -345,6 +345,8 @@ struct UiStorage {
     preparing_frame: Cell<bool>,
     content_sizes: RefCell<HashMap<NodeId, Signal<(f32, f32)>>>,
     observed_bounds: RefCell<HashMap<NodeId, Signal<Rect>>>,
+    observed_layout_bounds: RefCell<HashMap<NodeId, Signal<Option<Rect>>>>,
+    projected_layout: RefCell<std::collections::HashSet<NodeId>>,
     observed_visibility: RefCell<HashMap<NodeId, Signal<bool>>>,
     mount_initialization: RefCell<Option<Rc<MountInitialization>>>,
     interaction: RefCell<Option<InteractionDeadline>>,
@@ -455,6 +457,8 @@ impl Ui {
             preparing_frame: Cell::new(false),
             content_sizes: RefCell::new(HashMap::new()),
             observed_bounds: RefCell::new(HashMap::new()),
+            observed_layout_bounds: RefCell::new(HashMap::new()),
+            projected_layout: RefCell::default(),
             observed_visibility: RefCell::new(HashMap::new()),
             mount_initialization: RefCell::new(None),
             interaction: RefCell::new(None),
@@ -976,6 +980,31 @@ impl Ui {
         self.storage.bounds_geometry_revision.set(None);
         signal
     }
+    /// Layout-only allocation. None until the next settled layout publication;
+    /// paint translations and ancestor scrolling do not invalidate this signal.
+    pub(crate) fn mark_layout_projected(&self, node: NodeId) {
+        self.storage.projected_layout.borrow_mut().insert(node);
+    }
+    pub(crate) fn projected_ancestor_bounds(&self, node: NodeId) -> Option<(NodeId, Rect)> {
+        let projected = self.storage.projected_layout.borrow();
+        let scene = self.scene.borrow();
+        scene
+            .ancestors(node)
+            .find(|id| projected.contains(id))
+            .map(|id| (id, scene.layout_bounds(id)))
+    }
+    pub fn observe_layout_bounds(&self, node: NodeId) -> Signal<Option<Rect>> {
+        if let Some(signal) = self.storage.observed_layout_bounds.borrow().get(&node) {
+            return signal.clone();
+        }
+        let signal = self.signal(None);
+        self.storage
+            .observed_layout_bounds
+            .borrow_mut()
+            .insert(node, signal.clone());
+        self.storage.editor_layout_revision.set(None);
+        signal
+    }
     /// Inform retained media that its native window can currently present.
     /// Headless hosts default to presented; hidden/suspended hosts should set false.
     pub fn set_presented(&self, presented: bool) {
@@ -1080,9 +1109,34 @@ impl Ui {
             } else {
                 Vec::new()
             };
+            let layout_bounds: Vec<_> = if layout_changed {
+                let scene = self.scene.borrow();
+                self.storage
+                    .observed_layout_bounds
+                    .borrow()
+                    .iter()
+                    .filter(|(node, _)| scene.contains(**node))
+                    .map(|(node, signal)| {
+                        (
+                            *node,
+                            signal.clone(),
+                            scene
+                                .layout_visible(*node)
+                                .then(|| scene.layout_bounds(*node)),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // Publish outside every storage/scene borrow: geometry subscribers can
             // mount, dispose, translate, or reenter frame preparation.
             self.runtime.batch(|| {
+                for (node, signal, bounds) in layout_bounds {
+                    if self.scene.borrow().contains(node) {
+                        signal.set(bounds);
+                    }
+                }
                 for (node, signal, size) in sizes {
                     if self.scene.borrow().contains(node) {
                         signal.set(size);
@@ -1319,6 +1373,8 @@ impl Ui {
         for id in ids {
             self.storage.content_sizes.borrow_mut().remove(&id);
             self.storage.observed_bounds.borrow_mut().remove(&id);
+            self.storage.observed_layout_bounds.borrow_mut().remove(&id);
+            self.storage.projected_layout.borrow_mut().remove(&id);
             self.storage.observed_visibility.borrow_mut().remove(&id);
             self.input.unregister(id);
             self.semantics.borrow_mut().remove(id);

@@ -59,6 +59,7 @@ pub(crate) fn mount_style(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -77,6 +78,7 @@ pub(crate) fn mount_style_with_intrinsic(
     intrinsic: Option<Signal<(f32, f32)>>,
     layout_target: Option<Signal<Option<NodeId>>>,
     object_fit: Option<Signal<crate::style::ObjectFit>>,
+    projection: Option<Signal<crate::motion::Vec2>>,
 ) -> Signal<Typography> {
     let typography = ui.signal(inherited.with_untracked(Clone::clone));
     let output = typography.clone();
@@ -164,6 +166,7 @@ pub(crate) fn mount_style_with_intrinsic(
         if !ui.scene.borrow().contains(node) { return; }
         let mut resolved = base.clone();
         if let Some(dynamic) = &mut dynamic { resolved.merge(&dynamic()); }
+
         let state = interaction.get();
         let is_disabled = disabled.as_mut().is_some_and(|read| read());
         for (enabled, variant) in [(!is_disabled && state.hover, &variants.hover), (!is_disabled && (state.pointer_active || state.key_active.is_some()), &variants.active), (!is_disabled && state.focus, &variants.focus), (is_disabled, &variants.disabled)] {
@@ -175,6 +178,14 @@ pub(crate) fn mount_style_with_intrinsic(
         }
         if let Some(output) = &object_fit { output.set(resolved.object_fit.unwrap_or_default()); }
         // Only observe inherited typography when a field is actually inherited.
+        if let Some(offset) = &projection {
+            let offset = offset.get();
+            let base = resolved.transform.unwrap_or(original_transform);
+            resolved.transform = Some(crate::scene::Transform {
+                x: (base.x as f64 + offset.x as f64).clamp(-(f32::MAX as f64), f32::MAX as f64) as f32,
+                y: (base.y as f64 + offset.y as f64).clamp(-(f32::MAX as f64), f32::MAX as f64) as f32,
+            });
+        }
         let parent = if resolved.text_overflow.is_none() || resolved.line_clamp.is_none() || resolved.text_color.is_none() || resolved.text_size.is_none() || resolved.text_wrap.is_none() || resolved.font_family.is_none() || resolved.font_features.is_none() || resolved.text_align.is_none() || resolved.font_fallbacks.is_none() || resolved.font_weight.is_none() || resolved.italic.is_none() || resolved.line_height.is_none() || resolved.letter_spacing.is_none() {
             inherited.get()
         } else {

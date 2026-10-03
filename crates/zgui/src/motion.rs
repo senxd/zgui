@@ -19,6 +19,22 @@ use std::{
 mod math;
 use math::Oscillator;
 pub use math::{AnimationKind, Bezier, Easing, Spring, Transition};
+#[path = "motion_inspector.rs"]
+mod inspector;
+#[path = "motion_tracks.rs"]
+mod tracks;
+pub use inspector::{
+    MotionId, MotionInspector, MotionSnapshot, RenderDiagnostics, RenderSnapshot, TrackSnapshot,
+    TrackState,
+};
+#[path = "motion_bindings.rs"]
+mod bindings;
+pub(crate) use bindings::project_layout;
+pub use bindings::{DragMotion, MotionAxis, MotionStates, ScrollProgress};
+pub use tracks::{
+    AnimationGroup, Interpolate, Keyframe, Keyframes, MotionColor, MotionError, MotionPoint,
+    Playback, Repeat, Timeline, Vec2,
+};
 
 /// Optional subtree policy, supplied with `compose::provide`. Pausing freezes
 /// time and velocity; reduced motion immediately finishes at the target.
@@ -40,6 +56,36 @@ struct Run {
     oscillator: Option<Oscillator>,
     elapsed: Duration,
     last: Option<Instant>,
+    keyframes: Option<Keyframes<f32>>,
+    playback: Playback,
+}
+impl Run {
+    fn sample(&self) -> (f32, f32, bool) {
+        if self.elapsed < self.transition.delay {
+            return (self.from, 0., false);
+        }
+        let elapsed = self.elapsed.saturating_sub(self.transition.delay);
+        match self.transition.kind {
+            AnimationKind::Tween { duration, easing } => {
+                let (t, finished) = self.playback.phase(elapsed, duration);
+                let value = self.keyframes.as_ref().map_or_else(
+                    || self.from.interpolate(self.target, easing.sample(t)),
+                    |frames| frames.sample(t),
+                );
+                (value, 0., finished)
+            }
+            AnimationKind::Spring(spring) => {
+                let (displacement, velocity) =
+                    self.oscillator.unwrap().sample(elapsed.as_secs_f64());
+                (
+                    finite_scalar(self.target as f64 + displacement),
+                    finite_scalar(velocity),
+                    displacement.abs() <= spring.rest_delta as f64
+                        && velocity.abs() <= spring.rest_speed as f64,
+                )
+            }
+        }
+    }
 }
 struct Track {
     value: Signal<f32>,
@@ -49,12 +95,18 @@ struct Track {
     policy: Option<MotionPolicy>,
     alive: Cell<bool>,
     queued: Cell<bool>,
+    paused: Cell<bool>,
+    rate: Cell<f64>,
+    id: u64,
+    label: RefCell<String>,
 }
 impl Track {
     fn active(&self) -> bool {
-        self.policy
-            .as_ref()
-            .is_none_or(|p| p.active.with_untracked(|v| *v))
+        !self.paused.get()
+            && self
+                .policy
+                .as_ref()
+                .is_none_or(|p| p.active.with_untracked(|v| *v))
     }
     fn reduced(&self) -> bool {
         self.policy
@@ -75,47 +127,34 @@ impl Track {
         let completion = self.completion.borrow().clone();
         completion.set(Some(result));
     }
+    fn accrue_active_time(&self) {
+        if let Some(run) = self.run.borrow_mut().as_mut()
+            && let Some(last) = run.last.take()
+            && !self.paused.get()
+        {
+            run.elapsed = run.elapsed.saturating_add(scale_duration(
+                Instant::now().saturating_duration_since(last),
+                self.rate.get(),
+            ));
+        }
+    }
     fn step(&self, frame: Frame) {
         let (value, velocity, finished) = {
             let mut run = self.run.borrow_mut();
             let Some(run) = run.as_mut() else {
                 return;
             };
-            run.elapsed += run.last.map_or(frame.interval, |last| {
+            let elapsed = run.last.map_or(frame.interval, |last| {
                 frame.time.saturating_duration_since(last)
             });
+            run.elapsed = run
+                .elapsed
+                .saturating_add(scale_duration(elapsed, self.rate.get()));
             run.last = Some(frame.time);
             if run.elapsed < run.transition.delay {
                 return;
             }
-            let elapsed = run.elapsed.saturating_sub(run.transition.delay);
-            match run.transition.kind {
-                AnimationKind::Tween { duration, easing } => {
-                    let t = if duration.is_zero() {
-                        1.0
-                    } else {
-                        (elapsed.as_secs_f64() / duration.as_secs_f64()).min(1.0) as f32
-                    };
-                    (
-                        finite_scalar(
-                            run.from as f64
-                                + (run.target as f64 - run.from as f64) * easing.sample(t) as f64,
-                        ),
-                        0.0,
-                        t >= 1.0,
-                    )
-                }
-                AnimationKind::Spring(spring) => {
-                    let (displacement, velocity) =
-                        run.oscillator.unwrap().sample(elapsed.as_secs_f64());
-                    (
-                        finite_scalar(run.target as f64 + displacement),
-                        finite_scalar(velocity),
-                        displacement.abs() <= spring.rest_delta as f64
-                            && velocity.abs() <= spring.rest_speed as f64,
-                    )
-                }
-            }
+            run.sample()
         };
         if finished {
             self.finish(Completion::Finished);
@@ -131,8 +170,28 @@ impl Track {
 fn finite_scalar(value: f64) -> f32 {
     value.clamp(-(f32::MAX as f64), f32::MAX as f64) as f32
 }
+fn scale_duration(duration: Duration, rate: f64) -> Duration {
+    Duration::try_from_secs_f64(duration.as_secs_f64() * rate).unwrap_or(Duration::MAX)
+}
+
+fn scheduler_for(cx: &Context) -> Rc<Scheduler> {
+    let runtime = cx.runtime();
+    let frames = cx.try_service::<FrameClock>();
+    // Headless trees without BOTH services settle synchronously.
+    let runner = frames
+        .as_ref()
+        .and_then(|_| cx.try_service::<TaskRunner>())
+        .map(|r| (*r).clone());
+    match (frames, runner) {
+        (Some(frames), Some(runner)) => frames.motion_scheduler(runtime.clone(), Some(runner)),
+        _ => Scheduler::new(runtime.clone(), FrameClock::new(), None),
+    }
+}
+
+thread_local! { static NEXT_SCHEDULER_ID: Cell<u64> = const { Cell::new(1) }; }
 
 pub(crate) struct Scheduler {
+    id: u64,
     runtime: Runtime,
     frames: FrameClock,
     runner: Option<TaskRunner>,
@@ -141,6 +200,12 @@ pub(crate) struct Scheduler {
     wake: RefCell<Option<Waker>>,
     task: RefCell<Option<TaskToken>>,
     policy_effect: RefCell<Option<Effect>>,
+    registered: RefCell<Vec<Weak<Track>>>,
+    next_id: Cell<u64>,
+    profiling: Cell<usize>,
+    live_tracks: Cell<usize>,
+    sample_cost: Cell<Duration>,
+    sampled: Cell<usize>,
 }
 impl Scheduler {
     pub(crate) fn matches(&self, runtime: &Runtime) -> bool {
@@ -152,6 +217,11 @@ impl Scheduler {
         runner: Option<TaskRunner>,
     ) -> Rc<Self> {
         let this = Rc::new(Self {
+            id: NEXT_SCHEDULER_ID.with(|next| {
+                let id = next.get();
+                next.set(id.checked_add(1).expect("motion scheduler id overflow"));
+                id
+            }),
             revision: runtime.signal(0),
             runtime,
             frames,
@@ -160,6 +230,12 @@ impl Scheduler {
             wake: RefCell::default(),
             task: RefCell::default(),
             policy_effect: RefCell::default(),
+            registered: RefCell::default(),
+            next_id: Cell::new(1),
+            profiling: Cell::new(0),
+            live_tracks: Cell::new(0),
+            sample_cost: Cell::new(Duration::ZERO),
+            sampled: Cell::new(0),
         });
         let weak = Rc::downgrade(&this);
         let effect = this.runtime.effect(move || {
@@ -175,11 +251,8 @@ impl Scheduler {
                     if let Some(policy) = &track.policy {
                         let active = policy.active.get();
                         let reduced = policy.reduced.get();
-                        if !active
-                            && let Some(run) = track.run.borrow_mut().as_mut()
-                            && let Some(last) = run.last.take()
-                        {
-                            run.elapsed += Instant::now().saturating_duration_since(last);
+                        if !active {
+                            track.accrue_active_time();
                         }
                         if reduced && track.run.borrow().is_some() {
                             track.finish(Completion::Finished);
@@ -229,16 +302,23 @@ impl Scheduler {
         });
     }
     fn step(&self, frame: Frame) {
+        let started = (self.profiling.get() > 0).then(Instant::now);
+        let mut sampled = 0;
         self.runtime.batch(|| {
             // No user effects run until every track is sampled and the vector
             // borrow is released. A reentrant retarget joins the next frame.
             for track in self.tracks.borrow().iter() {
                 if track.alive.get() && track.active() {
+                    sampled += 1;
                     track.step(frame);
                 }
             }
             self.prune();
         });
+        if let Some(started) = started {
+            self.sample_cost.set(started.elapsed());
+            self.sampled.set(sampled);
+        }
     }
 }
 
@@ -269,13 +349,19 @@ impl Future for Driver {
                 continue;
             };
             // Resuming starts a new presentation interval, excluding pause time.
-            let remaining = run.transition.delay.saturating_sub(run.elapsed);
+            let remaining = scale_duration(
+                run.transition.delay.saturating_sub(run.elapsed),
+                1. / track.rate.get(),
+            );
             let last = if remaining.is_zero() {
                 run.last.unwrap_or(now)
             } else {
                 *run.last.get_or_insert(now)
             };
-            let deadline = last.checked_add(remaining).unwrap_or(last);
+            // An unrepresentable deadline cannot be reached by this clock.
+            let Some(deadline) = last.checked_add(remaining) else {
+                continue;
+            };
             if remaining.is_zero() || deadline <= now {
                 wants_frame = true;
             } else {
@@ -322,6 +408,9 @@ impl Drop for Owner {
     fn drop(&mut self) {
         self.track.alive.set(false);
         self.scheduler
+            .live_tracks
+            .set(self.scheduler.live_tracks.get() - 1);
+        self.scheduler
             .runtime
             .batch(|| self.track.finish(Completion::Cancelled));
         self.scheduler.changed();
@@ -345,17 +434,8 @@ impl MotionValue {
     }
     pub fn with_policy(cx: &mut Context, initial: f32, policy: Option<MotionPolicy>) -> Self {
         assert!(initial.is_finite(), "non-finite motion value");
-        let runtime = cx.runtime();
-        let frames = cx.try_service::<FrameClock>();
-        // Headless trees without BOTH services settle synchronously.
-        let runner = frames
-            .as_ref()
-            .and_then(|_| cx.try_service::<TaskRunner>())
-            .map(|r| (*r).clone());
-        let scheduler = match (frames, runner) {
-            (Some(frames), Some(runner)) => frames.motion_scheduler(runtime.clone(), Some(runner)),
-            _ => Scheduler::new(runtime.clone(), FrameClock::new(), None),
-        };
+        let scheduler = scheduler_for(cx);
+        let runtime = scheduler.runtime.clone();
         let track = Rc::new(Track {
             value: runtime.signal(initial),
             velocity: Cell::new(0.0),
@@ -364,7 +444,27 @@ impl MotionValue {
             policy,
             alive: Cell::new(true),
             queued: Cell::new(false),
+            paused: Cell::new(false),
+            rate: Cell::new(1.),
+            id: scheduler.next_id.get(),
+            label: RefCell::default(),
         });
+        scheduler.live_tracks.set(scheduler.live_tracks.get() + 1);
+        scheduler.next_id.set(
+            scheduler
+                .next_id
+                .get()
+                .checked_add(1)
+                .expect("motion track ID exhausted"),
+        );
+        let mut registered = scheduler.registered.borrow_mut();
+        if registered.len() >= 4096 {
+            registered.retain(|track| track.upgrade().is_some_and(|t| t.alive.get()));
+        }
+        if registered.len() < 4096 {
+            registered.push(Rc::downgrade(&track));
+        }
+        drop(registered);
         cx.retain(Owner {
             track: track.clone(),
             scheduler: scheduler.clone(),
@@ -403,7 +503,7 @@ impl MotionValue {
             };
             let now = Instant::now();
             let start = self.scheduler.frames.last().map_or(now, |f| f.time.max(now));
-            *self.track.run.borrow_mut() = Some(Run { from, target, transition, oscillator, elapsed: Duration::ZERO, last: Some(start) });
+            *self.track.run.borrow_mut() = Some(Run { from, target, transition, oscillator, elapsed: Duration::ZERO, last: self.track.active().then_some(start), keyframes: None, playback: Playback::default() });
             let instant = matches!(transition.kind, AnimationKind::Tween { duration, .. } if duration.is_zero()) && transition.delay.is_zero();
             if self.scheduler.runner.is_none() || self.track.reduced() || instant || (from == target && velocity == 0.0) {
                 self.track.finish(Completion::Finished);
@@ -420,6 +520,132 @@ impl MotionValue {
             result: self.track.completion.borrow().clone(),
             runtime: self.scheduler.runtime.clone(),
         }
+    }
+    pub fn animate_keyframes(
+        &self,
+        frames: Keyframes<f32>,
+        duration: Duration,
+        playback: Playback,
+    ) -> Animation {
+        assert!(
+            !duration.is_zero() || playback.repeat != Repeat::Forever,
+            "a repeating curve needs positive duration"
+        );
+        let result = self.scheduler.runtime.signal(None);
+        if !self.track.alive.get() {
+            result.set(Some(Completion::Cancelled));
+            return Animation {
+                result,
+                runtime: self.scheduler.runtime.clone(),
+            };
+        }
+        self.scheduler.runtime.batch(|| {
+            let previous = self.track.completion.replace(result.clone());
+            if previous.with_untracked(|s| s.is_none()) {
+                previous.set(Some(Completion::Cancelled));
+            }
+            let from = frames.sample(0.);
+            let target = frames.sample(playback.end());
+            *self.track.run.borrow_mut() = Some(Run {
+                from,
+                target,
+                transition: Transition::tween(duration, Easing::Linear).delay(playback.delay),
+                oscillator: None,
+                elapsed: Duration::ZERO,
+                last: self.track.active().then(|| {
+                    self.scheduler
+                        .frames
+                        .last()
+                        .map_or_else(Instant::now, |f| f.time.max(Instant::now()))
+                }),
+                keyframes: Some(frames),
+                playback,
+            });
+            self.track.velocity.set(0.);
+            self.track.value.set(from);
+            if self.scheduler.runner.is_none()
+                || self.track.reduced()
+                || (duration.is_zero() && playback.delay.is_zero())
+            {
+                self.track.finish(Completion::Finished);
+                self.scheduler.changed();
+            } else {
+                self.scheduler.enqueue(&self.track);
+            }
+        });
+        Animation {
+            result,
+            runtime: self.scheduler.runtime.clone(),
+        }
+    }
+    pub fn is_running(&self) -> bool {
+        self.track.alive.get() && self.track.run.borrow().is_some()
+    }
+    pub fn is_paused(&self) -> bool {
+        !self.track.active()
+    }
+    pub fn pause(&self) {
+        if !self.track.paused.get() {
+            if self.track.active() {
+                self.track.accrue_active_time();
+            }
+            self.track.paused.set(true);
+            self.scheduler.changed();
+        }
+    }
+    pub fn resume(&self) {
+        if self.track.paused.replace(false) {
+            if let Some(run) = self.track.run.borrow_mut().as_mut() {
+                run.last = None;
+            }
+            self.scheduler.changed();
+        }
+    }
+    /// Sample immediately without changing pause state or completing the run.
+    pub fn seek(&self, position: Duration) {
+        if !self.track.alive.get() {
+            return;
+        }
+        let sampled = {
+            let mut current = self.track.run.borrow_mut();
+            current.as_mut().map(|run| {
+                run.elapsed = run.transition.delay.saturating_add(position);
+                run.last = None;
+                let (value, velocity, _) = run.sample();
+                (value, velocity)
+            })
+        };
+        if let Some((value, velocity)) = sampled {
+            self.scheduler.runtime.batch(|| {
+                self.track.velocity.set(velocity);
+                self.track.value.set(value);
+                self.scheduler.changed();
+            });
+        }
+    }
+    pub fn set_rate(&self, rate: f64) {
+        assert!(
+            rate.is_finite() && (0.01..=100.).contains(&rate),
+            "playback rate must be in 0.01..=100"
+        );
+        if self.track.active() {
+            self.track.accrue_active_time();
+        }
+        self.track.rate.set(rate);
+        self.scheduler.changed();
+    }
+    pub fn label(&self, label: &str) {
+        *self.track.label.borrow_mut() = label.chars().take(80).collect();
+    }
+    /// Direct manipulation can preserve measured velocity for spring release.
+    pub fn set_with_velocity(&self, value: f32, velocity: f32) {
+        assert!(velocity.is_finite(), "non-finite motion velocity");
+        self.scheduler.runtime.batch(|| {
+            self.set(value);
+            if self.track.alive.get() {
+                self.track.velocity.set(velocity);
+            }
+        });
     }
     pub fn set(&self, value: f32) {
         assert!(value.is_finite(), "non-finite motion value");
@@ -499,6 +725,27 @@ impl Presence {
         self.mounted.clone()
     }
     pub fn set_present(&self, present: bool, transition: Transition) {
+        self.set_present_with(present, transition, AnimationGroup::default());
+    }
+    /// Keep the exit mounted until both presence progress and additional
+    /// property/timeline runs finish. A cancelled exit never removes the view.
+    pub fn set_present_with(
+        &self,
+        present: bool,
+        transition: Transition,
+        mut exits: AnimationGroup,
+    ) {
+        assert!(
+            exits.0.len() < tracks::MAX_TIMELINE_TRACKS,
+            "presence exit exceeds 128 tracks"
+        );
+        assert!(
+            exits
+                .0
+                .iter()
+                .all(|run| run.runtime.same(&self.progress.scheduler.runtime)),
+            "presence exit spans reactive runtimes"
+        );
         if !self.progress.track.alive.get() || self.present.replace(present) == present {
             return;
         }
@@ -510,18 +757,23 @@ impl Presence {
         let animation = self
             .progress
             .animate_to(if present { 1.0 } else { 0.0 }, transition);
+        exits.0.push(animation);
+        assert!(
+            exits.0.len() <= tracks::MAX_TIMELINE_TRACKS,
+            "presence exit exceeds 128 tracks"
+        );
         if !present {
             let this = self.clone();
             if let Some(tasks) = &self.tasks {
                 tasks.spawn(async move {
-                    if animation.finished().await == Completion::Finished
+                    if exits.finished().await == Completion::Finished
                         && !this.present.get()
                         && this.revision.get() == revision
                     {
                         this.mounted.set(false);
                     }
                 });
-            } else {
+            } else if exits.completion() == Some(Completion::Finished) {
                 self.mounted.set(false);
             }
         }
@@ -531,3 +783,7 @@ impl Presence {
 #[cfg(test)]
 #[path = "motion_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "motion_extended_tests.rs"]
+mod extended_tests;

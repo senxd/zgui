@@ -42,3 +42,29 @@ cargo test -p zgui --release motion_release_benchmark --lib -- --ignored --nocap
 Idle, all-paused, disposed, and delay-only work is covered by deterministic
 frame-demand assertions. This timing data does not establish performance of
 expensive procedural images or layout animation; measure those in the app.
+
+## Compiled typed timelines
+
+The follow-up timeline benchmark uses one scalar transport, five compiled linear
+keyframes per `Vec2` clip, and one simple reactive consumer per clip. Every case
+delivers 1,000 synthetic frames over an active 60-second timeline. Same machine
+and release profile, single-run mean CPU cost:
+
+| Parallel clips | Scalar channels | CPU µs/frame |
+|---:|---:|---:|
+| 1 | 2 | 0.489 |
+| 32 | 64 | 3.082 |
+| 128 | 256 | 12.020 |
+
+Each case asserts exactly one driver delivery per frame. This includes transport,
+curve search/interpolation, batched output writes and simple consumers. It excludes
+layout, shader dispatches, blur, text and native presentation. The scalar benchmark
+above is a different workload, so these numbers are not a claimed speedup ratio.
+
+```sh
+cargo test -p zgui --release compiled_timeline_release_benchmark --lib -- --ignored --nocapture
+```
+
+Regression tests verify that projected layout motion changes only paint after its
+initial reflow, scroll translations do not restart projection, snapshots/derived
+values request no frames, and paused/idle transports release display demand.

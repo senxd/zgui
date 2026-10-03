@@ -397,6 +397,8 @@ pub struct WindowContext {
     pub frames: FrameClock,
     /// Optional native presentation counter, independent of animation requests.
     pub frame_counter: crate::FrameCounter,
+    /// Last rendered frame's layout and shader work, read without polling.
+    pub motion_diagnostics: zgui::motion::RenderDiagnostics,
     close_requested: Option<Box<dyn FnMut() -> bool>>,
     closed: Option<Box<dyn FnOnce()>>,
     menu_action: Option<Box<dyn FnMut(crate::MenuAction)>>,
@@ -465,7 +467,10 @@ impl WindowContext {
             self.frames.clone(),
             zgui::compose::provide(
                 self.frame_counter.clone(),
-                zgui::compose::provide(runner, view),
+                zgui::compose::provide(
+                    self.motion_diagnostics.clone(),
+                    zgui::compose::provide(runner, view),
+                ),
             ),
         ))
     }
@@ -717,6 +722,7 @@ struct Host {
     ime_geometry: Option<Rect>,
     ime_target: Option<NodeId>,
     gpu_stats: Option<crate::gpu_stats::GpuStatsLog>,
+    motion_pending_layout: usize,
     counter_frame_pending: bool,
     /// `ZGUI_DAMAGE_CHECK=1`: compare every damaged frame with a full
     /// repaint and report stale pixels (slow; for debugging damage).
@@ -768,6 +774,7 @@ impl Host {
             viewport,
             frames: frames.clone(),
             frame_counter: crate::FrameCounter::default(),
+            motion_diagnostics: Default::default(),
             close_requested: None,
             closed: None,
             tasks: TaskSpawner {
@@ -821,6 +828,7 @@ impl Host {
             frame_paced: false,
             present_ready: false,
             gpu_stats: crate::gpu_stats::GpuStatsLog::from_env(),
+            motion_pending_layout: 0,
             counter_frame_pending: false,
             damage_check: std::env::var_os("ZGUI_DAMAGE_CHECK").map(|_| 0),
             frames,
@@ -968,6 +976,9 @@ impl Host {
         let scene = self.context.ui.scene.clone();
         let mut scene = scene.borrow_mut();
         let report = scene.flush();
+        self.motion_pending_layout = self
+            .motion_pending_layout
+            .saturating_add(report.layout_nodes);
         self.accessibility_geometry_dirty |= !report.damage.is_empty();
         self.counter_frame_pending |= self.context.frame_counter.content_damage(&report.damage);
         let full = [scene.bounds(scene.root())];
@@ -985,6 +996,16 @@ impl Host {
             } else {
                 if let Some(renderer) = &mut self.renderer {
                     let stats = renderer.render(&scene, damage)?;
+                    let previous = self.context.motion_diagnostics.snapshot();
+                    self.context
+                        .motion_diagnostics
+                        .record(zgui::motion::RenderSnapshot {
+                            frame: previous.frame.wrapping_add(1),
+                            layout_nodes: std::mem::take(&mut self.motion_pending_layout),
+                            shader_dispatches: stats.shader_dispatches,
+                            blur_passes: stats.blur_passes,
+                            shader_allocations: stats.shader_resource_allocations,
+                        });
                     if let Some(frame) = &mut self.damage_check {
                         *frame += 1;
                         check_damage(renderer, &scene, damage, &full, size.width as usize, *frame)?;

@@ -621,6 +621,10 @@ impl Scene {
     pub fn bounds(&self, id: NodeId) -> Rect {
         self.world(id).0
     }
+    /// Settled layout allocation, excluding every paint translation.
+    pub fn layout_bounds(&self, id: NodeId) -> Rect {
+        self.node(id).bounds
+    }
     /// Visible allocation after ancestor opacity, clipping and viewport intersection.
     /// This does not attempt occlusion testing against overlapping siblings.
     /// Layout visibility excludes hidden/display-none nodes and their descendants.

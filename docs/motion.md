@@ -94,8 +94,8 @@ still manage modal focus, pointer interaction, and accessibility as appropriate.
 
 Translation and opacity use the retained style fast path. Width/height still
 perform layout, and expensive procedural image work remains expensive. Prefer
-paint properties for feedback and entrances. Automatic layout projection,
-general scene scale/rotation, and gesture/timeline engines are outside this API.
+paint properties for feedback and entrances. Position projection, drag/snap input and bounded timelines are described below.
+General scene scale/rotation is outside this API.
 
 Run correctness checks with `cargo test -p zgui motion`. The ignored release
 benchmark reports scheduling and reactive-consumer cost without claiming GPU
@@ -149,3 +149,124 @@ Sampling stays within each clipped panel. Both paths preserve opacity and edge f
 See [native effects measurements](performance/effects/README.md) for GPU time,
 p95/p99 frame costs, allocations and memory. This is separate from scalar
 animation performance.
+
+## Keyframes and timelines
+
+`Keyframes<T>` validates 2..=1024 finite, strictly increasing offsets from 0 to 1
+and compiles reciprocal segment spans once. `Keyframe::easing` controls the
+segment starting at that keyframe. Sampling searches the compiled array; it
+allocates nothing. Supported properties include `f32`, `Vec2` and `MotionColor`,
+or a copyable custom `Interpolate` implementation. Interpolation must be pure.
+`MotionColor` decodes sRGB endpoints once and interpolates linear premultiplied
+RGBA, avoiding dark fades and transparent-color halos. Convert with `.color()`
+when applying a scene color or use `.premultiplied()` for linear shader inputs.
+
+```rust,no_run
+use std::time::Duration;
+use zgui::compose::prelude::*;
+
+let view = component(|cx| {
+    let timeline = Timeline::new(cx);
+    let position = timeline.track(Duration::ZERO, Duration::from_millis(300),
+        Keyframes::between(Vec2::new(0.0, 24.0), Vec2::default(), Easing::EaseOut)
+    ).unwrap();
+    let opacity = timeline.track(Duration::ZERO, Duration::from_millis(180),
+        Keyframes::between(0.0, 1.0, Easing::EaseOut)
+    ).unwrap();
+    timeline.play();
+    div().reactive_style(move || {
+        let p = position.get();
+        Styles::new().translate(p.x, p.y).opacity(opacity.get())
+    })
+});
+```
+
+Register up to 128 clips before playback. Equal start times run in parallel;
+`then(duration, frames)` appends after the latest clip end. One owned scalar
+transport samples every clip and batches all outputs. Timelines share the
+existing scheduler with other motion values and keep their sampler alive until
+component disposal, even if only output signals remain. Read output signals;
+mutating them directly bypasses the transport.
+
+`play` resumes or starts, `restart` cancels and begins again, `pause` freezes,
+`stop` cancels, and `seek` samples immediately. Seeking a stopped timeline
+creates a paused run, including at the endpoint; `play` completes that endpoint.
+A running timeline keeps playing after seek. `set_rate(0.5)` slows playback;
+rates must be finite and within 0.01..=100. `animate_to(0.0/1.0)` reverses from
+its current pose with proportional remaining duration. These controls are also
+available on individual `MotionValue`s.
+
+`playback(Playback { repeat: Repeat::count(3)?, alternate: true, delay, .. })`
+configures timeline loops before playback; `MotionValue::animate_keyframes`
+accepts the same configuration. A closed curve such as `[0, 1, 0]` still runs.
+Alternate even counts end at the starting value; ordinary repeats end at the
+last keyframe. `Forever` requires positive duration and settles at the last
+keyframe under reduced motion. Re-enabling motion requires an explicit restart.
+Use the budgeted `EffectScheduler` above for continuous decorative shaders;
+it handles visibility and lower sampling cadences.
+
+`cx.derive(|| ...)` creates a component-owned derived signal. `MotionPoint`
+provides a batched two-axis value with spring interruption and grouped
+completion. Derived signals do not request frames.
+
+## Layout, input and named states
+
+`.layout_motion(Transition::spring(Spring::default()))` opts a retained view
+into position projection. New layout applies once, then its previous visual
+position translates to the final position. Size changes apply immediately;
+projection composes with base/hover transforms and nested projected ancestors.
+Layout observation excludes all paint transforms, including scroll offsets,
+so animation frames do not trigger layout or restart the projection. Keep
+identity with `keyed` when reordering rows. Newly mounted or hidden views begin
+at their settled layout; this is not shared-element or size morphing.
+
+`DragMotion::new(cx, initial, MotionAxis::X, 0.0..=360.0)?` binds direct pointer
+input with `.bind(view)`. `.snap_points([0.0, 180.0, 360.0])?` selects the nearest
+point to a 150 ms velocity projection on release; `.spring(...)` tunes settling.
+The output signal is clamped to bounds while the underlying spring preserves
+velocity. Primary pointer capture keeps dragging outside the view; secondary
+release does not end it. Cancel/focus loss/disposal stop the gesture. Manual
+`begin/update/release` accept an `Instant` for deterministic host input.
+
+`ScrollProgress::new(cx).bind(scroll(offset))` publishes normalized measured
+progress, using the actual content extent minus viewport extent. Resize and
+content changes update it; a non-scrollable extent yields zero.
+
+`MotionStates::new(cx, "idle", [("idle", 0.0, idle_transition),
+("hover", 1.0, hover_transition)])?` supplies a bounded named scalar state table.
+Derive multiple properties from its signal. `set("hover")?` applies that state's
+transition; setting the current state is idempotent.
+
+`AnimationGroup::new([translation_exit, blur_exit])` combines up to 128 runs in
+one runtime. Await `.finished()` or inspect `.completion()`: all finished means
+Finished; any cancelled means Cancelled. `Presence::set_present_with(false,
+opacity_exit, group)` waits for its own opacity and every supplied exit before
+unmounting. Create exits in the owning parent; reopening invalidates older exit
+callbacks. Cancelling an exit retains the view. At most 127 extra exits can be
+supplied because Presence adds its own track.
+
+## On-demand inspector and native demo
+
+Create `MotionInspector::new(cx)` to enable sample timing for that component's
+scheduler. `.snapshot()` returns bounded registered tracks with stable IDs,
+labels, state, values, velocities, active count, frame demand and the most recent
+sample cost. `.label("panel / blur")` names a `MotionValue`. The inspector's
+`pause/resume/seek/set_rate/stop` controls reject foreign or disposed IDs. Neither
+snapshots nor controls introduce a polling task; paused/idle inspection requests
+no display refreshes. Timing uses two clock reads only while an inspector owner
+exists. Snapshots allocate on request and cap the registry at 4096 tracks;
+`total_tracks` and `registry_truncated` indicate omitted tracks.
+
+Native windows provide `RenderDiagnostics`, included in snapshots as the last
+rendered frame's layout nodes, shader dispatches/resource allocations and blur
+passes. CPU motion sample time includes batched reactive consumers; it is not
+GPU time. Existing GPU benchmarks measure shader cost separately.
+
+Run `cargo run -p zgui-desktop --example motion` for coordinated translation,
+opacity, backdrop blur and a persistent dither shader, playback controls,
+interruptible grouped exits, drag/snap, measured scrolling, layout projection
+and inspector snapshots. The shader has a lazy matching CPU fallback.
+
+Run regressions with `cargo test -p zgui motion --lib`. Measure typed timeline
+sampling with `cargo test -p zgui --release compiled_timeline_release_benchmark
+--lib -- --ignored --nocapture`.

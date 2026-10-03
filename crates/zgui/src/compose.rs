@@ -279,6 +279,8 @@ pub struct View {
     menu_trigger: Option<Signal<bool>>,
     menu_checked: Option<bool>,
     visibility: Vec<Signal<bool>>,
+    layout_motion: Option<crate::motion::Transition>,
+    scroll_progress: Option<Signal<f32>>,
 }
 impl View {
     /// Set the controlled checked state of a menu item, including accessibility.
@@ -356,6 +358,8 @@ impl View {
             menu_trigger: None,
             menu_checked: None,
             visibility: Vec::new(),
+            layout_motion: None,
+            scroll_progress: None,
         }
     }
     /// Show an interactive overlay scrollbar on a scroll viewport or virtual list.
@@ -367,6 +371,22 @@ impl View {
     /// updates on geometry/presentation changes, without per-frame scene walks.
     pub fn observe_visibility(mut self, visible: Signal<bool>) -> Self {
         self.visibility.push(visible);
+        self
+    }
+    /// Translate from the previous layout position without laying out each frame.
+    /// Size changes apply immediately; this projects position only.
+    pub fn layout_motion(mut self, transition: crate::motion::Transition) -> Self {
+        transition.validate();
+        self.layout_motion = Some(transition);
+        self
+    }
+    /// Publish normalized progress using the scroll view's measured extent.
+    pub fn scroll_progress(mut self, progress: Signal<f32>) -> Self {
+        assert!(
+            matches!(self.kind, Kind::Scroll { .. }),
+            "scroll_progress requires a scroll view"
+        );
+        self.scroll_progress = Some(progress);
         self
     }
     /// Enable bounded keyboard row navigation on a virtual list.
@@ -477,6 +497,8 @@ impl View {
     // Wrapper properties refine the component's actual root without an extra layout box.
     fn refine(self, mut inner: View) -> View {
         inner.visibility.extend(self.visibility);
+        inner.layout_motion = self.layout_motion.or(inner.layout_motion);
+        inner.scroll_progress = self.scroll_progress.or(inner.scroll_progress);
         if self.trigger_id.is_some() {
             inner.trigger_id = self.trigger_id;
         }
@@ -1885,6 +1907,13 @@ fn mount_element(
         view.layout_target = scroll_layout_target.clone();
     }
     let image_fit = is_image.then(|| ui.signal(crate::style::ObjectFit::default()));
+    let projection = view.layout_motion.map(|transition| {
+        let mut cx = Context::new(ui.runtime.clone(), environment.clone());
+        let point = crate::motion::MotionPoint::new(&mut cx, crate::motion::Vec2::default());
+        let signal = crate::motion::project_layout(ui, root, point, transition);
+        cx.finish(ui, root);
+        signal
+    });
     environment.typography = mount_style_with_intrinsic(
         ui,
         root,
@@ -1897,6 +1926,7 @@ fn mount_element(
         image_intrinsic,
         view.layout_target,
         image_fit.clone(),
+        projection,
     );
     if let Some(mut compute) = rich_compute {
         let paragraph = rich_paragraph.unwrap();
@@ -2119,7 +2149,16 @@ fn mount_element(
         ui.semantics.borrow_mut().remove(indicator);
     }
     if let (Some((offset, horizontal)), Some((viewport, content))) = (scroll_offset, scroll_nodes) {
-        mount_scroll(ui, root, viewport, content, offset, horizontal, scrollbar);
+        mount_scroll(
+            ui,
+            root,
+            viewport,
+            content,
+            offset,
+            horizontal,
+            scrollbar,
+            view.scroll_progress,
+        );
     }
     if let Some(mut compute) = compute {
         let weak = ui.downgrade();
@@ -2170,6 +2209,7 @@ fn mount_scroll(
     offset: Signal<f32>,
     horizontal: bool,
     scrollbar: bool,
+    progress: Option<Signal<f32>>,
 ) {
     use crate::scene::{Style, Transform};
     let main_size = move |size: (f32, f32)| if horizontal { size.0 } else { size.1 };
@@ -2297,6 +2337,9 @@ fn mount_scroll(
         };
         if requested != position {
             offset.set(position);
+        }
+        if let Some(progress) = &progress {
+            progress.set(if limit > 0. { position / limit } else { 0. });
         }
         let mut scene = scene.borrow_mut();
         scene.set_style(
@@ -2849,7 +2892,10 @@ pub mod prelude {
     pub use crate::cursor::Cursor;
     pub use crate::decoration::{Background, BorderStyle, Corners};
     pub use crate::motion::{
-        Completion, Easing, MotionPolicy, MotionValue, Presence, Spring, Transition,
+        AnimationGroup, Completion, DragMotion, Easing, Interpolate, Keyframe, Keyframes,
+        MotionAxis, MotionColor, MotionError, MotionInspector, MotionPoint, MotionPolicy,
+        MotionStates, MotionValue, Playback, Presence, Repeat, ScrollProgress, Spring, Timeline,
+        Transition, Vec2,
     };
     pub use crate::rich_text::Decoration;
     pub use crate::style::{ObjectFit, Styled, Styles, rgb, rgba};
