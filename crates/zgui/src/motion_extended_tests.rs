@@ -705,6 +705,16 @@ fn inspector_is_opt_in_idle_and_rejects_foreign_or_disposed_ids() {
         .id;
     let other = Harness::new(|cx| (div(), MotionInspector::new(cx)));
     assert!(!other.data.pause(id));
+    let foreign_thread_id = std::thread::spawn(|| {
+        let h = Harness::new(|cx| {
+            let _value = cx.motion_value(0.);
+            (div(), MotionInspector::new(cx))
+        });
+        h.data.snapshot().tracks[0].id
+    })
+    .join()
+    .unwrap();
+    assert!(!inspector.pause(foreign_thread_id));
     point.animate_to(Vec2::new(10., 20.), tween(100));
     h.tick();
     h.frame(1, 50);

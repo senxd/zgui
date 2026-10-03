@@ -188,7 +188,7 @@ fn scheduler_for(cx: &Context) -> Rc<Scheduler> {
     }
 }
 
-thread_local! { static NEXT_SCHEDULER_ID: Cell<u64> = const { Cell::new(1) }; }
+static NEXT_SCHEDULER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) struct Scheduler {
     id: u64,
@@ -217,11 +217,13 @@ impl Scheduler {
         runner: Option<TaskRunner>,
     ) -> Rc<Self> {
         let this = Rc::new(Self {
-            id: NEXT_SCHEDULER_ID.with(|next| {
-                let id = next.get();
-                next.set(id.checked_add(1).expect("motion scheduler id overflow"));
-                id
-            }),
+            id: NEXT_SCHEDULER_ID
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |id| id.checked_add(1),
+                )
+                .expect("motion scheduler id overflow"),
             revision: runtime.signal(0),
             runtime,
             frames,
