@@ -237,6 +237,11 @@ impl EventContext {
     pub fn focus(&mut self) {
         self.focus = Some(self.current_target);
     }
+    /// Request focus for another retained control. The dispatcher validates
+    /// focusability, visibility, disabled ancestors and the active focus scope.
+    pub fn focus_node(&mut self, node: NodeId) {
+        self.focus = Some(node);
+    }
     /// Capture pointer routing until the initiating button is released or the
     /// gesture is cancelled. Captures outside pointer-down retain the current
     /// capture button, defaulting to the primary button when none exists.

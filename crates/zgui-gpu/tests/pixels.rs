@@ -804,7 +804,7 @@ fn nested_layers_apply_opacity_at_each_boundary_and_invalidate_ancestors() {
 }
 
 #[test]
-fn isolated_overflow_and_fractional_translation_reuse_content() {
+fn isolated_overflow_repaints_fractional_translation_and_reuses_integer_translation() {
     let _gpu_fixture = gpu_fixture();
     let mut gpu = GpuRenderer::new(64, 40).unwrap();
     let mut scene = Scene::new(64., 40.);
@@ -831,13 +831,18 @@ fn isolated_overflow_and_fractional_translation_reuse_content() {
     scene.set_transform(group, Transform { x: 15.5, y: 5. });
     let d = scene.flush().damage;
     let stats = gpu.render(&scene, &d).unwrap();
-    assert_eq!(stats.layer_repaints, 0);
+    assert_eq!(stats.layer_repaints, 1);
     let half = gpu.readback().unwrap();
-    assert_ne!(p, half);
+    // Plain rectangles rasterize directly; fractional motion must preserve
+    // their overflowing opaque interior rather than interpolate old pixels.
+    assert_eq!(&half[(8 * 64 + 29) * 4..][..4], &[255, 0, 0, 255]);
     scene.set_transform(group, Transform { x: 15.75, y: 5. });
     let d = scene.flush().damage;
+    assert_eq!(gpu.render(&scene, &d).unwrap().layer_repaints, 1);
+    assert_eq!(&gpu.readback().unwrap()[(8 * 64 + 30) * 4..][..4], &[255, 0, 0, 255]);
+    scene.set_transform(group, Transform { x: 17.75, y: 5. });
+    let d = scene.flush().damage;
     assert_eq!(gpu.render(&scene, &d).unwrap().layer_repaints, 0);
-    assert_ne!(half, gpu.readback().unwrap());
     scene.set_isolated(group, false);
     let d = scene.flush().damage;
     gpu.render(&scene, &d).unwrap();
@@ -3810,8 +3815,11 @@ fn bounded_blur_damage_cached_layer_root_samples_changed_parent_backdrop() {
     );
     let damage = scene.flush().damage;
     let stats = gpu.render(&scene, &damage).unwrap();
-    assert_eq!(stats.layer_repaints, 0);
-    assert_eq!(stats.layer_cache_hits, 1);
+    // This movement changes the device-pixel phase at 1.3x. Repaint the
+    // retained layer rather than interpolating its old raster; the unchanged
+    // layer above still reuses its content when only the backdrop changes.
+    assert_eq!(stats.layer_repaints, 1);
+    assert_eq!(stats.layer_cache_hits, 0);
     assert_eq!(stats.layer_texture_allocations, 0);
     assert_blur_matches_fresh(&gpu, &scene, 260, 156, 1.3);
 }

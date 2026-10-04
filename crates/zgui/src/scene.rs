@@ -2252,7 +2252,15 @@ impl Scene {
                     let (cx, cy) = match layout {
                         Layout::Row => (cursor + m.left, cross + m.top),
                         Layout::Column => (cross + m.left, cursor + m.top),
-                        Layout::Overlay => (cross + m.left, m.top),
+                        Layout::Overlay => {
+                            let free = inner_h - h - m.top - m.bottom;
+                            let y = match style.justify {
+                                Justify::Center => free / 2.,
+                                Justify::End => free,
+                                _ => 0.,
+                            };
+                            (cross + m.left, y + m.top)
+                        }
                     };
                     children.push((*child, Rect::new(cx + padding.left, cy + padding.top, w, h)));
                     cursor += main(sizes[i]) + main_margin(&s) + style.gap + extra_gap;
@@ -4056,6 +4064,79 @@ mod tests {
 #[cfg(test)]
 mod paint_geometry_tests {
     use super::*;
+    #[test]
+    fn overlay_alignment_centers_each_layer_independently_in_both_layout_paths() {
+        for advanced in [false, true] {
+            let mut scene = Scene::new(100., 100.);
+            let parent = scene.append(
+                scene.root(),
+                NodeKind::Container(Layout::Overlay),
+                Style {
+                    width: Some(80.),
+                    height: Some(60.),
+                    padding_edges: Some(Insets {
+                        left: 4.,
+                        right: 8.,
+                        top: 2.,
+                        bottom: 6.,
+                    }),
+                    align: Align::Center,
+                    justify: Justify::Center,
+                    layout_options: advanced.then(|| {
+                        Arc::new(crate::layout::LayoutOptions {
+                            gap_x: Some(crate::layout::Length::Px(0.)),
+                            ..Default::default()
+                        })
+                    }),
+                    ..Default::default()
+                },
+            );
+            for (w, h) in [(20., 10.), (12., 18.)] {
+                scene.append(
+                    parent,
+                    NodeKind::Rect(Color(255, 255, 255, 255)),
+                    Style {
+                        width: Some(w),
+                        height: Some(h),
+                        ..Default::default()
+                    },
+                );
+            }
+            let anchored = scene.append(
+                parent,
+                NodeKind::Rect(Color(255, 0, 0, 255)),
+                Style {
+                    absolute: true,
+                    width: Some(5.),
+                    height: Some(5.),
+                    margin: Insets {
+                        left: 3.,
+                        top: 4.,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            scene.flush();
+            for child in scene
+                .children(parent)
+                .iter()
+                .copied()
+                .filter(|child| *child != anchored)
+            {
+                let rect = scene.bounds(child);
+                assert_eq!(
+                    (rect.x + rect.width / 2., rect.y + rect.height / 2.),
+                    (38., 28.),
+                    "advanced={advanced}"
+                );
+            }
+            assert_eq!(
+                (scene.bounds(anchored).x, scene.bounds(anchored).y),
+                (7., 6.)
+            );
+        }
+    }
     #[test]
     fn rect_and_quad_paint_changes_preserve_layout() {
         let mut scene = Scene::new(200., 100.);

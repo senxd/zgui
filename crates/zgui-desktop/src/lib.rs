@@ -21,6 +21,8 @@
 //! ```
 pub mod app_menu;
 mod clipboard;
+#[cfg(target_os = "windows")]
+mod editor_menu;
 pub mod file_dialog;
 #[cfg(target_os = "macos")]
 mod message_pump_macos;

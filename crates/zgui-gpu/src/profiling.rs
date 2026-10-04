@@ -15,6 +15,23 @@ pub struct GpuFrameProfile {
     pub duration_ms: f64,
     pub spans: Vec<GpuSpan>,
 }
+fn profile(frame: u64, labels: &[&'static str], ticks: &[u64], period: f64) -> Option<GpuFrameProfile> {
+    let ticks = ticks.get(..labels.len() * 2)?;
+    if labels.is_empty() || ticks.chunks_exact(2).any(|pair| pair[0] == 0 || pair[1] < pair[0]) {
+        return None;
+    }
+    let base = *ticks.iter().min()?;
+    let last = *ticks.iter().max()?;
+    Some(GpuFrameProfile {
+        frame,
+        duration_ms: (last - base) as f64 * period,
+        spans: labels.iter().enumerate().map(|(i, label)| GpuSpan {
+            label,
+            offset_ms: (ticks[2 * i] - base) as f64 * period,
+            duration_ms: (ticks[2 * i + 1] - ticks[2 * i]) as f64 * period,
+        }).collect(),
+    })
+}
 pub(crate) struct PassStamp {
     set: wgpu::QuerySet,
     start: u32,
@@ -187,34 +204,11 @@ impl Profiler {
                     .iter()
                     .map(|b| u64::from_ne_bytes(*b))
                     .collect();
-                let base = ticks[..slot.labels.len() * 2]
-                    .iter()
-                    .copied()
-                    .min()
-                    .unwrap();
-                let last = ticks[..slot.labels.len() * 2]
-                    .iter()
-                    .copied()
-                    .max()
-                    .unwrap();
-                let spans = slot
-                    .labels
-                    .iter()
-                    .enumerate()
-                    .map(|(i, label)| GpuSpan {
-                        label,
-                        offset_ms: ticks[2 * i].saturating_sub(base) as f64 * self.period,
-                        duration_ms: ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f64
-                            * self.period,
-                    })
-                    .collect();
                 // A stalled consumer must not grow profiling memory indefinitely.
-                if self.completed.len() < MAX_PENDING * 8 {
-                    self.completed.push(GpuFrameProfile {
-                        frame: slot.frame,
-                        duration_ms: last.saturating_sub(base) as f64 * self.period,
-                        spans,
-                    });
+                if self.completed.len() < MAX_PENDING * 8
+                    && let Some(profile) = profile(slot.frame, &slot.labels, &ticks, self.period)
+                {
+                    self.completed.push(profile);
                 } else {
                     self.dropped += 1;
                 }
@@ -236,6 +230,17 @@ impl Profiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_or_reversed_gpu_queries_are_not_frame_durations() {
+        let labels = ["uploads", "repaint"];
+        assert!(profile(1, &labels, &[0, 0, 8_449_491_000, 8_449_492_000], 0.001).is_none());
+        assert!(profile(1, &labels, &[100, 110, 130, 120], 0.001).is_none());
+        assert!(profile(1, &labels, &[100, 110], 0.001).is_none());
+        let valid = profile(1, &labels, &[100, 110, 120, 150], 0.001).unwrap();
+        assert_eq!(valid.duration_ms, 0.05);
+        assert_eq!(valid.spans[1].duration_ms, 0.03);
+        assert_eq!(valid.spans[1].offset_ms, 0.02);
+    }
     #[test]
     fn query_overflow_discards_partial_frame_and_recovers_next_frame() {
         let context = crate::GpuContext::new().unwrap();
