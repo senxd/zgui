@@ -1609,7 +1609,9 @@ impl Scene {
             if current != id {
                 effects.opacity *= ancestor.effects.opacity;
             }
-            clip = clipped_affine_bounds(clip, ancestor.bounds, matrix, &ancestor.style);
+            if current != id || !has_outer_shadow(&ancestor.kind) {
+                clip = clipped_affine_bounds(clip, ancestor.bounds, matrix, &ancestor.style);
+            }
         }
         (matrix.bounds(self.node(id).bounds), effects, clip)
     }
@@ -1645,6 +1647,11 @@ impl Scene {
         let transform = self.node_matrix(id).then(parent);
         let bounds = transform.bounds(node.bounds);
         let clip = clipped_affine_bounds(parent_clip, node.bounds, transform, &node.style);
+        let paint_clip = if has_outer_shadow(&node.kind) {
+            parent_clip
+        } else {
+            clip
+        };
         // Transform ink before clipping: rotated shadows and glyph overhang can
         // exceed the transformed allocation's axis-aligned box.
         let isolated = isolated || self.node(id).isolated;
@@ -1652,7 +1659,8 @@ impl Scene {
             let ink = transform.bounds(ink);
             if isolated { ink.expand(1.) } else { ink }
         });
-        if let Some(ink) = ink.and_then(|ink| clip.map_or(Some(ink), |clip| ink.intersection(clip)))
+        if let Some(ink) =
+            ink.and_then(|ink| paint_clip.map_or(Some(ink), |clip| ink.intersection(clip)))
         {
             self.add_damage(ink);
         }
@@ -1667,7 +1675,14 @@ impl Scene {
     /// World translation of `id` including its own, and the clip its children
     /// paint within.
     fn world_context(&self, id: NodeId) -> (Affine, Option<Rect>) {
-        (self.world_paint_transform(id), self.world(id).2)
+        let matrix = self.world_paint_transform(id);
+        let clip = clipped_affine_bounds(
+            self.world(id).2,
+            self.node(id).bounds,
+            matrix,
+            &self.node(id).style,
+        );
+        (matrix, clip)
     }
     /// See `Node::ink`. Computed on demand and cached until invalidated.
     fn ink(&self, id: NodeId) -> Option<Rect> {
@@ -1687,7 +1702,15 @@ impl Scene {
             }
         }
         let ink = ink
-            .and_then(|ink| clipped_bounds(Some(ink), node.bounds, &node.style))
+            .and_then(|ink| {
+                let clipped = clipped_bounds(Some(ink), node.bounds, &node.style);
+                if has_outer_shadow(&node.kind) {
+                    self.own_ink(id)
+                        .map(|own| clipped.map_or(own, |child| own.union(child)))
+                } else {
+                    clipped
+                }
+            })
             .map(|ink| self.node_matrix(id).bounds(ink));
         node.ink.set(ink);
         node.ink_valid.set(true);
@@ -2815,6 +2838,7 @@ impl Scene {
                 continue;
             }
             let clip = clipped_affine_bounds(parent_clip, node.bounds, matrix, &node.style);
+            let parent_regions = regions.clone();
             let regions = transformed_clips(regions, node.bounds, matrix, &node.style);
             let (child_mask, child_fade_transform) =
                 transformed_fade(mask, fade_transform, clip, node.bounds, matrix, &node.style);
@@ -2842,13 +2866,21 @@ impl Scene {
                 id,
                 bounds,
                 transform,
-                clip_regions: regions,
+                clip_regions: if has_outer_shadow(&node.kind) {
+                    parent_regions
+                } else {
+                    regions
+                },
                 fade_transform,
                 kind: &node.kind,
                 font: &node.font,
                 text_options: node.style.text_options,
                 effects,
-                clip,
+                clip: if has_outer_shadow(&node.kind) {
+                    parent_clip
+                } else {
+                    clip
+                },
                 mask,
             });
         }
@@ -2871,6 +2903,9 @@ impl Scene {
 }
 /// The mask a node passes to its children: its own when it fades its edges
 /// (over its clip), otherwise the one it inherited.
+fn has_outer_shadow(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } if !quad.shadows().is_empty())
+}
 fn fade_mask(inherited: Option<FadeMask>, clip: Option<Rect>, style: &Style) -> Option<FadeMask> {
     match clip {
         Some(clip) if style.fade_edges.iter().any(|band| *band > 0.) => {
@@ -2929,6 +2964,7 @@ impl<'a> Iterator for PaintIter<'a> {
         effects.opacity *= parent_opacity;
         let clip = clipped_affine_bounds(Some(parent_clip), node.bounds, matrix, &node.style)
             .unwrap_or(parent_clip);
+        let parent_regions = regions.clone();
         let regions = transformed_clips(regions, node.bounds, matrix, &node.style);
         let (child_mask, child_fade_transform) = transformed_fade(
             mask,
@@ -2954,13 +2990,21 @@ impl<'a> Iterator for PaintIter<'a> {
             id,
             bounds,
             transform,
-            clip_regions: regions,
+            clip_regions: if has_outer_shadow(&node.kind) {
+                parent_regions
+            } else {
+                regions
+            },
             fade_transform,
             kind: &node.kind,
             font: &node.font,
             text_options: node.style.text_options,
             effects,
-            clip: Some(clip),
+            clip: Some(if has_outer_shadow(&node.kind) {
+                parent_clip
+            } else {
+                clip
+            }),
             mask,
         })
     }

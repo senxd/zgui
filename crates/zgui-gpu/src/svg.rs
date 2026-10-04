@@ -7,7 +7,7 @@ use crate::GpuError;
 use std::{collections::HashMap, sync::Arc};
 use zgui::{
     image::ImageData,
-    scene::{NodeId, NodeKind, Scene},
+    scene::{NodeId, NodeKind, Rect, Scene},
     svg::SvgData,
 };
 const MAX_ENTRIES: usize = 1024;
@@ -20,6 +20,7 @@ struct Key {
     tint: Option<[u8; 4]>,
     width: u32,
     height: u32,
+    geometry: [u32; 4],
 }
 struct Entry {
     image: Arc<ImageData>,
@@ -93,6 +94,51 @@ impl SvgCache {
             (width * scale).ceil() as u32,
             (height * scale).ceil() as u32,
         );
+        self.get_raster(
+            node,
+            source,
+            width,
+            height,
+            [width as f32, height as f32, 0., 0.],
+        )
+    }
+    /// Untransformed icons are rasterized directly onto the device pixel grid.
+    pub(crate) fn get_at(
+        &mut self,
+        node: NodeId,
+        source: &Arc<SvgData>,
+        bounds: Rect,
+        scale: f32,
+    ) -> Result<(Arc<ImageData>, Rect), GpuError> {
+        let x = bounds.x * scale;
+        let y = bounds.y * scale;
+        let geometry = [
+            bounds.width * scale,
+            bounds.height * scale,
+            x - x.floor(),
+            y - y.floor(),
+        ];
+        let width = (geometry[0] + geometry[2]).ceil() as u32;
+        let height = (geometry[1] + geometry[3]).ceil() as u32;
+        let image = self.get_raster(node, source, width, height, geometry)?;
+        Ok((
+            image,
+            Rect::new(
+                x.floor() / scale,
+                y.floor() / scale,
+                width as f32 / scale,
+                height as f32 / scale,
+            ),
+        ))
+    }
+    fn get_raster(
+        &mut self,
+        node: NodeId,
+        source: &Arc<SvgData>,
+        width: u32,
+        height: u32,
+        geometry: [f32; 4],
+    ) -> Result<Arc<ImageData>, GpuError> {
         if (u64::from(width) * u64::from(height))
             .checked_mul(4)
             .is_none_or(|bytes| bytes > 32 * 1024 * 1024)
@@ -105,6 +151,7 @@ impl SvgCache {
             tint: source.tint().map(|c| [c.0, c.1, c.2, c.3]),
             width,
             height,
+            geometry: geometry.map(f32::to_bits),
         };
         if let Some(shown) = self.nodes.get_mut(&node)
             && shown.key == key
@@ -117,7 +164,7 @@ impl SvgCache {
             return Ok(shown.transformed.clone());
         }
         if !self.entries.contains_key(&key) {
-            let image = self.rasterize(source, width, height)?;
+            let image = self.rasterize(source, width, height, geometry)?;
             let bytes = image.pixels().len();
             while (self.bytes + bytes > 32 * 1024 * 1024 || self.entries.len() >= MAX_ENTRIES)
                 && !self.entries.is_empty()
@@ -163,8 +210,9 @@ impl SvgCache {
         source: &SvgData,
         width: u32,
         height: u32,
+        geometry: [f32; 4],
     ) -> Result<Arc<ImageData>, GpuError> {
-        let image = crate::assets::decode_svg(source.bytes(), width, height)?;
+        let image = crate::assets::decode_svg_at(source.bytes(), width, height, geometry)?;
         self.rasterizations += 1;
         let Some(color) = source.tint() else {
             return Ok(image);
