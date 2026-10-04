@@ -59,6 +59,9 @@ pub struct Runtime {
     inner: Rc<Inner>,
 }
 impl Runtime {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
     pub fn new() -> Self {
         Self::default()
     }

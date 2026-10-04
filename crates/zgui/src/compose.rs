@@ -52,6 +52,9 @@ impl TaskToken {
 #[derive(Clone)]
 pub struct TaskRunner(Rc<dyn Fn(LocalFuture) -> TaskToken>);
 impl TaskRunner {
+    pub(crate) fn spawn_owned(&self, future: impl Future<Output = ()> + 'static) -> TaskToken {
+        (self.0)(Box::pin(future))
+    }
     pub fn new(spawn: impl Fn(LocalFuture) -> TaskToken + 'static) -> Self {
         Self(Rc::new(spawn))
     }
@@ -261,6 +264,9 @@ pub struct View {
     reactive_style: Option<Box<dyn FnMut() -> Styles>>,
     disabled: Option<Box<dyn FnMut() -> bool>>,
     read_only: Option<Box<dyn FnMut() -> bool>>,
+    selection_style: Option<(crate::scene::Color, f32, crate::scene::Insets)>,
+    select_all_on_focus: Option<bool>,
+    on_editor: Option<Box<dyn FnOnce(crate::widgets::EditorHandle)>>,
     click: Option<Box<dyn FnMut()>>,
     events: Vec<EventListener>,
     keymap: crate::actions::Keymap,
@@ -337,6 +343,9 @@ impl View {
             reactive_style: None,
             disabled: None,
             read_only: None,
+            selection_style: None,
+            select_all_on_focus: None,
+            on_editor: None,
             click: None,
             events: Vec::new(),
             keymap: crate::actions::Keymap::new(),
@@ -454,6 +463,28 @@ impl View {
         self.read_only = Some(Box::new(move || read_only));
         self
     }
+    /// Rounded selection paint for editor views. Padding is optical paint only.
+    pub fn selection_style(
+        mut self,
+        color: crate::scene::Color,
+        radius: f32,
+        padding: crate::scene::Insets,
+    ) -> Self {
+        self.selection_style = Some((color, radius, padding));
+        self
+    }
+    pub fn select_all_on_focus(mut self, select: bool) -> Self {
+        self.select_all_on_focus = Some(select);
+        self
+    }
+    /// Capture the retained native editor for programmatic selection and editing.
+    pub fn on_editor(
+        mut self,
+        callback: impl FnOnce(crate::widgets::EditorHandle) + 'static,
+    ) -> Self {
+        self.on_editor = Some(Box::new(callback));
+        self
+    }
     /// Reactively control an editor's read-only state without remounting it.
     pub fn read_only_when(mut self, read_only: impl FnMut() -> bool + 'static) -> Self {
         self.read_only = Some(Box::new(read_only));
@@ -511,6 +542,21 @@ impl View {
         }
         if self.read_only.is_some() {
             inner.read_only = self.read_only;
+        }
+        if self.selection_style.is_some() {
+            inner.selection_style = self.selection_style;
+        }
+        if self.select_all_on_focus.is_some() {
+            inner.select_all_on_focus = self.select_all_on_focus;
+        }
+        if let Some(outer) = self.on_editor {
+            inner.on_editor = Some(match inner.on_editor.take() {
+                Some(original) => Box::new(move |editor| {
+                    original(editor.clone());
+                    outer(editor);
+                }),
+                None => outer,
+            });
         }
         if self.click.is_some() {
             inner.click = self.click;
@@ -1660,13 +1706,30 @@ fn mount_element(
             root
         }
         Kind::Button => {
+            // Definite dimensions already reserve the control's hit area. Auto
+            // padding must not squeeze fixed-height labels or square icons.
+            let fixed_height = view.styles.height.is_some() || view.styles.height_percent.is_some();
+            let square = view
+                .styles
+                .width
+                .zip(view.styles.height)
+                .is_some_and(|(w, h)| w > 0. && w == h);
+            let single_content = view
+                .children
+                .iter()
+                .filter(|child| !child.styles.absolute.unwrap_or(false))
+                .count()
+                == 1;
             let mut defaults = Styles::new()
-                .px(12.)
-                .py(8.)
+                .px(if square { 0. } else { 12. })
+                .py(if fixed_height { 0. } else { 8. })
                 .gap(6.)
                 .items_center()
                 .bg(ui.theme.surface)
                 .rounded(ui.theme.radius);
+            if single_content {
+                defaults = defaults.justify_center();
+            }
             defaults.merge(&view.styles);
             view.styles = defaults;
             if view.variants.hover.is_none() {
@@ -1760,10 +1823,12 @@ fn mount_element(
             let mut defaults = Styles::new().bg(ui.theme.surface).rounded(ui.theme.radius);
             defaults.merge(&view.styles);
             view.styles = defaults;
-            if view.variants.focus.is_none() {
-                view.variants.focus = Some(Styles::new().border(1.).border_color(ui.theme.accent));
-            }
+            // The caret/selection indicate editing focus. A composed field
+            // can opt into a border with its own explicit focus variant.
             let handle = ui.text_input_styled(parent, label, value, multiline);
+            if let Some((color, radius, padding)) = view.selection_style {
+                handle.set_selection_style(color, radius, padding);
+            }
             let root = handle.node;
             editor = Some(handle);
             root
@@ -2054,6 +2119,12 @@ fn mount_element(
         mount_slider(ui, root, value, range, environment.typography.clone());
     }
     if let Some(editor) = editor {
+        if let Some(select) = view.select_all_on_focus {
+            editor.set_select_all_on_focus(select);
+        }
+        if let Some(callback) = view.on_editor.take() {
+            callback(editor.clone());
+        }
         if let Some(mut read_only) = view.read_only.take() {
             let editor = editor.clone();
             ui.bind(root, move || editor.set_read_only(read_only()));
@@ -2821,6 +2892,9 @@ pub mod prelude {
     };
     pub use crate::cursor::Cursor;
     pub use crate::decoration::{Background, BorderStyle, Corners};
+    pub use crate::motion::{
+        Completion, Easing, MotionPolicy, MotionValue, Presence, Spring, Transition,
+    };
     pub use crate::rich_text::Decoration;
     pub use crate::style::{ObjectFit, Styled, Styles, rgb, rgba};
     pub use crate::svg::SvgData;
@@ -2853,6 +2927,94 @@ mod image_fit_tests {
 #[cfg(test)]
 mod editor_mount_tests {
     use super::*;
+    use crate::scene::Color;
+
+    #[test]
+    fn editor_focus_preserves_borders_caret_and_selection() {
+        for (multiline, border) in [false, true]
+            .into_iter()
+            .flat_map(|multiline| [None, Some(0.), Some(2.)].map(move |border| (multiline, border)))
+        {
+            let mut ui = Ui::new(400., 100.);
+            let value = ui.signal("address".into());
+            let mut editor = if multiline {
+                text_area("Editor", value)
+            } else {
+                text_input("Editor", value)
+            };
+            if let Some(border) = border {
+                editor = editor.border(border).border_color(Color(70, 80, 90, 255));
+            }
+            let view = ui.mount(editor);
+            ui.prepare_frame();
+            let borders = |ui: &Ui| {
+                ui.scene
+                    .borrow()
+                    .paint_items()
+                    .filter_map(|item| match item.kind {
+                        NodeKind::Quad(quad) | NodeKind::Panel { quad, .. }
+                            if quad.border_width > 0. =>
+                        {
+                            Some((quad.border_width, quad.border_color))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = borders(&ui);
+            ui.input.focus(&ui.scene, Some(view.node()));
+            ui.prepare_frame();
+            assert_eq!(
+                borders(&ui),
+                before,
+                "focus must not invent or replace a field border"
+            );
+            let editor = ui.focused_editor().unwrap();
+            assert_eq!(editor.node, view.node());
+            assert!(
+                ui.scene
+                    .borrow()
+                    .paint_items()
+                    .any(|item| item.effects.opacity > 0.
+                        && matches!(item.kind, NodeKind::Rect(color) if *color == ui.theme.text)),
+                "focused editor must retain its caret"
+            );
+            editor.select_all();
+            ui.prepare_frame();
+            assert_eq!(editor.copy(), "address");
+            assert!(ui.scene.borrow().paint_items().any(|item|
+                item.effects.opacity > 0. && matches!(item.kind, NodeKind::Quad(quad) if quad.fill == ui.theme.selection)),
+                "focused editor must paint its selection");
+            ui.input.focus(&ui.scene, None);
+            ui.prepare_frame();
+            assert_eq!(
+                borders(&ui),
+                before,
+                "blur must restore the same field border"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_editor_focus_border_and_default_button_focus_remain_available() {
+        for editor in [true, false] {
+            let mut ui = Ui::new(400., 100.);
+            let view = if editor {
+                text_input("Editor", ui.signal("address".into()))
+                    .focus(|s| s.border(1.).border_color(ui.theme.accent))
+            } else {
+                button().child(text("Button"))
+            };
+            let mounted = ui.mount(view);
+            ui.prepare_frame();
+            ui.input.focus(&ui.scene, Some(mounted.node()));
+            ui.prepare_frame();
+            assert!(ui.scene.borrow().paint_items().any(
+                |item| matches!(item.kind, NodeKind::Quad(quad) | NodeKind::Panel { quad, .. }
+                    if quad.border_width == 1. && quad.border_color == ui.theme.accent)
+            ));
+        }
+    }
 
     #[test]
     fn canonical_writeback_can_unmount_a_fully_registered_declarative_tree() {
@@ -2882,5 +3044,53 @@ mod editor_mount_tests {
         assert!(ui.scene.borrow().children(ui.root()).is_empty());
         drop(watcher);
         assert_eq!(ui.runtime.effect_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod control_alignment_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_controls_center_content_and_preserve_explicit_padding_and_alignment() {
+        let mut ui = Ui::new(300., 200.);
+        let root = ui.mount(
+            column().children([
+                button()
+                    .id("square")
+                    .size(32., 32.)
+                    .child(div().id("icon").size(14., 14.))
+                    .child(text("Accessible label").absolute().size(0., 0.).opacity(0.)),
+                button()
+                    .id("row")
+                    .h(28.)
+                    .px(6.)
+                    .child(text("1").id("number").text_size(10.).line_height(14.))
+                    .child(text("Option").text_size(12.).line_height(16.8)),
+                button()
+                    .id("explicit")
+                    .size(32., 32.)
+                    .px(4.)
+                    .py(3.)
+                    .justify_start()
+                    .child(div().id("explicit-icon").size(14., 14.)),
+                button().id("auto").child(text("Auto")),
+            ]),
+        );
+        ui.prepare_frame();
+        let scene = ui.scene.borrow();
+        let bounds = |name: &str| scene.bounds(root.find(name).unwrap());
+        let square = bounds("square");
+        let icon = bounds("icon");
+        assert_eq!((icon.x - square.x, icon.y - square.y), (9., 9.));
+        let row = bounds("row");
+        let number = bounds("number");
+        assert_eq!((number.x - row.x, number.y - row.y), (6., 7.));
+        let explicit = bounds("explicit");
+        let icon = bounds("explicit-icon");
+        assert_eq!((icon.x - explicit.x, icon.y - explicit.y), (4., 9.));
+        let explicit_style = scene.style(root.find("explicit").unwrap());
+        assert_eq!(explicit_style.padding_edges.unwrap().top, 3.);
+        assert_eq!(scene.style(root.find("auto").unwrap()).padding_edges.unwrap().top, 8.);
     }
 }

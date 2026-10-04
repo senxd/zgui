@@ -396,6 +396,17 @@ impl Scene {
                 let mut mapped = style(&self.node(*child).style, Layout::Column, true);
                 if layout == Layout::Overlay && root_options.display != Some(ViewDisplay::Grid) {
                     mapped.position = t::Position::Absolute;
+                    // Only in-flow layers inherit overlay alignment. Explicitly
+                    // positioned layers keep their anchors in both layout paths.
+                    if self.node(*child).style.absolute {
+                        let padding = self.resolved_padding(id, constraints);
+                        if mapped.inset.left.is_auto() && mapped.inset.right.is_auto() {
+                            mapped.inset.left = t::LengthPercentageAuto::length(padding.left);
+                        }
+                        if mapped.inset.top.is_auto() && mapped.inset.bottom.is_auto() {
+                            mapped.inset.top = t::LengthPercentageAuto::length(padding.top);
+                        }
+                    }
                 }
                 if let Some(key) = cache.nodes.get(child).copied() {
                     if cache.tree.style(key).expect("retained style") != &mapped {

@@ -89,6 +89,7 @@ enum Event {
     Close(u64),
     RequestClose(u64),
     WindowCommand(u64, WindowCommand),
+    ClipboardText(u64, String),
 }
 /// Commands are queued onto the UI thread; the operating system may decline requests.
 #[derive(Debug)]
@@ -197,6 +198,16 @@ pub struct WindowHandle {
     closed: Arc<AtomicBool>,
 }
 impl WindowHandle {
+    /// Queue a native clipboard write. `Ok` means queued; OS failures are reported
+    /// through stderr when the UI thread executes the write.
+    pub fn set_clipboard_text(&self, text: &str) -> Result<(), String> {
+        if self.is_closed() {
+            return Err("window is closed".into());
+        }
+        self.proxy
+            .send_event(Event::ClipboardText(self.token, text.to_owned()))
+            .map_err(|_| "application event loop is closed".into())
+    }
     pub fn set_bounds(&self, bounds: crate::WindowBounds) {
         if bounds.size.0 > 0 && bounds.size.1 > 0 {
             self.command(WindowCommand::Bounds(bounds));
@@ -392,6 +403,8 @@ pub struct WindowContext {
     /// Display-paced animation frames for this window. Components reach it
     /// through `Context::frames`.
     pub frames: FrameClock,
+    /// Optional native presentation counter, independent of animation requests.
+    pub frame_counter: crate::FrameCounter,
     close_requested: Option<Box<dyn FnMut() -> bool>>,
     closed: Option<Box<dyn FnOnce()>>,
     menu_action: Option<Box<dyn FnMut(crate::MenuAction)>>,
@@ -458,7 +471,10 @@ impl WindowContext {
         });
         self.ui.render(zgui::compose::provide(
             self.frames.clone(),
-            zgui::compose::provide(runner, view),
+            zgui::compose::provide(
+                self.frame_counter.clone(),
+                zgui::compose::provide(runner, view),
+            ),
         ))
     }
 
@@ -709,6 +725,7 @@ struct Host {
     ime_geometry: Option<Rect>,
     ime_target: Option<NodeId>,
     gpu_stats: Option<crate::gpu_stats::GpuStatsLog>,
+    counter_frame_pending: bool,
     /// `ZGUI_DAMAGE_CHECK=1`: compare every damaged frame with a full
     /// repaint and report stale pixels (slow; for debugging damage).
     damage_check: Option<u64>,
@@ -758,6 +775,7 @@ impl Host {
             ui,
             viewport,
             frames: frames.clone(),
+            frame_counter: crate::FrameCounter::default(),
             close_requested: None,
             closed: None,
             tasks: TaskSpawner {
@@ -811,6 +829,7 @@ impl Host {
             frame_paced: false,
             present_ready: false,
             gpu_stats: crate::gpu_stats::GpuStatsLog::from_env(),
+            counter_frame_pending: false,
             damage_check: std::env::var_os("ZGUI_DAMAGE_CHECK").map(|_| 0),
             frames,
             #[cfg(target_os = "macos")]
@@ -946,6 +965,7 @@ impl Host {
         let mut scene = scene.borrow_mut();
         let report = scene.flush();
         self.accessibility_geometry_dirty |= !report.damage.is_empty();
+        self.counter_frame_pending |= self.context.frame_counter.content_damage(&report.damage);
         let full = [scene.bounds(scene.root())];
         let damage = if self.force {
             &full[..]
@@ -984,6 +1004,9 @@ impl Host {
             } else {
                 let status = renderer.present_with_notify(|| window.pre_present_notify())?;
                 if status == zgui_gpu::PresentationStatus::Presented {
+                    self.context
+                        .frame_counter
+                        .presented(std::mem::take(&mut self.counter_frame_pending));
                     self.present_ready = false;
                     let now = std::time::Instant::now();
                     self.trim_at = Some(now + TRIM_DELAY);
@@ -1079,6 +1102,58 @@ impl Host {
             }
         }
         true
+    }
+    #[cfg(target_os = "windows")]
+    fn editor_context_menu(&mut self, editor: zgui::widgets::EditorHandle, keyboard: bool) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let selected = !editor.editor.borrow().selection().is_empty();
+        let nonempty = !editor.editor.borrow().text().is_empty();
+        let paste = self
+            .clipboard
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|clipboard| clipboard.get_text().is_ok());
+        let caret = keyboard.then(|| {
+            let caret = self.context.ui.scene.borrow().bounds(editor.caret);
+            (caret.x, caret.y + caret.height)
+        });
+        let action = crate::editor_menu::show(
+            &window,
+            selected,
+            !editor.is_read_only(),
+            nonempty,
+            paste,
+            caret,
+        );
+        match action {
+            1 | 2 => {
+                let text = editor.copy();
+                if !text.is_empty()
+                    && self
+                        .clipboard
+                        .borrow_mut()
+                        .as_mut()
+                        .is_some_and(|clipboard| clipboard.set_text(text).is_ok())
+                    && action == 1
+                {
+                    editor.cut();
+                }
+            }
+            3 => {
+                let text = self
+                    .clipboard
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|clipboard| clipboard.get_text().ok());
+                if let Some(text) = text {
+                    editor.paste(&text);
+                }
+            }
+            4 => editor.select_all(),
+            _ => {}
+        }
     }
     fn accessibility_action(&mut self, request: accesskit::ActionRequest) {
         let Some(node) = self.tree.scene_node(request.target_node) else {
@@ -1566,6 +1641,17 @@ impl Host {
                 } else {
                     InputEvent::PointerUp { x, y, button }
                 })?;
+                #[cfg(target_os = "windows")]
+                if state == ElementState::Released
+                    && button == PointerButton::Secondary
+                    && let Some(editor) = self.context.ui.editor_at(x, y)
+                {
+                    self.context
+                        .ui
+                        .input
+                        .focus(&self.context.ui.scene, Some(editor.node));
+                    self.editor_context_menu(editor, false);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = wheel_delta(delta, self.scale_factor);
@@ -1609,6 +1695,18 @@ impl Host {
                 is_synthetic: true, ..
             } => {}
             WindowEvent::KeyboardInput { event, .. } => {
+                #[cfg(target_os = "windows")]
+                if event.state == ElementState::Pressed
+                    && (event.logical_key
+                        == winit::keyboard::Key::Named(winit::keyboard::NamedKey::ContextMenu)
+                        || (self.modifiers.shift
+                            && event.logical_key
+                                == winit::keyboard::Key::Named(winit::keyboard::NamedKey::F10)))
+                    && let Some(editor) = self.context.ui.focused_editor()
+                {
+                    self.editor_context_menu(editor, true);
+                    return Ok(());
+                }
                 let key = map_key(&event.logical_key);
                 let mut prevented = false;
                 if let Some(key) = key
@@ -2151,6 +2249,24 @@ impl ApplicationHandler<Event> for WindowManager {
                     .find(|request| request.handle.token == token && !request.handle.is_closed())
                 {
                     request.state.apply(&mut request.options, &command);
+                }
+            }
+            Event::ClipboardText(token, text) => {
+                if self
+                    .hosts
+                    .get(&token)
+                    .is_some_and(|host| !host.context.window.is_closed())
+                {
+                    let mut clipboard = self.factory.clipboard.borrow_mut();
+                    let result = clipboard
+                        .as_mut()
+                        .ok_or_else(|| "native clipboard unavailable".to_string())
+                        .and_then(|clipboard| {
+                            clipboard.set_text(text).map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = result {
+                        eprintln!("zgui: clipboard write failed: {error}");
+                    }
                 }
             }
             Event::Close(token) => self.close(token),

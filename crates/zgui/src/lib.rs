@@ -22,6 +22,7 @@ pub mod components;
 pub mod timer;
 
 pub mod frame;
+pub mod motion;
 
 pub mod rich_text;
 pub mod text_layout;
@@ -46,6 +47,9 @@ mod composition_guide {}
 #[cfg(doctest)]
 #[doc = include_str!("../../../docs/styling.md")]
 mod styling_guide {}
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/motion.md")]
+mod motion_guide {}
 
 pub mod actions;
 

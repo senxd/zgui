@@ -50,6 +50,7 @@ impl Frame {
 pub struct FrameClock(Rc<Inner>);
 #[derive(Default)]
 struct Inner {
+    motions: RefCell<Vec<std::rc::Weak<crate::motion::Scheduler>>>,
     waiters: RefCell<BTreeMap<u64, Waiter>>,
     next_id: Cell<u64>,
     last: Cell<Option<Frame>>,
@@ -65,6 +66,24 @@ struct Waiter {
 }
 
 impl FrameClock {
+    pub(crate) fn motion_scheduler(
+        &self,
+        runtime: crate::reactive::Runtime,
+        runner: Option<crate::compose::TaskRunner>,
+    ) -> Rc<crate::motion::Scheduler> {
+        let mut motions = self.0.motions.borrow_mut();
+        motions.retain(|motion| motion.strong_count() > 0);
+        if let Some(motion) = motions
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .find(|motion| motion.matches(&runtime))
+        {
+            return motion;
+        }
+        let motion = crate::motion::Scheduler::new(runtime, self.clone(), runner);
+        motions.push(Rc::downgrade(&motion));
+        motion
+    }
     pub fn new() -> Self {
         Self::default()
     }

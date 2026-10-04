@@ -5,6 +5,69 @@ use std::sync::{
 };
 static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Add a rectangle to disjoint damage regions. Intersecting thin strips must
+/// not inflate into their mostly-clean bounding box. GPU callers may also
+/// merge nearby regions within `near_area` to reduce draw overhead.
+pub fn merge_damage(regions: &mut Vec<Rect>, rect: Rect, near_area: Option<f32>) {
+    let area = |r: Rect| r.width * r.height;
+    // Subtract first, merge second. Interleaving them can repeatedly split
+    // and regrow the same L shape without making progress.
+    let mut pending = vec![rect];
+    for existing in regions.iter() {
+        pending = pending
+            .into_iter()
+            .flat_map(|rect| {
+                let Some(overlap) = existing.intersection(rect) else {
+                    return vec![rect];
+                };
+                [
+                    Rect::new(rect.x, rect.y, rect.width, overlap.y - rect.y),
+                    Rect::new(
+                        rect.x,
+                        overlap.y + overlap.height,
+                        rect.width,
+                        rect.y + rect.height - overlap.y - overlap.height,
+                    ),
+                    Rect::new(rect.x, overlap.y, overlap.x - rect.x, overlap.height),
+                    Rect::new(
+                        overlap.x + overlap.width,
+                        overlap.y,
+                        rect.x + rect.width - overlap.x - overlap.width,
+                        overlap.height,
+                    ),
+                ]
+                .into_iter()
+                .filter(|band| band.width > 0. && band.height > 0.)
+                .collect()
+            })
+            .collect();
+    }
+    regions.extend(pending);
+    loop {
+        let mut pair = None;
+        'pairs: for a in 0..regions.len() {
+            for b in a + 1..regions.len() {
+                let union = regions[a].union(regions[b]);
+                if area(union)
+                    <= (area(regions[a]) + area(regions[b])) * 1.5 + near_area.unwrap_or(0.)
+                    && !regions
+                        .iter()
+                        .enumerate()
+                        .any(|(i, r)| i != a && i != b && r.intersects(union))
+                {
+                    pair = Some((a, b, union));
+                    break 'pairs;
+                }
+            }
+        }
+        let Some((a, b, union)) = pair else {
+            break;
+        };
+        regions[a] = union;
+        regions.swap_remove(b);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId {
     index: u32,
@@ -410,6 +473,9 @@ type FontMeasurer =
     dyn Fn(&std::sync::Arc<str>, f32, Option<f32>, &crate::text_layout::FontStyle) -> (f32, f32);
 pub struct Scene {
     identity: u64,
+    visibility_revision: u64,
+    raster_revision: u64,
+    scroll_copy_count: usize,
     slots: Vec<Slot>,
     free: Vec<u32>,
     root: NodeId,
@@ -504,6 +570,9 @@ impl Scene {
             pending_moves: Vec::new(),
             moves: Vec::new(),
             flush_serial: 0,
+            visibility_revision: 0,
+            raster_revision: 0,
+            scroll_copy_count: 0,
             isolation_count: 0,
             text_measurer: None,
             text_shaper: None,
@@ -1058,6 +1127,9 @@ impl Scene {
         if node.isolated {
             self.isolation_count -= 1;
         }
+        if node.scroll_copy {
+            self.scroll_copy_count -= 1;
+        }
         if node.effects.blur_radius > 0.0 {
             self.blur_nodes.retain(|entry| *entry != id);
         }
@@ -1111,6 +1183,7 @@ impl Scene {
         }
         self.damage_subtree(id);
         if own_visible(&self.node(id).style) != own_visible(&style) {
+            self.visibility_revision = self.visibility_revision.wrapping_add(1);
             self.geometry_revision = self.geometry_revision.wrapping_add(1);
         }
         self.node_mut(id).style = style;
@@ -1184,7 +1257,12 @@ impl Scene {
         if self.node(id).effects == effects {
             return;
         }
+        self.raster_revision = self.raster_revision.wrapping_add(1);
+        if self.node(id).scroll_copy {
+            self.node_mut(id).layer_revision = self.node(id).layer_revision.wrapping_add(1);
+        }
         if (self.node(id).effects.opacity <= 0.) != (effects.opacity <= 0.) {
+            self.visibility_revision = self.visibility_revision.wrapping_add(1);
             self.geometry_revision = self.geometry_revision.wrapping_add(1);
         }
         let old_blur = self.node(id).effects.blur_radius > 0.0;
@@ -1200,11 +1278,16 @@ impl Scene {
         self.invalidate(id, COMPOSITE);
     }
     fn invalidate(&mut self, id: NodeId, flags: u8) {
-        if self.isolation_count > 0 {
+        if flags & (LAYOUT | PAINT) != 0 {
+            self.raster_revision = self.raster_revision.wrapping_add(1);
+        }
+        if self.isolation_count > 0 || self.scroll_copy_count > 0 {
             let mut current = Some(id);
             while let Some(ancestor) = current {
                 let node = self.node_mut(ancestor);
-                if node.isolated && (ancestor != id || flags & (LAYOUT | PAINT) != 0) {
+                if (node.isolated || node.scroll_copy)
+                    && (ancestor != id || flags & (LAYOUT | PAINT) != 0)
+                {
                     node.layer_revision = node.layer_revision.wrapping_add(1);
                 }
                 current = node.parent;
@@ -1282,19 +1365,10 @@ impl Scene {
             (rect.x + rect.width).ceil() - rect.x.floor(),
             (rect.y + rect.height).ceil() - rect.y.floor(),
         );
-        let Some(mut rect) = rect.intersection(self.viewport) else {
+        let Some(rect) = rect.intersection(self.viewport) else {
             return;
         };
-        let mut index = 0;
-        while index < self.damage.len() {
-            if self.damage[index].intersects(rect) {
-                rect = self.damage.swap_remove(index).union(rect);
-                index = 0;
-            } else {
-                index += 1;
-            }
-        }
-        self.damage.push(rect);
+        merge_damage(&mut self.damage, rect, None);
         // Bound fragmentation: many independent writes are cheaper as one surface update.
         if self.damage.len() > 64 {
             self.damage.clear();
@@ -1322,10 +1396,11 @@ impl Scene {
         }
         let bounds = node.bounds.translated(transform);
         let mut clip = Some(self.viewport);
+        let shadow_owner = has_outer_shadow(&node.kind).then_some(id);
         let mut current = Some(id);
         while let Some(id) = current {
             let ancestor = self.node(id);
-            if clip_axes(&ancestor.style) != (false, false) {
+            if clip_axes(&ancestor.style) != (false, false) && shadow_owner != Some(id) {
                 let mut offset = ancestor.transform;
                 let mut parent = ancestor.parent;
                 while let Some(parent_id) = parent {
@@ -1371,7 +1446,12 @@ impl Scene {
         } else {
             parent_clip
         };
-        self.damage_painted(id, bounds, node.effects.blur_radius, clip);
+        let paint_clip = if has_outer_shadow(&node.kind) {
+            parent_clip
+        } else {
+            clip
+        };
+        self.damage_painted(id, bounds, node.effects.blur_radius, paint_clip);
         for index in 0..self.node(id).children.len() {
             let child = self.node(id).children[index];
             self.damage_subtree_in(child, transform, clip);
@@ -1380,7 +1460,8 @@ impl Scene {
     /// World translation of `id` including its own, and the clip its children
     /// paint within.
     fn world_context(&self, id: NodeId) -> (Transform, Option<Rect>) {
-        let (_, _, clip) = self.world(id);
+        let (bounds, _, clip) = self.world(id);
+        let clip = clipped_bounds(clip, bounds, &self.node(id).style);
         let mut transform = Transform::default();
         let mut current = Some(id);
         while let Some(id) = current {
@@ -1409,7 +1490,15 @@ impl Scene {
             }
         }
         let ink = ink
-            .and_then(|ink| clipped_bounds(Some(ink), node.bounds, &node.style))
+            .and_then(|ink| {
+                let clipped = clipped_bounds(Some(ink), node.bounds, &node.style);
+                if has_outer_shadow(&node.kind) {
+                    self.own_ink(id)
+                        .map(|own| clipped.map_or(own, |child| own.union(child)))
+                } else {
+                    clipped
+                }
+            })
             .map(|ink| ink.translated(node.transform));
         node.ink.set(ink);
         node.ink_valid.set(true);
@@ -1948,7 +2037,15 @@ impl Scene {
                     let (cx, cy) = match layout {
                         Layout::Row => (cursor + m.left, cross + m.top),
                         Layout::Column => (cross + m.left, cursor + m.top),
-                        Layout::Overlay => (cross + m.left, m.top),
+                        Layout::Overlay => {
+                            let free = inner_h - h - m.top - m.bottom;
+                            let y = match style.justify {
+                                Justify::Center => free / 2.,
+                                Justify::End => free,
+                                _ => 0.,
+                            };
+                            (cross + m.left, y + m.top)
+                        }
                     };
                     children.push((*child, Rect::new(cx + padding.left, cy + padding.top, w, h)));
                     cursor += main(sizes[i]) + main_margin(&s) + style.gap + extra_gap;
@@ -2178,6 +2275,11 @@ impl Scene {
     /// Mark `id` as scroll content: translating it reports a `ScrollMove`
     /// instead of damaging everything it paints.
     pub fn set_scroll_copy(&mut self, id: NodeId, enabled: bool) {
+        if self.node(id).scroll_copy == enabled {
+            return;
+        }
+        self.scroll_copy_count =
+            self.scroll_copy_count - usize::from(self.node(id).scroll_copy) + usize::from(enabled);
         self.node_mut(id).scroll_copy = enabled;
     }
     /// Moves reported by the most recent flush.
@@ -2210,6 +2312,11 @@ impl Scene {
         let mut moves = Vec::new();
         for (id, from, again) in pending {
             if !self.contains(id) {
+                continue;
+            }
+            // Geometry-only scrollers (e.g. a mirrored scrollbar's extent)
+            // move no pixels and must not invalidate overlapping real content.
+            if self.ink(id).is_none() {
                 continue;
             }
             let to = self.node(id).transform;
@@ -2268,7 +2375,35 @@ impl Scene {
                 }
             }
         }
-        // Nested or overlapping moves: repaint instead.
+        // Two-axis scrollers translate wrappers on each axis. If the outer
+        // wrapper paints only the inner content through the same clip, this
+        // is one rigid diagonal move, not two conflicting copies.
+        let mut merged = true;
+        while merged {
+            merged = false;
+            'pairs: for outer in 0..moves.len() {
+                for inner in 0..moves.len() {
+                    if outer != inner
+                        && moves[outer].clip == moves[inner].clip
+                        && self.is_within(moves[inner].node, moves[outer].node)
+                        && self
+                            .layer_items(Some(moves[outer].node))
+                            .iter()
+                            .all(|item| {
+                                self.is_within(item.id, moves[inner].node)
+                                    || (!item.isolated && self.own_ink(item.id).is_none())
+                            })
+                    {
+                        moves[inner].dx += moves[outer].dx;
+                        moves[inner].dy += moves[outer].dy;
+                        moves.remove(outer);
+                        merged = true;
+                        break 'pairs;
+                    }
+                }
+            }
+        }
+        // Remaining nested or overlapping moves: repaint instead.
         let overlapping: Vec<usize> = (0..moves.len())
             .filter(|&i| {
                 (0..moves.len()).any(|j| {
@@ -2366,6 +2501,19 @@ impl Scene {
     pub fn content_revision(&self) -> u64 {
         self.content_revision
     }
+    /// Accessible traversal changes; rigid translations only change bounds.
+    pub fn projection_revision(&self) -> (u64, u64, u64, u64) {
+        (
+            self.identity,
+            self.content_revision,
+            self.layout_revision,
+            self.visibility_revision,
+        )
+    }
+    /// Pixel content/effects/layout revision, excluding rigid translations.
+    pub fn raster_revision(&self) -> u64 {
+        self.raster_revision
+    }
     /// True when any node applies a backdrop blur, whose output depends on
     /// pixels outside its own subtree.
     pub fn has_backdrop_blur(&self) -> bool {
@@ -2456,7 +2604,11 @@ impl Scene {
                 font: &node.font,
                 text_options: node.style.text_options,
                 effects,
-                clip,
+                clip: if has_outer_shadow(&node.kind) {
+                    parent_clip
+                } else {
+                    clip
+                },
                 mask,
             });
         }
@@ -2471,6 +2623,9 @@ impl Scene {
 }
 /// The mask a node passes to its children: its own when it fades its edges
 /// (over its clip), otherwise the one it inherited.
+fn has_outer_shadow(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } if !quad.shadows().is_empty())
+}
 fn fade_mask(inherited: Option<FadeMask>, clip: Option<Rect>, style: &Style) -> Option<FadeMask> {
     match clip {
         Some(clip) if style.fade_edges.iter().any(|band| *band > 0.) => {
@@ -2536,7 +2691,11 @@ impl<'a> Iterator for PaintIter<'a> {
             font: &node.font,
             text_options: node.style.text_options,
             effects,
-            clip: Some(clip),
+            clip: Some(if has_outer_shadow(&node.kind) {
+                parent_clip
+            } else {
+                clip
+            }),
             mask,
         })
     }
@@ -2545,6 +2704,89 @@ impl<'a> Iterator for PaintIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn damage_keeps_thin_strips_disjoint_without_inflating_the_viewport() {
+        let mut regions = Vec::new();
+        merge_damage(&mut regions, Rect::new(0., 0., 1000., 8.), None);
+        merge_damage(&mut regions, Rect::new(992., 0., 8., 800.), None);
+        assert_eq!(
+            regions.iter().map(|r| r.width * r.height).sum::<f32>(),
+            14336.
+        );
+        // Overlapping additions must terminate, cover every input pixel and
+        // keep alpha pixels in exactly one repaint region.
+        let mut regions = Vec::new();
+        let mut covered = [false; 64 * 64];
+        for i in 0..120 {
+            let (x, y) = ((i * 17) % 48, (i * 29) % 48);
+            let rect = Rect::new(x as f32, y as f32, 16., 16.);
+            merge_damage(&mut regions, rect, Some(4.));
+            for y in y..y + 16 {
+                for x in x..x + 16 {
+                    covered[y * 64 + x] = true;
+                }
+            }
+            for (index, a) in regions.iter().enumerate() {
+                assert!(regions[index + 1..].iter().all(|b| !a.intersects(*b)));
+            }
+            for (index, pixel) in covered.iter().enumerate() {
+                if *pixel {
+                    let (x, y) = ((index % 64) as f32 + 0.5, (index / 64) as f32 + 0.5);
+                    assert!(
+                        regions.iter().any(|r| r.x <= x
+                            && x < r.x + r.width
+                            && r.y <= y
+                            && y < r.y + r.height)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_mirrored_scroll_extent_and_nested_axes_preserve_rigid_moves() {
+        use crate::{compose::prelude::*, widgets::Ui};
+        let mut ui = Ui::new(160., 120.);
+        let x = ui.signal(0.);
+        let y = ui.signal(0.);
+        ui.mount(
+            overlay()
+                .w_full()
+                .h_full()
+                .child(
+                    scroll_x(x.clone()).w_full().h_full().child(
+                        scroll(y.clone())
+                            .w(300.)
+                            .h_full()
+                            .child(div().size(300., 360.).bg(rgb(0x223344))),
+                    ),
+                )
+                .child(
+                    scroll(y.clone())
+                        .absolute()
+                        .right(0.)
+                        .w(8.)
+                        .h_full()
+                        .child(div().size(8., 360.)),
+                ),
+        );
+        ui.prepare_frame();
+        ui.scene.borrow_mut().flush();
+        y.set(12.);
+        ui.prepare_frame();
+        ui.scene.borrow_mut().flush();
+        assert_eq!(ui.scene.borrow().scroll_moves().len(), 1);
+        x.set(12.);
+        y.set(24.);
+        ui.prepare_frame();
+        ui.scene.borrow_mut().flush();
+        let scene = ui.scene.borrow();
+        assert_eq!(scene.scroll_moves().len(), 1);
+        assert_eq!(
+            (scene.scroll_moves()[0].dx, scene.scroll_moves()[0].dy),
+            (-12., -12.)
+        );
+    }
     fn text(value: &str) -> NodeKind {
         NodeKind::Text {
             text: value.into(),
@@ -3060,6 +3302,79 @@ mod tests {
 #[cfg(test)]
 mod paint_geometry_tests {
     use super::*;
+    #[test]
+    fn overlay_alignment_centers_each_layer_independently_in_both_layout_paths() {
+        for advanced in [false, true] {
+            let mut scene = Scene::new(100., 100.);
+            let parent = scene.append(
+                scene.root(),
+                NodeKind::Container(Layout::Overlay),
+                Style {
+                    width: Some(80.),
+                    height: Some(60.),
+                    padding_edges: Some(Insets {
+                        left: 4.,
+                        right: 8.,
+                        top: 2.,
+                        bottom: 6.,
+                    }),
+                    align: Align::Center,
+                    justify: Justify::Center,
+                    layout_options: advanced.then(|| {
+                        Arc::new(crate::layout::LayoutOptions {
+                            gap_x: Some(crate::layout::Length::Px(0.)),
+                            ..Default::default()
+                        })
+                    }),
+                    ..Default::default()
+                },
+            );
+            for (w, h) in [(20., 10.), (12., 18.)] {
+                scene.append(
+                    parent,
+                    NodeKind::Rect(Color(255, 255, 255, 255)),
+                    Style {
+                        width: Some(w),
+                        height: Some(h),
+                        ..Default::default()
+                    },
+                );
+            }
+            let anchored = scene.append(
+                parent,
+                NodeKind::Rect(Color(255, 0, 0, 255)),
+                Style {
+                    absolute: true,
+                    width: Some(5.),
+                    height: Some(5.),
+                    margin: Insets {
+                        left: 3.,
+                        top: 4.,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            scene.flush();
+            for child in scene
+                .children(parent)
+                .iter()
+                .copied()
+                .filter(|child| *child != anchored)
+            {
+                let rect = scene.bounds(child);
+                assert_eq!(
+                    (rect.x + rect.width / 2., rect.y + rect.height / 2.),
+                    (38., 28.),
+                    "advanced={advanced}"
+                );
+            }
+            assert_eq!(
+                (scene.bounds(anchored).x, scene.bounds(anchored).y),
+                (7., 6.)
+            );
+        }
+    }
     #[test]
     fn rect_and_quad_paint_changes_preserve_layout() {
         let mut scene = Scene::new(200., 100.);

@@ -72,6 +72,7 @@ Components resolve typed services with `cx.service::<Model>()`, initialize local
 The framework includes:
 
 - Tracked signals, equal-write suppression, batching, scoped providers, stable reactive collection rows, keyed views, explicit ownership, cancellation, bounded background workers and wake-driven async tasks.
+- [Shared motion values](docs/motion.md), named/custom Bezier easings, analytical springs, reduced-motion policy and retained exits, with batched display-paced updates and no idle frame requests.
 - Cached row/column/overlay layout, grid placement/spans, wrapping/reversed flex, basis and alignment, percentage constraints/spacing, auto margins, absolute insets, aspect ratios and independent overflow policies.
 - Shaped rich text with inline links/decorations, font features/fallbacks, custom fonts, alignment, ellipsis and line clamping; bounded glyph/image caches and persistent damage rendering.
 - Retained vector paths, gradient/pattern fills, independent border edges/corners, multiple shadows, device-scale SVG/tint/transforms, async image caching and visibility-aware GIF playback. Transparency, edge fades, backdrop blur and explicit cached compositor layers compose with these views.

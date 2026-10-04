@@ -67,8 +67,39 @@ pub struct EditorHandle {
     text: NodeId,
     scene: Rc<RefCell<Scene>>,
     geometry: Rc<RefCell<Option<(Rect, Style, u64)>>>,
+    selection_style: Rc<Cell<(Color, f32, Insets)>>,
+    select_all_on_focus: Rc<Cell<bool>>,
+    caret_blink_at: Rc<Cell<Instant>>,
+    caret_blink_active: Rc<Cell<bool>>,
 }
 impl EditorHandle {
+    pub fn set_select_all_on_focus(&self, select: bool) {
+        self.select_all_on_focus.set(select);
+    }
+    pub fn set_selection(&self, anchor: usize, focus: usize) {
+        self.preferred_x.set(None);
+        // Model effects can be queued while an application effect is running.
+        // Resolve offsets against the current value before its paint binding runs.
+        self.value.with(|value| {
+            let mut editor = self.editor.borrow_mut();
+            editor.set_text_ref(&normalize_text(value, self.multiline));
+            editor.set_selection(anchor, focus);
+        });
+        self.refresh();
+    }
+    pub fn select_all(&self) {
+        let end = self
+            .value
+            .with(|value| normalize_text(value, self.multiline).len());
+        self.set_selection(0, end);
+    }
+    /// Style selection paint without changing glyph positions or hit testing.
+    pub fn set_selection_style(&self, color: Color, radius: f32, padding: Insets) {
+        let next = (color, radius.max(0.), padding);
+        if self.selection_style.replace(next) != next {
+            self.refresh();
+        }
+    }
     /// Whether user editing is blocked. Selection, copying and model writes remain available.
     pub fn is_read_only(&self) -> bool {
         self.read_only.get()
@@ -1131,6 +1162,21 @@ impl Ui {
             .focused()
             .and_then(|id| self.storage.editors.borrow().get(&id).cloned())
     }
+    /// The editable control under a pointer, including its text/selection children.
+    pub fn editor_at(&self, x: f32, y: f32) -> Option<EditorHandle> {
+        let scene = self.scene.borrow();
+        let editors = self.storage.editors.borrow();
+        for hit in scene.hit_test_all(x, y) {
+            let mut node = Some(hit);
+            while let Some(id) = node {
+                if let Some(editor) = editors.get(&id) {
+                    return Some(editor.clone());
+                }
+                node = scene.parent(id);
+            }
+        }
+        None
+    }
     pub fn dispatch(&mut self, event: InputEvent) -> crate::input::DispatchResult {
         self.try_dispatch(event)
             .unwrap_or_else(|error| panic!("{error}"))
@@ -1173,15 +1219,24 @@ impl Ui {
             && self.input.focused() == Some(job.owner)
             && self.input.is_enabled(&self.scene.borrow(), job.owner)
     }
-    /// Next deadline for active editor drag autoscroll. Idle editors schedule nothing.
+    /// Next deadline for editing interactions. Unfocused/hidden editors schedule nothing.
     pub fn next_interaction_deadline(&self) -> Option<Instant> {
         [
             self.input.next_key_deadline(),
             self.next_editor_interaction_deadline(),
+            self.next_caret_blink_deadline(),
         ]
         .into_iter()
         .flatten()
         .min()
+    }
+    fn next_caret_blink_deadline(&self) -> Option<Instant> {
+        if !self.storage.presented.get() {
+            return None;
+        }
+        self.focused_editor()
+            .filter(|editor| editor.caret_blink_active.get())
+            .map(|editor| editor.caret_blink_at.get())
     }
     fn next_editor_interaction_deadline(&self) -> Option<Instant> {
         let pending = self
@@ -1210,6 +1265,19 @@ impl Ui {
             return Ok(false);
         }
         let keys = self.input.advance_key_sequence(&self.scene, now);
+        let mut blink = false;
+        if self
+            .next_caret_blink_deadline()
+            .is_some_and(|deadline| deadline <= now)
+            && let Some(editor) = self.focused_editor()
+        {
+            let mut scene = self.scene.borrow_mut();
+            let mut effects = scene.effects(editor.caret);
+            effects.opacity = if effects.opacity > 0. { 0. } else { 1. };
+            scene.set_effects(editor.caret, effects);
+            editor.caret_blink_at.set(now + Duration::from_millis(500));
+            blink = true;
+        }
         if keys {
             self.try_prepare_frame()?;
         }
@@ -1218,7 +1286,7 @@ impl Ui {
             .next_editor_interaction_deadline()
             .is_none_or(|deadline| deadline > now)
         {
-            return Ok(keys);
+            return Ok(keys || blink);
         }
         self.try_prepare_frame()?;
         // Geometry refresh can stop the gesture before the scheduled tick.
@@ -1226,7 +1294,7 @@ impl Ui {
             .next_editor_interaction_deadline()
             .is_none_or(|deadline| deadline > now)
         {
-            return Ok(keys);
+            return Ok(keys || blink);
         }
         let pending = self.storage.interaction.borrow_mut().take().unwrap();
         let elapsed = now
@@ -1469,6 +1537,13 @@ impl Ui {
         let draw_position = position.clone();
         let geometry = Rc::new(RefCell::new(None));
         let draw_typography = typography.clone();
+        let selection_style = Rc::new(Cell::new((theme.selection, 2., Insets::all(0.))));
+        let select_all_on_focus = Rc::new(Cell::new(false));
+        let caret_blink_at = Rc::new(Cell::new(Instant::now() + Duration::from_millis(500)));
+        let caret_blink_active = Rc::new(Cell::new(false));
+        let draw_caret_blink_at = caret_blink_at.clone();
+        let draw_caret_blink_active = caret_blink_active.clone();
+        let draw_selection_style = selection_style.clone();
         let draw_geometry = geometry.clone();
         let draw_storage = Rc::downgrade(&self.storage);
         let read_only = Rc::new(Cell::new(false));
@@ -1570,6 +1645,11 @@ impl Ui {
                 }
             }
             let (tw, th) = layout.size();
+            let text_y = if multiline {
+                0.
+            } else {
+                ((inner_height - th) / 2.).max(0.)
+            };
             let limit = (
                 if draw_wrap.get() {
                     0.
@@ -1589,7 +1669,7 @@ impl Ui {
                 text,
                 Transform {
                     x: -scroll.0,
-                    y: -scroll.1,
+                    y: text_y - scroll.1,
                 },
             );
             s.set_transform(
@@ -1600,29 +1680,38 @@ impl Ui {
                     } else {
                         cx - scroll.0
                     },
-                    y: cy - scroll.1,
+                    y: text_y + cy - scroll.1,
                 },
             );
             let mut effects = s.effects(caret);
-            effects.opacity =
-                if *focus.borrow() && e.preedit().is_none_or(|preedit| preedit.cursor.is_some()) {
-                    1.
-                } else {
-                    0.
-                };
+            let caret_active = *focus.borrow() && selection.is_empty() && e.preedit().is_none();
+            draw_caret_blink_active.set(caret_active);
+            draw_caret_blink_at.set(Instant::now() + Duration::from_millis(500));
+            effects.opacity = if *focus.borrow()
+                && (selection.is_empty() || e.preedit().is_some())
+                && e.preedit().is_none_or(|preedit| preedit.cursor.is_some())
+            {
+                1.
+            } else {
+                0.
+            };
             s.set_effects(caret, effects);
-            let rects: Vec<_> = if e.preedit().is_none() {
+            let (selection_color, selection_radius, selection_padding) = draw_selection_style.get();
+            let rects: Vec<_> = if *focus.borrow() && e.preedit().is_none() {
                 layout
                     .selection(selection.range())
                     .into_iter()
                     .filter_map(|r| {
-                        let y = r.y - scroll.1;
-                        (y + r.height > 0. && y < inner_height).then_some((
-                            r.x - scroll.0,
-                            y,
-                            r.width,
-                            r.height,
-                        ))
+                        // Clip geometry before rounding so a select-all/scroll edge
+                        // retains its corner instead of scissoring the corner away.
+                        let x = (r.x - scroll.0 - selection_padding.left).max(0.);
+                        let right =
+                            (r.x + r.width - scroll.0 + selection_padding.right).min(inner_width);
+                        let y = (text_y + r.y - scroll.1 - selection_padding.top).max(0.);
+                        let bottom = (text_y + r.y + r.height - scroll.1
+                            + selection_padding.bottom)
+                            .min(inner_height);
+                        (right > x && bottom > y).then_some((x, y, right - x, bottom - y))
                     })
                     .collect()
             } else {
@@ -1635,11 +1724,19 @@ impl Ui {
             while nodes.len() < rects.len() {
                 nodes.push(s.append(
                     selection_layer,
-                    NodeKind::Rect(theme.selection),
+                    surface(theme, selection_color),
                     Style::default(),
                 ));
             }
             for (id, (x, y, w, h)) in nodes.iter().zip(rects) {
+                s.set_kind(
+                    *id,
+                    NodeKind::Quad(crate::scene::QuadStyle {
+                        fill: selection_color,
+                        radius: selection_radius,
+                        ..Default::default()
+                    }),
+                );
                 s.set_style(*id, fixed(w, h));
                 s.set_transform(*id, Transform { x, y });
             }
@@ -1649,7 +1746,7 @@ impl Ui {
                     .selection(start..start + preedit.text.len())
                     .into_iter()
                     .filter_map(|r| {
-                        let y = r.y + r.height - 2. - scroll.1;
+                        let y = text_y + r.y + r.height - 2. - scroll.1;
                         (y >= 0. && y < inner_height).then_some((r.x - scroll.0, y, r.width))
                     })
                     .collect()
@@ -1705,6 +1802,10 @@ impl Ui {
             text,
             scene: self.scene.clone(),
             geometry,
+            selection_style,
+            select_all_on_focus: select_all_on_focus.clone(),
+            caret_blink_at,
+            caret_blink_active,
         };
         self.storage
             .editors
@@ -1974,6 +2075,9 @@ impl Ui {
             match event {
                 InputEvent::Focus => {
                     *focused.borrow_mut() = true;
+                    if select_all_on_focus.get() {
+                        editor.borrow_mut().select_all();
+                    }
                     if let Some(bg) = bg {
                         scene.borrow_mut().set_kind(bg, surface(theme, theme.hover));
                     }
@@ -2989,5 +3093,122 @@ mod mount_initialization_tests {
         drop(token);
         assert!(weak.upgrade().is_none());
         assert_eq!(ui.runtime.effect_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod editor_fidelity_tests {
+    use super::*;
+
+    #[test]
+    fn selection_after_model_write_in_effect_uses_the_new_text() {
+        let mut ui = Ui::new(300., 80.);
+        let handle = ui.text_input(
+            ui.root(),
+            "Address",
+            ui.signal("linear".into()),
+            280.,
+            false,
+        );
+        let trigger = ui.signal(false);
+        let read = trigger.clone();
+        let edit = handle.clone();
+        let effect = ui.runtime.effect(move || {
+            if read.get() {
+                edit.value.set("linear.app/workspace/inbox".into());
+                edit.set_selection(6, 26);
+            }
+        });
+        trigger.set(true);
+        assert_eq!(handle.copy(), ".app/workspace/inbox");
+        assert_eq!(handle.editor.borrow().selection().range(), 6..26);
+        drop(effect);
+    }
+
+    #[test]
+    fn caret_blinks_only_when_focused_visible_and_without_selection() {
+        let mut ui = Ui::new(300., 80.);
+        let handle = ui.text_input(
+            ui.root(),
+            "Address",
+            ui.signal("linear.app".into()),
+            280.,
+            false,
+        );
+        ui.prepare_frame();
+        assert!(ui.next_caret_blink_deadline().is_none());
+        ui.input.focus(&ui.scene, Some(handle.node));
+        assert_eq!(ui.scene.borrow().effects(handle.caret).opacity, 1.);
+        let deadline = ui.next_caret_blink_deadline().unwrap();
+        assert!(ui.advance_interactions(deadline).unwrap());
+        assert_eq!(ui.scene.borrow().effects(handle.caret).opacity, 0.);
+        let deadline = ui.next_caret_blink_deadline().unwrap();
+        ui.advance_interactions(deadline).unwrap();
+        assert_eq!(ui.scene.borrow().effects(handle.caret).opacity, 1.);
+        handle.select_all();
+        assert_eq!(ui.scene.borrow().effects(handle.caret).opacity, 0.);
+        assert!(ui.next_caret_blink_deadline().is_none());
+        handle.set_selection(0, 0);
+        ui.set_presented(false);
+        assert!(ui.next_caret_blink_deadline().is_none());
+        ui.set_presented(true);
+        ui.input.focus(&ui.scene, None);
+        assert!(ui.next_caret_blink_deadline().is_none());
+    }
+
+    #[test]
+    fn rounded_selection_is_paint_only_centered_and_hidden_on_blur() {
+        let mut ui = Ui::new(300., 80.);
+        let handle = ui.text_input_styled(
+            ui.root(),
+            "Address",
+            ui.signal("linear.app/workspace/inbox".into()),
+            false,
+        );
+        ui.scene
+            .borrow_mut()
+            .set_style(handle.node, fixed(280., 40.));
+        handle.set_typography(Color(237, 235, 229, 255), 13., FontStyle::default());
+        let color = Color(57, 57, 51, 255);
+        handle.set_selection_style(
+            color,
+            2.,
+            Insets {
+                left: 1.,
+                right: 1.,
+                top: 0.,
+                bottom: 0.,
+            },
+        );
+        handle.set_select_all_on_focus(true);
+        ui.prepare_frame();
+        let before = ui.scene.borrow().bounds(handle.text);
+        assert_eq!(
+            ui.editor_at(12., 20.).map(|editor| editor.node),
+            Some(handle.node)
+        );
+        assert!(ui.editor_at(290., 70.).is_none());
+        ui.input.focus(&ui.scene, Some(handle.node));
+        assert_eq!(handle.copy(), "linear.app/workspace/inbox");
+        handle.set_selection(6, 10);
+        ui.prepare_frame();
+        let scene = ui.scene.borrow();
+        assert_eq!(scene.bounds(handle.text), before);
+        let selection = scene
+            .paint_items()
+            .find(|item| matches!(item.kind, NodeKind::Quad(q) if q.fill == color))
+            .unwrap();
+        assert!(matches!(selection.kind, NodeKind::Quad(q) if q.radius == 2.));
+        let text = scene.bounds(handle.text);
+        assert!((text.y + text.height / 2. - 20.).abs() < 0.01);
+        assert_eq!(handle.copy(), ".app");
+        drop(scene);
+        ui.input.focus(&ui.scene, None);
+        assert!(
+            !ui.scene
+                .borrow()
+                .paint_items()
+                .any(|item| matches!(item.kind, NodeKind::Quad(q) if q.fill == color))
+        );
     }
 }
