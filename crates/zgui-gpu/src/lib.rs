@@ -6,8 +6,16 @@ use rustc_hash::FxHashMap;
 use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 use zgui::scene::{Color, NodeId, NodeKind, Rect, Scene};
 
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
+mod blur_cache;
+mod dual_kawase;
+mod effect_chain;
+mod gaussian;
 #[cfg(target_os = "macos")]
 mod native_surface;
+mod procedural;
+pub mod profiling;
 mod surface;
 mod upload;
 pub use surface::PresentationStatus;
@@ -29,7 +37,9 @@ fn premultiply_into_cell(cell: &mut [u8], pixels: &[u8], width: u32) {
     for (y, source) in pixels.chunks_exact(row).enumerate() {
         let start = ((y + 1) * (width as usize + 2) + 1) * 4;
         for (texel, pixel) in cell[start..start + row]
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .zip(source.as_chunks::<4>().0)
         {
             let alpha = u16::from(pixel[3]);
@@ -44,6 +54,14 @@ fn premultiply_into_cell(cell: &mut [u8], pixels: &[u8], width: u32) {
 /// X11, so presenting can be a plain copy (see `copy_present`). Readback
 /// converts to RGBA.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+/// Backdrop filter implementation. Existing `Effects` and blur radii work with either.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlurAlgorithm {
+    #[default]
+    Gaussian,
+    /// Approximate Gaussian using a resolution pyramid; radius changes blend smoothly.
+    DualKawase,
+}
 #[derive(Debug)]
 pub struct GpuError(pub String);
 impl fmt::Display for GpuError {
@@ -57,12 +75,19 @@ pub struct GpuStats {
     pub draw_calls: usize,
     /// Encoded render passes, including repainted isolated layers; excludes presentation.
     pub render_passes: usize,
-    /// Separable filter passes (two per applied backdrop blur), included in render_passes.
+    /// Filter passes, including the final composite, included in render_passes.
     pub blur_passes: usize,
+    pub blur_cache_hits: usize,
+    pub blur_texture_allocations: usize,
+    /// Physical output pixels whose filter input was recomputed (excludes cache hits).
+    pub filtered_pixels: u64,
     pub instances: usize,
     pub shaped_nodes: usize,
     pub glyph_uploads: usize,
     pub image_uploads: usize,
+    pub shader_dispatches: usize,
+    pub shader_resource_allocations: usize,
+    pub effect_stage_cache_hits: usize,
     /// Native GPU imports/conversions, never CPU image uploads.
     pub native_surface_imports: usize,
     pub native_surface_conversions: usize,
@@ -76,6 +101,9 @@ pub struct GpuStats {
     pub layer_texture_allocations: usize,
     /// Scrolled regions shifted by copying instead of redrawn.
     pub scroll_copies: usize,
+    /// Device pixels transferred by retained scroll operations (one read/write each).
+    pub copied_pixels: u64,
+    pub scroll_phase_hits: usize,
 }
 /// Retained allocation counters for diagnostics; excludes driver/font database allocations.
 #[derive(Debug, Clone, Copy)]
@@ -89,11 +117,19 @@ pub struct DebugCacheStats {
     pub swash_outlines: usize,
     pub image_textures: usize,
     pub image_bytes: usize,
+    /// Includes persistent shader resources also referenced by image_bytes.
+    pub shader_resource_bytes: usize,
+    /// Includes chain outputs also referenced by image_bytes.
+    pub effect_chain_bytes: usize,
+    pub blur_cache_bytes: usize,
+    pub blur_scratch_bytes: usize,
     pub canvas_raster_bytes: usize,
     pub svg_raster_bytes: usize,
     pub vertex_buffer_bytes: usize,
     pub layer_textures: usize,
     pub layer_bytes: usize,
+    /// One older fractional-scroll origin; capped at 64 MiB.
+    pub scroll_cache_bytes: usize,
 }
 const SHAPE_BUDGET: usize = 8 * 1024 * 1024;
 /// Shaping frames a cached word survives without being used.
@@ -128,20 +164,14 @@ enum Shading {
     /// pixel it writes. Same pixels.
     Opaque,
 }
-fn shading(quad: &Quad, scale: f32) -> Shading {
-    // A panel with square corners and no border only antialiases its edges:
-    // on whole device pixels, coverage is exactly what rasterizing gives.
-    let whole = |value: f32| {
-        let device = value * scale;
-        (device - device.round()).abs() < 1e-3
-    };
-    let [x, y, width, height] = quad.rect;
+fn shading(quad: &Quad, _scale: f32) -> Shading {
+    // The basic shader preserves square-panel coverage at fractional pixels,
+    // so smooth scrolling does not force backgrounds through the full shader.
     let square = quad.shape[3] > 0.5
         && quad.shape[0] <= 0.
         && quad.shape[1] <= 0.
         && quad.options[3] < 0.5
-        && quad.rect == quad.fade
-        && [x, y, x + width, y + height].into_iter().all(whole);
+        && quad.rect == quad.fade;
     let plain = quad.options[0] == 0.
         && quad.options[2] < 0.5
         && quad.shape[2] <= 0.
@@ -150,7 +180,7 @@ fn shading(quad: &Quad, scale: f32) -> Shading {
         && quad.mask[3] <= 0.;
     if !plain {
         Shading::Full
-    } else if quad.options[1] <= 0.5 && quad.color[3] >= 1. {
+    } else if quad.options[1] <= 0.5 && quad.color[3] >= 1. && !square {
         Shading::Opaque
     } else {
         Shading::Basic
@@ -167,6 +197,7 @@ struct QuadPipelines {
     full_clear: std::cell::OnceCell<wgpu::RenderPipeline>,
     basic: std::cell::OnceCell<wgpu::RenderPipeline>,
     basic_clear: std::cell::OnceCell<wgpu::RenderPipeline>,
+    drawable: Option<wgpu::TextureFormat>,
 }
 impl QuadPipelines {
     /// The pipeline drawing quads of `shading`.
@@ -177,7 +208,14 @@ impl QuadPipelines {
             Shading::Opaque => (&self.basic_clear, true, false),
         };
         cell.get_or_init(|| {
-            quad_pipeline(&self.device, &self.shader, &self.layout, blend, None, basic)
+            quad_pipeline(
+                &self.device,
+                &self.shader,
+                &self.layout,
+                blend,
+                self.drawable,
+                basic,
+            )
         })
     }
     /// The pipeline clearing a region to the background quad.
@@ -186,7 +224,14 @@ impl QuadPipelines {
             self.get(Shading::Opaque)
         } else {
             self.full_clear.get_or_init(|| {
-                quad_pipeline(&self.device, &self.shader, &self.layout, false, None, false)
+                quad_pipeline(
+                    &self.device,
+                    &self.shader,
+                    &self.layout,
+                    false,
+                    self.drawable,
+                    false,
+                )
             })
         }
     }
@@ -197,9 +242,79 @@ const NEAR_PIXELS: f32 = 256.;
 /// Damaged regions of at least this many device pixels draw opaque quads
 /// without blending (see `encode_draws`).
 const SPLIT_PIXELS: f32 = 32_768.;
+/// Keep SDF coverage/borders in the rim; large constant interiors need neither
+/// antialiasing math nor a framebuffer read for blending. Partition on device
+/// pixel boundaries so the interior and rim never shade the same pixel.
+fn opaque_interior(quads: &mut Vec<Quad>, start: u32, scale: f32, clip: Rect, damage: &[Rect]) {
+    if quads.len() <= start as usize {
+        return;
+    }
+    let q = *quads.last().unwrap();
+    if q.color[3] < 1.
+        || q.rect != q.fade
+        || q.shape[3] <= 0.5
+        || q.shape[2] > 0.
+        || q.options[0] != 0.
+        || q.options[1] != 0.
+        || q.options[2] >= 0.5
+        || q.mask != NO_MASK
+    {
+        return;
+    }
+    let radius = if q.options[3] > 0.5 {
+        q.border.into_iter().fold(0_f32, f32::max)
+    } else {
+        q.shape[0].max(0.)
+    };
+    // The shader clamps its AA width to at least 0.5 logical pixels.
+    let inset = radius + q.shape[1].max(0.) + (1. / scale).max(0.5);
+    let (left, top) = (
+        ((q.rect[0] + inset) * scale).ceil() / scale,
+        ((q.rect[1] + inset) * scale).ceil() / scale,
+    );
+    let (right, bottom) = (
+        ((q.rect[0] + q.rect[2] - inset) * scale).floor() / scale,
+        ((q.rect[1] + q.rect[3] - inset) * scale).floor() / scale,
+    );
+    if right <= left
+        || bottom <= top
+        || (right - left) * (bottom - top) * scale * scale < SPLIT_PIXELS
+    {
+        return;
+    }
+    let center = Rect::new(left, top, right - left, bottom - top);
+    let Some(visible) = center.intersection(clip) else {
+        return;
+    };
+    let pixels = damage
+        .iter()
+        .filter_map(|d| visible.intersection(*d))
+        .map(|r| r.width * r.height * scale * scale)
+        .sum::<f32>();
+    // Thin scroll strips do not justify more runs/pipeline switches.
+    if pixels < SPLIT_PIXELS {
+        return;
+    }
+    *quads.last_mut().unwrap() = Quad {
+        rect: [left, top, center.width, center.height],
+        options: [0.; 4],
+        shape: [0.; 4],
+        border: [0.; 4],
+        ..q
+    };
+    for rim in rect_outside(
+        Rect::new(q.rect[0], q.rect[1], q.rect[2], q.rect[3]),
+        center,
+    ) {
+        quads.push(Quad {
+            rect: [rim.x, rim.y, rim.width, rim.height],
+            ..q
+        });
+    }
+}
 /// Split a draw's quads into runs of one shading, in paint order, when
-/// `split`: only software rasterizers gain, running shaders on the CPU. A GPU
-/// shades the full shader almost for free, and each extra draw costs CPU.
+/// `split`: software and integrated GPUs benefit from lighter shaders for
+/// backgrounds; discrete GPUs favor fewer draws through the full shader.
 fn push_draw(draws: &mut Vec<Draw>, quads: &[Quad], draw: Draw, split: bool, scale: f32) {
     if !split || draw.blur.is_some() || draw.layer.is_some() || draw.end <= draw.start {
         draws.push(draw);
@@ -230,29 +345,25 @@ fn texel_at(texture: &wgpu::Texture, x: u32, y: u32) -> wgpu::TexelCopyTextureIn
         aspect: wgpu::TextureAspect::All,
     }
 }
-/// Whether moving `scroll`'s pixels reproduces the frame: its content is one
-/// contiguous run of paint items free of masks, layers and filters; beneath
-/// it the clip shows a single opaque rectangle (or the window background);
-/// above it nothing paints in the clip outside this frame's damage.
-fn copy_is_exact(scene: &Scene, scroll: &zgui::scene::ScrollMove, damage: &[Rect]) -> bool {
+/// Repair needed to move `scroll`'s pixels exactly. Content is contiguous,
+/// free of stationary masks and backdrop filters, over an opaque rectangle
+/// or the window background. Foreground pixels and their shifted ghosts are
+/// repainted after the copy.
+struct ScrollRepair {
+    regions: Vec<Rect>,
+    foreground: Vec<Rect>,
+}
+fn copy_repair(
+    scene: &Scene,
+    scroll: &zgui::scene::ScrollMove,
+    damage: &[Rect],
+) -> Option<ScrollRepair> {
     let clip = scroll.clip;
     let items = scene.layer_items_within(None, Some(&[clip]));
     let content = |item: &zgui::scene::PaintItem<'_>| scene.is_within(item.id, scroll.node);
-    let Some(first) = items.iter().position(content) else {
-        return false;
-    };
+    let first = items.iter().position(content)?;
     let last = items.iter().rposition(content).expect("found above");
-    let paints = |item: &zgui::scene::PaintItem<'_>| -> Option<Rect> {
-        let bounds = match item.kind {
-            NodeKind::Container(_) if item.effects.blur_radius <= 0. => return None,
-            NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } => quad.paint_bounds(item.bounds),
-            _ => item.bounds,
-        };
-        if item.effects.opacity <= 0. {
-            return None;
-        }
-        bounds.intersection(item.clip?)?.intersection(clip)
-    };
+    let paints = |item: &zgui::scene::PaintItem<'_>| scroll_item_bounds(scene, item, clip);
     let repainted = |rect: Rect| {
         damage.iter().any(|d| {
             d.x <= rect.x
@@ -262,16 +373,30 @@ fn copy_is_exact(scene: &Scene, scroll: &zgui::scene::ScrollMove, damage: &[Rect
         })
     };
     for item in &items[first..=last] {
-        if !content(item) || item.mask.is_some() || item.isolated || item.effects.blur_radius > 0. {
-            return false;
+        if !content(item) || item.mask.is_some() || item.effects.blur_radius > 0. {
+            return None;
         }
     }
-    if items[last + 1..]
-        .iter()
-        .filter_map(paints)
-        .any(|rect| !repainted(rect))
-    {
-        return false;
+    let mut repair = Vec::new();
+    let foreground: Vec<_> = items[last + 1..].iter().filter_map(paints).collect();
+    for rect in foreground.iter().copied() {
+        for rect in [
+            Some(rect),
+            Rect::new(
+                rect.x + scroll.dx,
+                rect.y + scroll.dy,
+                rect.width,
+                rect.height,
+            )
+            .intersection(clip),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !repainted(rect) {
+                repair.push(rect);
+            }
+        }
     }
     for item in items[..first].iter().rev() {
         let Some(rect) = paints(item) else {
@@ -289,13 +414,40 @@ fn copy_is_exact(scene: &Scene, scroll: &zgui::scene::ScrollMove, damage: &[Rect
             && !item.isolated
             && rect == clip
         {
-            return true;
+            return Some(ScrollRepair {
+                regions: repair,
+                foreground,
+            });
         }
         if !repainted(rect) {
-            return false;
+            return None;
         }
     }
-    true
+    Some(ScrollRepair {
+        regions: repair,
+        foreground,
+    })
+}
+fn scroll_item_bounds(
+    scene: &Scene,
+    item: &zgui::scene::PaintItem<'_>,
+    clip: Rect,
+) -> Option<Rect> {
+    let bounds = if item.isolated {
+        scene.layer_bounds(item.id)
+    } else {
+        match item.kind {
+            NodeKind::Container(_) if item.effects.blur_radius <= 0. => return None,
+            NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } => quad.paint_bounds(item.bounds),
+            NodeKind::Svg(svg) => svg.paint_bounds(item.bounds),
+            NodeKind::Image(image) => image.paint_bounds(item.bounds),
+            _ => item.bounds,
+        }
+    };
+    if item.effects.opacity <= 0. {
+        return None;
+    }
+    bounds.intersection(item.clip?)?.intersection(clip)
 }
 /// Positioned glyphs of laid-out runs; rich text takes each glyph's colour
 /// from its run (it is shaped without colours, see `rich_buffer_raw`).
@@ -321,8 +473,8 @@ fn glyphs_of<'a>(
                         .map(|c| zgui::scene::Color(c.r(), c.g(), c.b(), c.a())),
                 },
                 run: run_index,
-                x: p.x as f32,
-                y: p.y as f32 + run.line_y * scale,
+                x: (glyph.x + glyph.font_size * glyph.x_offset) * scale,
+                y: (glyph.y - glyph.font_size * glyph.y_offset + run.line_y) * scale,
             });
         }
     }
@@ -332,6 +484,80 @@ fn glyphs_of<'a>(
 type Scissor = (u32, u32, u32, u32);
 /// A scroll copy's destination and the offset of its source.
 type ScrollCopy = (Scissor, (i32, i32));
+fn scroll_pixels(clip: Rect, dx: f32, dy: f32, scale: f32) -> Option<ScrollCopy> {
+    let whole = |v: f32| {
+        let v = v * scale;
+        ((v - v.round()).abs() < 1e-3).then_some(v.round() as i32)
+    };
+    let (x, y, right, bottom) = (
+        whole(clip.x)?,
+        whole(clip.y)?,
+        whole(clip.x + clip.width)?,
+        whole(clip.y + clip.height)?,
+    );
+    let (dx, dy) = (whole(dx)?, whole(dy)?);
+    let (x0, x1, y0, y1) = (
+        x.max(x + dx),
+        right.min(right + dx),
+        y.max(y + dy),
+        bottom.min(bottom + dy),
+    );
+    (x0 >= 0 && y0 >= 0 && x0 < x1 && y0 < y1).then_some((
+        (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32),
+        (-dx, -dy),
+    ))
+}
+fn rect_outside(rect: Rect, dest: Rect) -> Vec<Rect> {
+    [
+        Rect::new(rect.x, rect.y, rect.width, dest.y - rect.y),
+        Rect::new(
+            rect.x,
+            dest.y + dest.height,
+            rect.width,
+            rect.y + rect.height - dest.y - dest.height,
+        ),
+        Rect::new(rect.x, dest.y, dest.x - rect.x, dest.height),
+        Rect::new(
+            dest.x + dest.width,
+            dest.y,
+            rect.x + rect.width - dest.x - dest.width,
+            dest.height,
+        ),
+    ]
+    .into_iter()
+    .filter(|r| r.width > 0. && r.height > 0.)
+    .collect()
+}
+/// Partition the surface outside scroll destinations without overlapping copies.
+fn unchanged_scissors(width: u32, height: u32, copies: &[ScrollCopy]) -> Vec<Scissor> {
+    let mut regions = vec![(0, 0, width, height)];
+    for &((cx, cy, cw, ch), _) in copies {
+        regions = regions
+            .into_iter()
+            .flat_map(|(x, y, w, h)| {
+                let (left, top, right, bottom) = (
+                    x.max(cx),
+                    y.max(cy),
+                    (x + w).min(cx + cw),
+                    (y + h).min(cy + ch),
+                );
+                if left >= right || top >= bottom {
+                    return vec![(x, y, w, h)];
+                }
+                [
+                    (x, y, w, top - y),
+                    (x, bottom, w, y + h - bottom),
+                    (x, top, left - x, bottom - top),
+                    (right, top, x + w - right, bottom - top),
+                ]
+                .into_iter()
+                .filter(|r| r.2 > 0 && r.3 > 0)
+                .collect()
+            })
+            .collect();
+    }
+    regions
+}
 /// For each damage region, the index of the topmost quad that paints every
 /// pixel of the region opaque: a plain solid rectangle (no texture, radius,
 /// border, shadow, fade, mask or transform) at full alpha, unclipped over the
@@ -379,7 +605,19 @@ fn occluded_from(
                 for index in (draw.start..draw.end).rev() {
                     let q = &quads[index as usize];
                     let rect = Rect::new(q.rect[0], q.rect[1], q.rect[2], q.rect[3]);
-                    if plain(q) && covers(rect, pixels) {
+                    let opaque_rect = if q.shape[3] > 0.5 {
+                        // SDF coverage can be partial at square corners too,
+                        // including whole-pixel panels on hardware GPUs.
+                        Rect::new(
+                            rect.x + 1. / scale,
+                            rect.y + 1. / scale,
+                            rect.width - 2. / scale,
+                            rect.height - 2. / scale,
+                        )
+                    } else {
+                        rect
+                    };
+                    if plain(q) && covers(opaque_rect, pixels) {
                         return index;
                     }
                 }
@@ -397,6 +635,18 @@ struct Glyph {
     x: f32,
     y: f32,
 }
+impl Glyph {
+    fn at(&self, origin: (f32, f32)) -> (CacheKey, i32, i32) {
+        CacheKey::new(
+            self.key.font_id,
+            self.key.glyph_id,
+            f32::from_bits(self.key.font_size_bits),
+            (self.x + origin.0, (self.y + origin.1).trunc()),
+            self.key.font_weight,
+            self.key.flags,
+        )
+    }
+}
 struct Shaped {
     rich: Option<Arc<zgui::rich_text::RichText>>,
     text_options: zgui::text_layout::TextOptions,
@@ -409,6 +659,8 @@ struct Shaped {
     glyphs: Vec<Glyph>,
     quads: Vec<Quad>,
     atlas_epoch: u64,
+    /// Fractional physical node origin used for the cached glyph rasters.
+    raster_origin: (f32, f32),
     last_used: u64,
     /// The prepared text these glyphs were laid out from, kept while drawn.
     prepared: Option<u64>,
@@ -447,7 +699,8 @@ struct LayerCache {
 struct Draw {
     /// How its quads are drawn; set by `push_draw`.
     shading: Shading,
-    blur: Option<(Rect, zgui::scene::Effects)>,
+    blur: Option<(NodeId, Rect, zgui::scene::Effects)>,
+    blur_mask: Option<zgui::scene::FadeMask>,
     start: u32,
     end: u32,
     clip: Rect,
@@ -476,9 +729,13 @@ struct Deferred {
 }
 /// A backdrop filter's vertical half: one draw per damaged output, reading the
 /// horizontal pass's scratch textures (see `GpuRenderer::blur`).
+#[derive(Clone)]
 struct VerticalBlur {
     bind: wgpu::BindGroup,
     scissors: Vec<(u32, u32, u32, u32)>,
+    prepasses: usize,
+    predraws: usize,
+    allocations: usize,
 }
 /// Separable blur pipelines. The horizontal pass reads the target and keeps
 /// its original pixels; the vertical draws write the target, or the target
@@ -488,8 +745,12 @@ struct BlurPipelines {
     /// Shared by every vertical pipeline so one bind group serves each.
     layout: wgpu::BindGroupLayout,
     horizontal: wgpu::RenderPipeline,
+    /// Single-target horizontal and original crop draws for unequal extents.
+    crop: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     vertical: wgpu::RenderPipeline,
     both: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    weights: FxHashMap<u32, wgpu::Buffer>,
+    sampler: wgpu::Sampler,
 }
 impl BlurPipelines {
     fn new(device: &wgpu::Device) -> Self {
@@ -522,6 +783,22 @@ impl BlurPipelines {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let target = Some(wgpu::ColorTargetState {
@@ -532,7 +809,7 @@ impl BlurPipelines {
         let horizontal = Self::pipeline(
             device,
             &shader,
-            None,
+            Some(&layout),
             "fs_split",
             &[target.clone(), target.clone()],
         );
@@ -547,9 +824,42 @@ impl BlurPipelines {
             shader,
             layout,
             horizontal,
+            crop: None,
             vertical,
             both: None,
+            weights: Default::default(),
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
         }
+    }
+    fn crop(&mut self, device: &wgpu::Device) {
+        if self.crop.is_some() {
+            return;
+        }
+        let target = [Some(wgpu::ColorTargetState {
+            format: FORMAT,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        self.crop = Some((
+            Self::pipeline(
+                device,
+                &self.shader,
+                Some(&self.layout),
+                "fs_horizontal",
+                &target,
+            ),
+            Self::pipeline(
+                device,
+                &self.shader,
+                Some(&self.layout),
+                "fs_original",
+                &target,
+            ),
+        ));
     }
     fn pipeline(
         device: &wgpu::Device,
@@ -620,11 +930,23 @@ struct Retained {
     copy_bind: Option<wgpu::BindGroup>,
     blit_bind: Option<wgpu::BindGroup>,
 }
+#[derive(Clone)]
+struct ScrollState {
+    node: NodeId,
+    clip: Rect,
+    origin: (f32, f32),
+    revision: (u64, u64, u64),
+    foreground: Vec<Rect>,
+    repair: Vec<Rect>,
+}
+struct ScrollHistory {
+    retained: Retained,
+    state: ScrollState,
+}
 /// Pipelines writing the retained target and a drawable of `format` at once.
 struct SinglePass {
     format: wgpu::TextureFormat,
-    quads: wgpu::RenderPipeline,
-    clear: wgpu::RenderPipeline,
+    quads: QuadPipelines,
     copy: wgpu::RenderPipeline,
 }
 /// A run of draws encoded as one instanced call.
@@ -638,9 +960,25 @@ struct Batch {
 fn quad_bounds(quads: &[Quad]) -> Rect {
     quads
         .iter()
-        .map(|q| Rect::new(q.rect[0], q.rect[1], q.rect[2], q.rect[3]))
+        .map(quad_paint_bounds)
         .reduce(|a, b| a.union(b))
         .unwrap_or_default()
+}
+fn quad_paint_bounds(q: &Quad) -> Rect {
+    let bounds = Rect::new(q.rect[0], q.rect[1], q.rect[2], q.rect[3]);
+    if q.options[1] > 1.5 && q.options[2] > 0.5 {
+        zgui::affine::Affine {
+            a: q.shape[0],
+            c: q.shape[1],
+            b: q.shape[2],
+            d: q.shape[3],
+            tx: q.border[0],
+            ty: q.border[1],
+        }
+        .bounds(bounds)
+    } else {
+        bounds
+    }
 }
 /// Shapes using exactly the same font selection and line metrics as the renderer.
 pub fn measure_text(
@@ -706,11 +1044,14 @@ impl GpuContext {
                 .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("zgui shared device"),
-            required_features: if mapped_uploads {
-                wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
-            } else {
-                wgpu::Features::empty()
-            },
+            required_features: (adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS))
+                | if mapped_uploads {
+                    wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+                } else {
+                    wgpu::Features::empty()
+                },
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         }))
@@ -725,6 +1066,7 @@ impl GpuContext {
             full_clear: Default::default(),
             basic: Default::default(),
             basic_clear: Default::default(),
+            drawable: None,
         };
         Ok(Self {
             inner: Rc::new(GpuContextInner {
@@ -761,6 +1103,7 @@ impl GpuError {
     }
 }
 pub struct GpuRenderer {
+    profiler: RefCell<Option<profiling::Profiler>>,
     context: GpuContext,
     scene_identity: Option<u64>,
     /// Scene content revision the per-node caches were last pruned at.
@@ -851,6 +1194,12 @@ pub struct GpuRenderer {
     /// Scroll copies for the next root frame: destination pixel rectangle
     /// and the source offset (see `scroll_copies`).
     copies: Vec<ScrollCopy>,
+    scroll_state: Option<ScrollState>,
+    scroll_history: Option<ScrollHistory>,
+    scroll_source: Option<wgpu::Texture>,
+    retain_scroll_frame: bool,
+    scroll_phase_cache: bool,
+    opaque_interiors: bool,
     atlas_epoch: u64,
     frame: u64,
     vertices: wgpu::Buffer,
@@ -858,6 +1207,10 @@ pub struct GpuRenderer {
     frame_quads: Vec<Quad>,
     background: Color,
     images: FxHashMap<u64, (wgpu::BindGroup, usize)>,
+    procedural: procedural::Cache,
+    chain_cache: effect_chain::Cache,
+    image_textures: FxHashMap<u64, wgpu::Texture>,
+    procedural_encoder: Option<wgpu::CommandEncoder>,
     #[cfg(target_os = "macos")]
     native_surfaces: Option<native_surface::SurfaceCache>,
     /// The next present joins the Core Animation transaction that resized the layer.
@@ -876,10 +1229,13 @@ pub struct GpuRenderer {
     atlas_recycled_at: u64,
     /// Compiled on the first backdrop filter.
     blur_pipelines: Option<BlurPipelines>,
-    /// Source and intermediate blur targets, shared by the window and every
-    /// isolated layer. At least as large as the target being filtered; the
-    /// shader clamps samples to the target's own size, passed as a parameter.
-    blur_scratch: Option<(wgpu::Texture, wgpu::Texture)>,
+    blur_composite: Option<BlurPipelines>,
+    blur_algorithm: BlurAlgorithm,
+    kawase: Option<dual_kawase::Kawase>,
+    blur_cache: FxHashMap<NodeId, blur_cache::CachedBlur>,
+    /// Horizontal Gaussian intermediate; completed filters retain only raw
+    /// and fully filtered pixels, and never sample this shared scratch.
+    gaussian_scratch: Option<wgpu::Texture>,
 }
 impl GpuRenderer {
     pub fn new(width: u32, height: u32) -> Result<Self, GpuError> {
@@ -993,7 +1349,10 @@ impl GpuRenderer {
         let target = texture(&device, width, height, "retained output");
         let view = target.create_view(&Default::default());
         let atlas = texture(&device, 1, 1, "lazy glyph atlas placeholder");
-        let split_shading = context.inner.info.device_type == wgpu::DeviceType::Cpu;
+        let split_shading = matches!(
+            context.inner.info.device_type,
+            wgpu::DeviceType::Cpu | wgpu::DeviceType::IntegratedGpu
+        );
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas"),
             layout: &context.inner.texture_layout,
@@ -1023,8 +1382,11 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let profiler = std::env::var_os("ZGUI_GPU_PROFILE")
+            .and_then(|_| profiling::Profiler::new(&device, &queue));
         Ok(Self {
             context: context.clone(),
+            profiler: RefCell::new(profiler),
             scene_identity: None,
             pruned_revision: None,
             pending: RefCell::new(None),
@@ -1079,6 +1441,12 @@ impl GpuRenderer {
             fresh: true,
             rendered_serial: None,
             copies: Vec::new(),
+            scroll_state: None,
+            scroll_history: None,
+            scroll_source: None,
+            retain_scroll_frame: false,
+            scroll_phase_cache: true,
+            opaque_interiors: true,
             atlas_epoch: 1,
             frame: 0,
             vertices,
@@ -1086,6 +1454,10 @@ impl GpuRenderer {
             frame_quads: Vec::new(),
             background: Color(0, 0, 0, 0),
             images: FxHashMap::default(),
+            procedural: Default::default(),
+            chain_cache: Default::default(),
+            image_textures: Default::default(),
+            procedural_encoder: None,
             #[cfg(target_os = "macos")]
             native_surfaces: None,
             #[cfg(target_os = "macos")]
@@ -1095,10 +1467,14 @@ impl GpuRenderer {
             canvases: Default::default(),
             svgs: Default::default(),
             blur_pipelines: None,
+            blur_composite: None,
             image_cells: FxHashMap::default(),
             // As if last recycled long ago: the first fill recycles.
             atlas_recycled_at: 0_u64.wrapping_sub(ATLAS_THRASH_FRAMES),
-            blur_scratch: None,
+            blur_algorithm: BlurAlgorithm::Gaussian,
+            kawase: None,
+            blur_cache: Default::default(),
+            gaussian_scratch: None,
         })
     }
     /// Bytes the native device reports as allocated (Metal only), including
@@ -1125,11 +1501,21 @@ impl GpuRenderer {
             swash_outlines: self.swash.outline_command_cache.len(),
             image_textures: self.images.len(),
             image_bytes: self.images.values().map(|i| i.1).sum(),
+            shader_resource_bytes: self.procedural.bytes(),
+            effect_chain_bytes: self.chain_cache.bytes(),
+            blur_cache_bytes: self.blur_cache.values().map(|c| c.bytes()).sum(),
+            blur_scratch_bytes: self.kawase.as_ref().map_or(0, |k| k.bytes())
+                + self.gaussian_scratch.as_ref().map_or(0, |texture| {
+                    texture.width() as usize * texture.height() as usize * 4
+                }),
             canvas_raster_bytes: self.canvases.bytes(),
             svg_raster_bytes: self.svgs.bytes(),
             vertex_buffer_bytes: self.vertex_capacity,
             layer_textures: self.layers.len(),
             layer_bytes: self.layers.values().map(|l| l.bytes).sum(),
+            scroll_cache_bytes: self.scroll_history.as_ref().map_or(0, |h| {
+                h.retained.texture.width() as usize * h.retained.texture.height() as usize * 4
+            }),
         }
     }
     pub fn set_background(&mut self, color: Color) {
@@ -1216,6 +1602,7 @@ impl GpuRenderer {
             self.layers.clear();
             self.shapes.clear();
             self.entries.clear();
+            self.image_cells.clear();
             self.atlas_epoch = self.atlas_epoch.wrapping_add(1);
             self.cursor = (0, 0, 0);
             self.fresh = true;
@@ -1229,12 +1616,14 @@ impl GpuRenderer {
         self.flush_pending();
         self.layers.clear();
         // Scratch grows on demand; release it when the window shrinks a lot.
-        if self
-            .blur_scratch
-            .as_ref()
-            .is_some_and(|(source, _)| source.width() > width * 2 || source.height() > height * 2)
-        {
-            self.blur_scratch = None;
+        if let Some(kawase) = &mut self.kawase {
+            kawase.trim_to(width, height);
+        }
+        if self.gaussian_scratch.as_ref().is_some_and(|texture| {
+            texture.width() > width.next_multiple_of(64)
+                || texture.height() > height.next_multiple_of(64)
+        }) {
+            self.gaussian_scratch = None;
         }
         self.width = width;
         self.height = height;
@@ -1262,8 +1651,17 @@ impl GpuRenderer {
         self.fresh = true;
     }
     pub fn render(&mut self, scene: &Scene, damage: &[Rect]) -> Result<GpuStats, GpuError> {
+        self.flush_pending_inner(true);
+        if let Some(profiler) = self.profiler.get_mut() {
+            profiler.begin(&self.device);
+        }
         let presented = std::mem::take(&mut self.present_stats);
         let mut stats = self.render_inner(scene, damage)?;
+        stats.shader_dispatches = std::mem::take(&mut self.procedural.dispatches)
+            + std::mem::take(&mut self.chain_cache.dispatches);
+        stats.shader_resource_allocations = std::mem::take(&mut self.procedural.allocations)
+            + std::mem::take(&mut self.chain_cache.allocations);
+        stats.effect_stage_cache_hits = std::mem::take(&mut self.chain_cache.cache_hits);
         if stats.shaped_nodes > 0 {
             // Words shaped by measurement or this frame are reused by the next
             // shaping frame (streaming text repeats nearly all of them); older
@@ -1314,6 +1712,7 @@ impl GpuRenderer {
             self.layers.clear();
             self.shapes.clear();
             self.node_images.clear();
+            self.blur_cache.clear();
             self.shaped_bytes = 0;
             self.fresh = true;
             self.pruned_revision = None;
@@ -1326,7 +1725,81 @@ impl GpuRenderer {
         self.layers
             .retain(|id, _| scene.contains(*id) && scene.is_isolated(*id));
         // Scroll moves this frame can copy; the rest repaint their clip.
-        let (copies, repaint) = self.scroll_copies(scene, damage);
+        let next_scroll = self.scroll_state_for(scene, damage);
+        let (mut copies, mut repaint) = self.scroll_copies(scene, damage, next_scroll.as_ref());
+        self.retain_scroll_frame = false;
+        self.scroll_source = None;
+        let mut phase_hit = false;
+        if let Some(next) = &next_scroll
+            && let Some(previous) = &self.scroll_state
+            && previous.node == next.node
+            && previous.clip == next.clip
+            && previous.revision == next.revision
+            && !self.fresh
+            && self.scroll_phase_cache
+            && !cfg!(target_os = "macos")
+            && self.width as u64 * self.height as u64 * 4 <= 64 * 1024 * 1024
+        {
+            let delta = (
+                (next.origin.0 - previous.origin.0) * self.scale,
+                (next.origin.1 - previous.origin.1) * self.scale,
+            );
+            let whole = |v: f32| (v - v.round()).abs() < 1e-3;
+            // Retain only the common alternating half-pixel case. Continuous
+            // subpixel origins fall back instead of accumulating raster phases.
+            if whole(delta.0 * 2.) && whole(delta.1 * 2.) && (!whole(delta.0) || !whole(delta.1)) {
+                self.retain_scroll_frame = true;
+                if let Some(history) = &self.scroll_history
+                    && history.state.node == next.node
+                    && history.state.clip == next.clip
+                    && history.state.revision == next.revision
+                {
+                    let shift = (
+                        next.origin.0 - history.state.origin.0,
+                        next.origin.1 - history.state.origin.1,
+                    );
+                    if let Some(copy) = scroll_pixels(next.clip, shift.0, shift.1, self.scale) {
+                        let mut repair = next.foreground.clone();
+                        for rect in &next.foreground {
+                            if let Some(ghost) = Rect::new(
+                                rect.x + shift.0,
+                                rect.y + shift.1,
+                                rect.width,
+                                rect.height,
+                            )
+                            .intersection(next.clip)
+                            {
+                                repair.push(ghost);
+                            }
+                        }
+                        for rect in &history.state.foreground {
+                            if let Some(ghost) = Rect::new(
+                                rect.x + shift.0,
+                                rect.y + shift.1,
+                                rect.width,
+                                rect.height,
+                            )
+                            .intersection(next.clip)
+                            {
+                                repair.push(ghost);
+                            }
+                        }
+                        let (x, y, w, h) = copy.0;
+                        let dest = Rect::new(
+                            x as f32 / self.scale,
+                            y as f32 / self.scale,
+                            w as f32 / self.scale,
+                            h as f32 / self.scale,
+                        );
+                        repair.extend(rect_outside(next.clip, dest));
+                        copies = vec![copy];
+                        repaint = repair;
+                        self.scroll_source = Some(history.retained.texture.clone());
+                        phase_hit = true;
+                    }
+                }
+            }
+        }
         self.copies = copies;
         let extended;
         let damage = if repaint.is_empty() {
@@ -1338,19 +1811,19 @@ impl GpuRenderer {
         if damage.is_empty() && !self.fresh && self.copies.is_empty() {
             return Ok(GpuStats::default());
         }
-        // Visit only subtrees that paint inside the damage the frame will
-        // actually repaint. Backdrop blur samples beyond its own subtree, so
-        // scenes using it keep the full walk.
+        // Replay only damaged subtrees and the bounded sources sampled by blur.
         let viewport = Rect::new(
             0.,
             0.,
             self.width as f32 / self.scale,
             self.height as f32 / self.scale,
         );
-        let items = if self.fresh || scene.has_backdrop_blur() {
+        let items = if self.fresh {
             scene.layer_items(None)
         } else {
-            scene.layer_items_within(None, Some(&merge_damage(damage, viewport, self.scale)))
+            let dependencies: Vec<_> = scene.backdrop_regions().collect();
+            let regions = blur_damage(damage, &dependencies, viewport, self.scale);
+            scene.layer_items_within(None, Some(&regions))
         };
         let mut layer_stats = GpuStats::default();
         for item in &items {
@@ -1359,6 +1832,18 @@ impl GpuRenderer {
             }
         }
         let mut stats = self.render_flat(scene, items, damage)?;
+        if self.retain_scroll_frame {
+            let retained = self.spare.take().expect("scroll frame preserved in spare");
+            let state = self.scroll_state.take().expect("previous frame exists");
+            let old_history = self
+                .scroll_history
+                .replace(ScrollHistory { retained, state });
+            self.spare = old_history.map(|h| h.retained);
+        } else {
+            self.scroll_history = None;
+        }
+        self.scroll_state = next_scroll;
+        stats.scroll_phase_hits = usize::from(phase_hit);
         self.rendered_serial = Some(scene.flush_serial());
         stats.layer_repaints = layer_stats.layer_repaints;
         stats.layer_cache_hits = layer_stats.layer_cache_hits;
@@ -1367,6 +1852,9 @@ impl GpuRenderer {
         stats.draw_calls += layer_stats.draw_calls;
         stats.render_passes += layer_stats.render_passes;
         stats.blur_passes += layer_stats.blur_passes;
+        stats.blur_cache_hits += layer_stats.blur_cache_hits;
+        stats.blur_texture_allocations += layer_stats.blur_texture_allocations;
+        stats.filtered_pixels += layer_stats.filtered_pixels;
         stats.instances += layer_stats.instances;
         stats.shaped_nodes += layer_stats.shaped_nodes;
         stats.glyph_uploads += layer_stats.glyph_uploads;
@@ -1381,6 +1869,33 @@ impl GpuRenderer {
     }
     /// Drop cached shapes, canvases, SVGs and textures of nodes that are gone.
     fn prune(&mut self, scene: &Scene) {
+        self.blur_cache
+            .retain(|id, _| scene.contains(*id) && scene.effects(*id).blur_radius > 0.);
+        let mut snapshots = std::collections::HashSet::new();
+        let mut instances = std::collections::HashSet::new();
+        let mut chains = std::collections::HashSet::new();
+        for item in scene.paint_items() {
+            if let NodeKind::Image(image) = item.kind {
+                let mut image = image.as_ref();
+                loop {
+                    snapshots.insert(image.id());
+                    if let Some(id) = image.procedural().and_then(|p| p.instance) {
+                        instances.insert(id);
+                    }
+                    let Some(chain) = image.effect_chain() else {
+                        break;
+                    };
+                    chains.insert(chain.instance);
+                    image = chain.input.as_ref();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if let NodeKind::NativeSurface(frame) = item.kind {
+                snapshots.insert(frame.id());
+            }
+        }
+        self.procedural.retain(snapshots.clone(), &instances);
+        self.chain_cache.retain(snapshots.clone(), &chains);
         self.node_images.retain(|id, _| scene.contains(*id));
         self.shapes.retain(|id, _| {
             scene.contains(*id)
@@ -1393,15 +1908,7 @@ impl GpuRenderer {
         self.canvases.retain(scene);
         self.svgs.retain(scene);
         if !self.images.is_empty() {
-            let mut live_images: std::collections::HashSet<u64> = scene
-                .paint_items()
-                .filter_map(|item| match item.kind {
-                    NodeKind::Image(image) => Some(image.id()),
-                    #[cfg(target_os = "macos")]
-                    NodeKind::NativeSurface(frame) => Some(frame.id()),
-                    _ => None,
-                })
-                .collect();
+            let mut live_images = snapshots;
             live_images.extend(self.canvases.image_ids());
             live_images.extend(self.svgs.image_ids());
             #[cfg(target_os = "macos")]
@@ -1409,6 +1916,7 @@ impl GpuRenderer {
                 cache.retain(&live_images);
             }
             self.images.retain(|id, _| live_images.contains(id));
+            self.image_textures.retain(|id, _| live_images.contains(id));
         }
     }
     fn prepare_layer(
@@ -1421,6 +1929,12 @@ impl GpuRenderer {
         let root = scene.bounds(id);
         if let Some(cache) = self.layers.get_mut(&id)
             && cache.revision == revision
+            && [root.x - cache.root_origin.0, root.y - cache.root_origin.1]
+                .into_iter()
+                .all(|delta| {
+                    let pixels = delta * self.scale;
+                    (pixels - pixels.round()).abs() < 1e-3
+                })
         {
             cache.bounds.x += root.x - cache.root_origin.0;
             cache.bounds.y += root.y - cache.root_origin.1;
@@ -1428,13 +1942,18 @@ impl GpuRenderer {
             stats.layer_cache_hits += 1;
             return Ok(());
         }
-        // A transparent texel border lets linear sampling preserve fractional
-        // translation coverage instead of clamping opaque edge pixels.
+        // Align the layer to device pixels so compositing does not resample
+        // already-antialiased text/icons. Fractional movement repaints above;
+        // whole-pixel movement can still reuse the retained texture.
         let bounds = scene.layer_bounds(id).expand(1. / self.scale);
-        let x = bounds.x;
-        let y = bounds.y;
-        let width = (bounds.width * self.scale).ceil().max(1.) as u32;
-        let height = (bounds.height * self.scale).ceil().max(1.) as u32;
+        let x = (bounds.x * self.scale).floor() / self.scale;
+        let y = (bounds.y * self.scale).floor() / self.scale;
+        let width = (((bounds.x + bounds.width) * self.scale).ceil()
+            - (bounds.x * self.scale).floor())
+        .max(1.) as u32;
+        let height = (((bounds.y + bounds.height) * self.scale).ceil()
+            - (bounds.y * self.scale).floor())
+        .max(1.) as u32;
         let bounds = Rect::new(x, y, width as f32 / self.scale, height as f32 / self.scale);
         let items = scene.layer_items(Some(id));
         for item in &items {
@@ -1442,14 +1961,9 @@ impl GpuRenderer {
                 self.prepare_layer(scene, item.id, stats)?;
             }
         }
-        let bytes = width as usize * height as usize * 4;
         let existing = self.layers.get(&id).map_or(0, |l| l.bytes);
-        let used: usize = self.layers.values().map(|l| l.bytes).sum();
         if !self.layers.contains_key(&id) && self.layers.len() >= 1024 {
             return Err(GpuError("isolated layers exceed 1024 texture limit".into()));
-        }
-        if bytes > 64 * 1024 * 1024 || used - existing + bytes > 64 * 1024 * 1024 {
-            return Err(GpuError("isolated layers exceed 64 MiB budget".into()));
         }
         if width > self.device.limits().max_texture_dimension_2d
             || height > self.device.limits().max_texture_dimension_2d
@@ -1465,13 +1979,29 @@ impl GpuRenderer {
             width.next_multiple_of(64).min(limit),
             height.next_multiple_of(64).min(limit),
         );
-        let existing = self.layers.remove(&id);
-        let (texture, bind) = if let Some(cache) = existing.filter(|cache| {
+        let reuse = self.layers.get(&id).is_some_and(|cache| {
             let (w, h) = (cache.texture.width(), cache.texture.height());
             w >= width
                 && h >= height
                 && u64::from(w) * u64::from(h) <= 2 * u64::from(alloc_w) * u64::from(alloc_h)
-        }) {
+        });
+        // Budget the allocation we will actually retain, including rounding or
+        // a larger reusable texture. A steady/shrinking allocation cannot grow
+        // the cache and needs no full map scan.
+        let bytes = if reuse {
+            existing
+        } else {
+            alloc_w as usize * alloc_h as usize * 4
+        };
+        if bytes > 64 * 1024 * 1024
+            || (bytes > existing
+                && self.layers.values().map(|l| l.bytes).sum::<usize>() - existing + bytes
+                    > 64 * 1024 * 1024)
+        {
+            return Err(GpuError("isolated layers exceed 64 MiB budget".into()));
+        }
+        let existing = self.layers.remove(&id);
+        let (texture, bind) = if let Some(cache) = existing.filter(|_| reuse) {
             (cache.texture, cache.bind)
         } else {
             let texture = texture(&self.device, alloc_w, alloc_h, "isolated subtree");
@@ -1539,6 +2069,9 @@ impl GpuRenderer {
         stats.draw_calls += result.draw_calls;
         stats.render_passes += result.render_passes;
         stats.blur_passes += result.blur_passes;
+        stats.blur_cache_hits += result.blur_cache_hits;
+        stats.blur_texture_allocations += result.blur_texture_allocations;
+        stats.filtered_pixels += result.filtered_pixels;
         stats.instances += result.instances;
         stats.shaped_nodes += result.shaped_nodes;
         stats.glyph_uploads += result.glyph_uploads;
@@ -1764,13 +2297,18 @@ impl GpuRenderer {
                 });
                 draws.push(Draw {
                     shading: Shading::Full,
+                    blur_mask: item.mask,
                     start,
                     end: quads.len() as u32,
                     clip,
                     bounds: quad_bounds(&quads[start as usize..]),
                     image: None,
                     layer: Some(item.id),
-                    blur: (item.effects.blur_radius > 0.).then_some((item.bounds, item.effects)),
+                    blur: (item.effects.blur_radius > 0.).then_some((
+                        item.id,
+                        item.bounds,
+                        item.effects,
+                    )),
                 });
                 continue;
             }
@@ -1816,7 +2354,10 @@ impl GpuRenderer {
                         return Err(GpuError("panel exceeds 32 shadows".into()));
                     }
                     for shadow in style.shadows() {
-                        let core = bounds.expand(shadow.spread.max(0.));
+                        let core = bounds.expand(shadow.spread);
+                        if core.width <= 0. || core.height <= 0. {
+                            continue;
+                        }
                         let core = Rect::new(
                             core.x + shadow.offset.x,
                             core.y + shadow.offset.y,
@@ -1831,7 +2372,7 @@ impl GpuRenderer {
                             fade: [core.x, core.y, core.width, core.height],
                             options: [0., 0., 0., 1.],
                             shape: [
-                                style.radius + shadow.spread.max(0.),
+                                (style.radius + shadow.spread).max(0.),
                                 0.,
                                 shadow.blur_radius.max(0.001),
                                 0.,
@@ -1840,7 +2381,7 @@ impl GpuRenderer {
                                 style,
                                 core.width,
                                 core.height,
-                                shadow.spread.max(0.),
+                                shadow.spread,
                             ),
                             mask: NO_MASK,
                         });
@@ -1867,8 +2408,10 @@ impl GpuRenderer {
                         (border <= 0. || style.border_color.3 == 0).then_some(fill)
                     });
                     if let Some(fill) = flat_fill {
+                        self.canvases.forget(item.id);
                         if let Some(old) = self.node_images.remove(&item.id) {
                             self.images.remove(&old);
+                            self.image_textures.remove(&old);
                         }
                         quads.push(Quad {
                             rect: fade,
@@ -1924,9 +2467,17 @@ impl GpuRenderer {
                         continue;
                     }
                     let before = self.svgs.rasterizations();
-                    let image =
-                        self.svgs
-                            .get(item.id, svg, bounds.width, bounds.height, self.scale)?;
+                    let (image, raster_bounds) = if svg.transform()
+                        == zgui::affine::Affine::IDENTITY
+                    {
+                        self.svgs.get_at(item.id, svg, bounds, self.scale)?
+                    } else {
+                        (
+                            self.svgs
+                                .get(item.id, svg, bounds.width, bounds.height, self.scale)?,
+                            bounds,
+                        )
+                    };
                     stats.svg_rasterizations += (self.svgs.rasterizations() - before) as usize;
                     // Nodes share SVG rasters: `prune` releases their textures
                     // once no node shows them (a new source prunes).
@@ -1964,7 +2515,12 @@ impl GpuRenderer {
                             [0., 0., 1., 1.]
                         };
                     quads.push(Quad {
-                        rect: fade,
+                        rect: [
+                            raster_bounds.x,
+                            raster_bounds.y,
+                            raster_bounds.width,
+                            raster_bounds.height,
+                        ],
                         uv,
                         color: [1., 1., 1., item.effects.opacity],
                         fade,
@@ -2230,6 +2786,7 @@ impl GpuRenderer {
                             glyphs,
                             quads: Vec::new(),
                             atlas_epoch: 0,
+                            raster_origin: (f32::NAN, f32::NAN),
                             last_used: self.frame,
                             prepared,
                         };
@@ -2239,7 +2796,11 @@ impl GpuRenderer {
                     }
                     let mut shaped = self.shapes.remove(&item.id).unwrap();
                     self.shaped_bytes -= shaped.bytes();
-                    if shaped.atlas_epoch != self.atlas_epoch {
+                    let origin = (
+                        (bounds.x * self.scale).rem_euclid(1.),
+                        (bounds.y * self.scale).rem_euclid(1.),
+                    );
+                    if shaped.atlas_epoch != self.atlas_epoch || shaped.raster_origin != origin {
                         shaped.quads.clear();
                         shaped.quads.extend(
                             shaped
@@ -2249,11 +2810,15 @@ impl GpuRenderer {
                                 .map(rich_decoration_quad),
                         );
                         for glyph in &shaped.glyphs {
-                            if let Some(a) = self.glyph(glyph.key, &mut stats)? {
+                            // Rasterize at the final physical phase. Translating an
+                            // antialiased bitmap by a fraction of a pixel blurs it
+                            // again; include the baseline before vertical hinting.
+                            let (key, x, y) = glyph.at(origin);
+                            if let Some(a) = self.glyph(key, &mut stats)? {
                                 shaped.quads.push(Quad {
                                     rect: [
-                                        (glyph.x + a.left as f32) / self.scale,
-                                        (glyph.y - a.top as f32) / self.scale,
+                                        (x as f32 + a.left as f32 - origin.0) / self.scale,
+                                        (y as f32 - a.top as f32 - origin.1) / self.scale,
                                         a.width as f32 / self.scale,
                                         a.height as f32 / self.scale,
                                     ],
@@ -2280,6 +2845,7 @@ impl GpuRenderer {
                                 .map(rich_decoration_quad),
                         );
                         shaped.atlas_epoch = self.atlas_epoch;
+                        shaped.raster_origin = origin;
                         stats.geometry_rebuilds += 1;
                     }
                     for cached in &shaped.quads {
@@ -2325,15 +2891,16 @@ impl GpuRenderer {
             if let Some((rect, [top, bottom])) = item.mask {
                 let mask = [rect.y, rect.y + rect.height, top, bottom];
                 for quad in &mut quads[start as usize..] {
-                    if quad.options[2] < 0.5 {
-                        quad.mask = mask;
-                    }
+                    quad.mask = mask;
                 }
             }
             // When the clip only culls whole quads, apply it on the CPU and
             // draw under the viewport, so a change of clip never splits a
             // batch: neighbouring text, icons and rows become one draw. Quads
             // it would cut, transformed quads and filters keep the scissor.
+            if self.split_shading && self.opaque_interiors && item.effects.blur_radius <= 0. {
+                opaque_interior(&mut quads, start, self.scale, clip, &damage);
+            }
             let mut draw_clip = clip;
             let limit = snap_out(clip, self.scale);
             if item.effects.blur_radius <= 0.
@@ -2354,8 +2921,13 @@ impl GpuRenderer {
             if quads.len() as u32 > start || item.effects.blur_radius > 0. {
                 let draw = Draw {
                     shading: Shading::Full,
+                    blur_mask: item.mask,
                     layer: None,
-                    blur: (item.effects.blur_radius > 0.).then_some((bounds, item.effects)),
+                    blur: (item.effects.blur_radius > 0.).then_some((
+                        item.id,
+                        bounds,
+                        item.effects,
+                    )),
                     start,
                     end: quads.len() as u32,
                     clip: draw_clip,
@@ -2375,15 +2947,40 @@ impl GpuRenderer {
         if needed > VERTEX_BUDGET {
             return Err(GpuError("frame geometry exceeds 32 MiB budget".into()));
         }
-        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut encoder = self
+            .procedural_encoder
+            .take()
+            .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
         // Glyphs rasterized while building this frame land before any pass
         // samples them. Counted as glyph uploads, not scene render passes.
+        let upload_stamp = self.profile_start(&mut encoder, "uploads");
         self.texture_uploads.encode(&self.device, &mut encoder);
-        // Scrolled content: shift last frame's pixels (through the spare
-        // target, as a texture cannot copy onto itself), then draw only what
-        // the shift could not supply.
-        if !copies.is_empty() {
+        profiling::Profiler::end(&mut encoder, upload_stamp);
+        // Build the next retained frame directly in the spare: shifted scroll
+        // destinations plus unchanged pixels outside them cover the surface.
+        // Swapping avoids copying the scrolled pixels back a second time.
+        if !copies.is_empty() || self.retain_scroll_frame && !self.in_layer {
+            let copy_stamp = self.profile_start(&mut encoder, "scroll_copy");
             let spare = self.spare_texture();
+            let mut replaced = copies.clone();
+            replaced.extend(
+                damage
+                    .iter()
+                    .filter_map(|r| scissor(*r, self.scale, self.width, self.height))
+                    .map(|r| (r, (0, 0))),
+            );
+            for (x, y, w, h) in unchanged_scissors(self.width, self.height, &replaced) {
+                encoder.copy_texture_to_texture(
+                    texel_at(&self.target, x, y),
+                    texel_at(&spare, x, y),
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                stats.copied_pixels += u64::from(w) * u64::from(h);
+            }
             for ((x, y, w, h), (sx, sy)) in &copies {
                 let extent = wgpu::Extent3d {
                     width: *w,
@@ -2392,17 +2989,20 @@ impl GpuRenderer {
                 };
                 let (from_x, from_y) = ((*x as i32 + sx) as u32, (*y as i32 + sy) as u32);
                 encoder.copy_texture_to_texture(
-                    texel_at(&self.target, from_x, from_y),
+                    texel_at(
+                        self.scroll_source.as_ref().unwrap_or(&self.target),
+                        from_x,
+                        from_y,
+                    ),
                     texel_at(&spare, *x, *y),
                     extent,
                 );
-                encoder.copy_texture_to_texture(
-                    texel_at(&spare, *x, *y),
-                    texel_at(&self.target, *x, *y),
-                    extent,
-                );
+                stats.copied_pixels += u64::from(*w) * u64::from(*h);
                 stats.scroll_copies += 1;
             }
+            profiling::Profiler::end(&mut encoder, copy_stamp);
+            let next = self.spare.take().expect("created above");
+            self.swap_retained(next);
         }
         let bytes: &[u8] = bytemuck::cast_slice(&quads);
         let vertices = if let Some(mapped) = &mut self.mapped {
@@ -2439,7 +3039,7 @@ impl GpuRenderer {
         // must not force every unrelated quad into its own render pass.
         let has_damaged_blur = has_blur
             && draws.iter().any(|draw| {
-                draw.blur.is_some_and(|(bounds, _)| {
+                draw.blur.is_some_and(|(_, bounds, _)| {
                     damage.iter().any(|region| {
                         region
                             .intersection(draw.clip)
@@ -2461,7 +3061,7 @@ impl GpuRenderer {
 
         // The part of a filter's output inside `region`, if it reaches it.
         let filtered = |draw: &Draw, region: &Rect| {
-            let (bounds, _) = draw.blur?;
+            let (_, bounds, _) = draw.blur?;
             region.intersection(draw.clip)?.intersection(bounds)
         };
         // A filter samples everything painted before it, so each filter a
@@ -2498,6 +3098,15 @@ impl GpuRenderer {
         let mut from = 0;
         // Each filter's vertical half opens the pass after its horizontal one.
         let mut vertical = None;
+        let fingerprints = blur_cache::fingerprints(
+            &draws,
+            &quads,
+            &self.layers,
+            self.scale,
+            self.background,
+            self.atlas_epoch,
+            self.blur_algorithm,
+        );
         for (segment, end) in splits.iter().copied().chain([draws.len()]).enumerate() {
             if defer && end == draws.len() {
                 stats.render_passes += 1;
@@ -2515,8 +3124,14 @@ impl GpuRenderer {
             }
             if segment == 0 || end > from {
                 stats.render_passes += 1;
+                let stamp = self.profile_pass(if self.in_layer {
+                    "layer_repaint"
+                } else {
+                    "repaint"
+                });
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("damage"),
+                    timestamp_writes: stamp.as_ref().map(|s| s.writes()),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.view,
                         depth_slice: None,
@@ -2529,7 +3144,7 @@ impl GpuRenderer {
                     ..Default::default()
                 });
                 if let Some(blur) = vertical.take() {
-                    let pipeline = &self.blur_pipelines.as_ref().expect("filtered").vertical;
+                    let pipeline = self.blur_vertical(&blur);
                     Self::encode_vertical(&mut pass, pipeline, &blur, &mut stats);
                 }
                 pass.set_vertex_buffer(0, vertices.slice(..));
@@ -2558,15 +3173,22 @@ impl GpuRenderer {
             let Some(draw) = draws.get(end) else {
                 break;
             };
-            let (bounds, effects) = draw.blur.expect("split at a filter");
+            let (id, _, _) = draw.blur.expect("split at a filter");
             let outputs = regions
                 .iter()
                 .filter_map(|(region, _)| filtered(draw, region));
-            vertical = self.blur(&mut encoder, bounds, draw.clip, outputs, effects);
+            vertical = self.blur(&mut encoder, fingerprints[&id], draw, outputs);
             if let Some(blur) = &vertical {
-                stats.draw_calls += blur.scissors.len();
-                stats.render_passes += 1;
-                stats.blur_passes += 2;
+                stats.draw_calls += blur.predraws;
+                stats.render_passes += blur.prepasses;
+                stats.blur_passes += blur.prepasses + 1;
+                stats.blur_cache_hits += usize::from(blur.prepasses == 0);
+                stats.blur_texture_allocations += blur.allocations;
+                if blur.prepasses > 0 {
+                    for &(_, _, w, h) in &blur.scissors {
+                        stats.filtered_pixels += u64::from(w) * u64::from(h);
+                    }
+                }
             }
             // The filtered draw's own quads open the next pass.
             from = end;
@@ -2601,7 +3223,12 @@ impl GpuRenderer {
     /// land on whole pixels, and within the clip nothing but the content
     /// changes position: whatever lies under it is hidden by one opaque
     /// rectangle, and anything over it is repainted anyway.
-    fn scroll_copies(&self, scene: &Scene, damage: &[Rect]) -> (Vec<ScrollCopy>, Vec<Rect>) {
+    fn scroll_copies(
+        &self,
+        scene: &Scene,
+        damage: &[Rect],
+        known: Option<&ScrollState>,
+    ) -> (Vec<ScrollCopy>, Vec<Rect>) {
         let serial = scene.flush_serial();
         let mut copies = Vec::new();
         let mut repaint = Vec::new();
@@ -2638,29 +3265,74 @@ impl GpuRenderer {
                     )
                 })
             })();
-            match pixels {
-                Some(copy)
-                    if copyable
-                        && !self.fresh
-                        && self.rendered_serial == Some(serial - 1)
-                        && copy_is_exact(scene, scroll, damage) =>
-                {
-                    copies.push(copy)
-                }
-                _ => repaint.push(scroll.clip),
+            if let Some(copy) = pixels
+                && copyable
+                && !self.fresh
+                && self.rendered_serial == Some(serial - 1)
+                && let Some(repair) = known
+                    .filter(|s| s.node == scroll.node)
+                    .map(|s| s.repair.clone())
+                    .or_else(|| copy_repair(scene, scroll, damage).map(|r| r.regions))
+            {
+                copies.push(copy);
+                repaint.extend(repair);
+            } else {
+                repaint.push(scroll.clip);
             }
         }
         (copies, repaint)
     }
+    fn scroll_state_for(&self, scene: &Scene, damage: &[Rect]) -> Option<ScrollState> {
+        if !self.scroll_phase_cache || scene.scroll_moves().len() != 1 || scene.has_backdrop_blur()
+        {
+            return None;
+        }
+        let scroll = &scene.scroll_moves()[0];
+        if scroll.serial != scene.flush_serial() {
+            return None;
+        }
+        let repair = copy_repair(scene, scroll, damage)?;
+        let clip = scroll.clip.intersection(Rect::new(
+            0.,
+            0.,
+            self.width as f32 / self.scale,
+            self.height as f32 / self.scale,
+        ))?;
+        let origin = scene.bounds(scroll.node);
+        Some(ScrollState {
+            node: scroll.node,
+            clip,
+            origin: (origin.x, origin.y),
+            revision: (
+                scene.content_revision(),
+                scene.raster_revision(),
+                scene.layer_revision(scroll.node),
+            ),
+            foreground: repair.foreground,
+            repair: repair.regions,
+        })
+    }
+    /// Ablate the bounded fractional-origin cache without changing scrolling.
+    pub fn set_scroll_phase_cache(&mut self, enabled: bool) {
+        self.flush_pending();
+        self.scroll_phase_cache = enabled;
+        self.scroll_history = None;
+        self.scroll_state = None;
+    }
     /// Submit commands recorded by the last render, if any.
     fn flush_pending(&self) {
+        self.flush_pending_inner(false);
+    }
+    fn flush_pending_inner(&self, finish_profile: bool) {
         let Some(mut pending) = self.pending.borrow_mut().take() else {
             return;
         };
         // Not presented (skipped, hidden or read back): draw it the two-pass
         // way so the retained target is complete.
         if let Some(deferred) = self.deferred.borrow_mut().take() {
+            let stamp = self.profile_pass("deferred_repaint");
             let mut pass = pending.begin_render_pass(&wgpu::RenderPassDescriptor {
+                timestamp_writes: stamp.as_ref().map(|s| s.writes()),
                 label: Some("damage"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.view,
@@ -2675,20 +3347,12 @@ impl GpuRenderer {
             });
             let mut stats = GpuStats::default();
             if let Some(blur) = &deferred.blur {
-                let pipeline = &self.blur_pipelines.as_ref().expect("filtered").vertical;
+                let pipeline = self.blur_vertical(blur);
                 Self::encode_vertical(&mut pass, pipeline, blur, &mut stats);
             }
-            self.encode_damage(
-                &mut pass,
-                &deferred,
-                (
-                    self.context.inner.quads.clear(false),
-                    self.context.inner.quads.get(Shading::Full),
-                ),
-                &mut stats,
-            );
+            self.encode_damage(&mut pass, &deferred, &self.context.inner.quads, &mut stats);
         }
-        self.queue.submit([pending.finish()]);
+        self.submit_profiled(pending, finish_profile);
         self.belt.borrow_mut().recall();
         self.submitted();
         if let Some(mapped) = &self.mapped {
@@ -2706,20 +3370,15 @@ impl GpuRenderer {
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         frame: &Deferred,
-        (clear, quads): (&wgpu::RenderPipeline, &wgpu::RenderPipeline),
+        pipelines: &QuadPipelines,
         stats: &mut GpuStats,
     ) {
         pass.set_vertex_buffer(0, frame.vertices.slice(..));
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_bind_group(1, frame.viewport.as_ref(), &[]);
-        // The full shader draws every shading; unblended ones clear.
-        let pick = |shading| {
-            if shading == Shading::Opaque {
-                clear
-            } else {
-                quads
-            }
-        };
+        let clear = pipelines.clear(self.split_shading);
+        let quads = pipelines.get(Shading::Full);
+        let pick = |shading| pipelines.get(shading);
         let first = |index: usize| frame.first.get(index).copied().unwrap_or(0);
         if !frame.clear {
             pass.set_pipeline(quads);
@@ -2806,22 +3465,16 @@ impl GpuRenderer {
             }
             self.single_pass = Some(SinglePass {
                 format,
-                quads: quad_pipeline(
-                    &self.device,
-                    &inner.quad_shader,
-                    &inner.quad_layout,
-                    true,
-                    Some(format),
-                    false,
-                ),
-                clear: quad_pipeline(
-                    &self.device,
-                    &inner.quad_shader,
-                    &inner.quad_layout,
-                    false,
-                    Some(format),
-                    false,
-                ),
+                quads: QuadPipelines {
+                    device: self.device.clone(),
+                    shader: inner.quad_shader.clone(),
+                    layout: inner.quad_layout.clone(),
+                    full: Default::default(),
+                    full_clear: Default::default(),
+                    basic: Default::default(),
+                    basic_clear: Default::default(),
+                    drawable: Some(format),
+                },
                 copy,
             });
         }
@@ -2841,8 +3494,10 @@ impl GpuRenderer {
         }
         if frame.blur.is_some() {
             let device = &self.device;
-            let blur = self.blur_pipelines.as_mut().expect("filtered");
-            blur.both(device, format);
+            self.blur_composite
+                .as_mut()
+                .expect("filtered")
+                .both(device, format);
         }
         let pipelines = self.single_pass.as_ref().expect("created above");
         let previous = self
@@ -2855,8 +3510,10 @@ impl GpuRenderer {
             store: wgpu::StoreOp::Store,
         };
         {
+            let stamp = self.profile_pass("presentation_and_repaint");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame"),
+                timestamp_writes: stamp.as_ref().map(|s| s.writes()),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
                         view: &spare.view,
@@ -2878,22 +3535,20 @@ impl GpuRenderer {
             pass.draw(0..3, 0..1);
             let mut stats = GpuStats::default();
             if let Some(blur) = &frame.blur {
-                let both = self.blur_pipelines.as_ref().and_then(|b| b.both.as_ref());
+                let both = self.blur_composite.as_ref().and_then(|b| b.both.as_ref());
                 let (_, pipeline) = both.expect("created above");
                 Self::encode_vertical(&mut pass, pipeline, blur, &mut stats);
             }
-            self.encode_damage(
-                &mut pass,
-                frame,
-                (&pipelines.clear, &pipelines.quads),
-                &mut stats,
-            );
+            self.encode_damage(&mut pass, frame, &pipelines.quads, &mut stats);
             self.present_stats.draw_calls += stats.draw_calls + 1;
             self.present_stats.instances += stats.instances;
         }
         if !frame.regions.is_empty() {
             self.single_pass_frames += 1;
         }
+        self.swap_retained(spare);
+    }
+    fn swap_retained(&mut self, spare: Retained) {
         // The spare now holds this frame; the old target becomes the spare,
         // keeping its view and bind groups for when it is drawn into again.
         let Retained {
@@ -3012,13 +3667,14 @@ impl GpuRenderer {
     fn blur(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        bounds: Rect,
-        clip: Rect,
+        fingerprint: u64,
+        draw: &Draw,
         outputs: impl IntoIterator<Item = Rect>,
-        effects: zgui::scene::Effects,
     ) -> Option<VerticalBlur> {
+        let (id, bounds, effects) = draw.blur.expect("filter draw");
+        let clip = draw.clip;
+        let mask = draw.blur_mask;
         let sigma = (effects.blur_radius * self.scale).clamp(0.1, 64.);
-        let radius = (sigma * 3.).ceil() as u32;
         // Samples stay inside the filter's visible pixels (see blur.wgsl).
         let (ax, ay, aw, ah) = bounds
             .intersection(clip)
@@ -3030,30 +3686,82 @@ impl GpuRenderer {
         if scissors.is_empty() {
             return None;
         }
+        let composite = blur_cache::composite_key(bounds, effects, mask);
+        if self
+            .blur_cache
+            .get(&id)
+            .is_some_and(|c| c.fingerprint == fingerprint)
+        {
+            let mut cached = self.blur_cache.remove(&id).expect("checked above");
+            if cached.composite != composite {
+                cached.filter.bind = self.blur_composite_bind(
+                    &cached.textures[0],
+                    cached.textures.last().unwrap(),
+                    bounds,
+                    (ax, ay),
+                    effects,
+                    mask,
+                );
+                cached.composite = composite;
+            }
+            cached.used = self.frame;
+            let mut filter = cached.filter.clone();
+            filter.scissors = scissors;
+            filter.prepasses = 0;
+            filter.predraws = 0;
+            filter.allocations = 0;
+            self.blur_cache.insert(id, cached);
+            return Some(filter);
+        }
+        let mut textures = self
+            .blur_cache
+            .remove(&id)
+            .map_or_else(Vec::new, |c| c.textures);
+        if self.blur_algorithm == BlurAlgorithm::DualKawase {
+            let (mut filter, textures) =
+                self.kawase_blur(encoder, (ax, ay, aw, ah), scissors, sigma, textures);
+            filter.bind = self.blur_composite_bind(
+                &textures[0],
+                &textures[1],
+                bounds,
+                (ax, ay),
+                effects,
+                mask,
+            );
+            self.cache_blur(id, fingerprint, filter.clone(), textures, composite);
+            return Some(filter);
+        }
         if self.blur_pipelines.is_none() {
             self.blur_pipelines = Some(BlurPipelines::new(&self.device));
         }
-        if self
-            .blur_scratch
-            .as_ref()
-            .is_none_or(|(source, _)| source.width() < self.width || source.height() < self.height)
-        {
-            // Round up so a slowly growing layer does not reallocate every frame.
-            let (current_w, current_h) = self
-                .blur_scratch
-                .as_ref()
-                .map_or((0, 0), |(source, _)| (source.width(), source.height()));
-            let width = self.width.max(current_w).next_multiple_of(256);
-            let height = self.height.max(current_h).next_multiple_of(256);
-            let limit = self.device.limits().max_texture_dimension_2d;
-            let (width, height) = (width.min(limit), height.min(limit));
-            self.blur_scratch = Some((
-                texture(&self.device, width, height, "backdrop source"),
-                texture(&self.device, width, height, "horizontal blur"),
-            ));
+        let pipelines = self.blur_pipelines.as_mut().unwrap();
+        if !pipelines.weights.contains_key(&sigma.to_bits()) {
+            if pipelines.weights.len() >= 64 {
+                pipelines.weights.clear();
+            }
+            let buffer = upload::init_buffer(
+                &self.device,
+                self.mapped.is_some(),
+                "Gaussian paired weights",
+                bytemuck::cast_slice(&gaussian::samples(sigma)),
+                wgpu::BufferUsages::STORAGE,
+            );
+            pipelines.weights.insert(sigma.to_bits(), buffer);
+        }
+        let allocations = blur_cache::reserve(&self.device, &mut textures, 0, aw, ah)
+            + blur_cache::reserve(&self.device, &mut textures, 1, aw, ah)
+            + blur_cache::reserve_scratch(&self.device, &mut self.gaussian_scratch, aw, ah);
+        let source = &textures[0];
+        let intermediate = self.gaussian_scratch.as_ref().expect("reserved above");
+        let split =
+            (source.width(), source.height()) == (intermediate.width(), intermediate.height());
+        if !split {
+            self.blur_pipelines
+                .as_mut()
+                .expect("created above")
+                .crop(&self.device);
         }
         let pipelines = self.blur_pipelines.as_ref().expect("created above");
-        let (source, intermediate) = self.blur_scratch.as_ref().expect("created above");
         let source_view = source.create_view(&Default::default());
         let intermediate_view = intermediate.create_view(&Default::default());
         let uniform = |vertical: bool| {
@@ -3061,7 +3769,7 @@ impl GpuRenderer {
                 if vertical { 0. } else { 1. },
                 if vertical { 1. } else { 0. },
                 sigma,
-                if vertical { 1. } else { 0. },
+                if vertical { 3. } else { -1. },
                 bounds.x * self.scale,
                 bounds.y * self.scale,
                 bounds.width * self.scale,
@@ -3094,9 +3802,18 @@ impl GpuRenderer {
             layout: &pipelines.horizontal.get_bind_group_layout(0),
             entries: &[
                 texture(0, &self.view),
+                texture(1, &self.view),
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: horizontal.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pipelines.weights[&sigma.to_bits()].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&pipelines.sampler),
                 },
             ],
         });
@@ -3110,6 +3827,14 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: vertical.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pipelines.weights[&sigma.to_bits()].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&pipelines.sampler),
                 },
             ],
         });
@@ -3128,27 +3853,69 @@ impl GpuRenderer {
                 ops: load,
             })
         };
+        let stamp = self.profile_pass("blur_horizontal");
+        let horizontal_attachments = [attachment(&intermediate_view), attachment(&source_view)];
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("horizontal blur"),
-            color_attachments: &[attachment(&intermediate_view), attachment(&source_view)],
+            timestamp_writes: stamp.as_ref().map(|s| s.writes()),
+            color_attachments: if split {
+                &horizontal_attachments
+            } else {
+                &horizontal_attachments[..1]
+            },
             ..Default::default()
         });
-        pass.set_pipeline(&pipelines.horizontal);
+        pass.set_pipeline(if split {
+            &pipelines.horizontal
+        } else {
+            &pipelines.crop.as_ref().expect("created above").0
+        });
         pass.set_bind_group(0, &horizontal, &[]);
-        for &(x, y, width, height) in &scissors {
-            // Cover the rows the vertical kernel reaches inside the area.
-            let top = y.saturating_sub(radius).max(ay);
-            let bottom = (y + height + radius).min(ay + ah);
-            pass.set_scissor_rect(x, top, width, bottom - top);
+        pass.set_viewport(0., 0., aw as f32, ah as f32, 0., 1.);
+        pass.set_scissor_rect(0, 0, aw, ah);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        if !split {
+            let stamp = self.profile_pass("blur_original");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("original blur crop"),
+                timestamp_writes: stamp.as_ref().map(|s| s.writes()),
+                color_attachments: &[attachment(&source_view)],
+                ..Default::default()
+            });
+            pass.set_pipeline(&pipelines.crop.as_ref().expect("created above").1);
+            pass.set_bind_group(0, &horizontal, &[]);
+            pass.set_viewport(0., 0., aw as f32, ah as f32, 0., 1.);
+            pass.set_scissor_rect(0, 0, aw, ah);
             pass.draw(0..3, 0..1);
         }
-        Some(VerticalBlur {
-            bind: vertical,
+        let filtered_view = textures[1].create_view(&Default::default());
+        let stamp = self.profile_pass("blur_vertical");
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("cached vertical blur"),
+            timestamp_writes: stamp.as_ref().map(|s| s.writes()),
+            color_attachments: &[attachment(&filtered_view)],
+            ..Default::default()
+        });
+        pass.set_pipeline(&pipelines.vertical);
+        pass.set_bind_group(0, &vertical, &[]);
+        pass.set_viewport(0., 0., aw as f32, ah as f32, 0., 1.);
+        pass.set_scissor_rect(0, 0, aw, ah);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        let bind =
+            self.blur_composite_bind(&textures[0], &textures[1], bounds, (ax, ay), effects, mask);
+        let filter = VerticalBlur {
+            bind,
+            predraws: 2 + usize::from(!split),
+            allocations,
             scissors,
-        })
+            prepasses: 2 + usize::from(!split),
+        };
+        self.cache_blur(id, fingerprint, filter.clone(), textures, composite);
+        Some(filter)
     }
-    /// Draw a filter's vertical half, mixing it over the original pixels, at
-    /// the start of the pass that follows its horizontal half.
+    /// Composite a completed cached filter over its original backdrop.
     fn encode_vertical(
         pass: &mut wgpu::RenderPass<'_>,
         pipeline: &wgpu::RenderPipeline,
@@ -3169,6 +3936,7 @@ impl GpuRenderer {
             && old != id
         {
             self.images.remove(&old);
+            self.image_textures.remove(&old);
         }
     }
     /// The texture of `node`'s canvas raster, uploaded if it is new; the
@@ -3185,6 +3953,7 @@ impl GpuRenderer {
             if found.pixels.is_none() {
                 self.canvases.forget(node);
                 found = raster(&mut self.canvases)?;
+                self.retire_node_image(node, found.id);
             }
             let pixels = found.pixels.expect("fresh raster");
             self.upload_image(&pixels)?;
@@ -3194,63 +3963,137 @@ impl GpuRenderer {
         Ok(found.id)
     }
     fn upload_image(&mut self, image: &zgui::image::ImageData) -> Result<(), GpuError> {
-        let bytes = image.pixels().len();
-        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > 64 * 1024 * 1024 {
-            return Err(GpuError(
-                "visible image textures exceed the 64 MiB budget".into(),
-            ));
-        }
         if image.width() > self.device.limits().max_texture_dimension_2d
             || image.height() > self.device.limits().max_texture_dimension_2d
         {
             return Err(GpuError("image exceeds GPU texture dimensions".into()));
         }
-        let texture = texture(&self.device, image.width(), image.height(), "image");
-        let mut pixels = image.pixels().to_vec();
-        for pixel in pixels.as_chunks_mut::<4>().0 {
-            let alpha = u16::from(pixel[3]);
-            for channel in &mut pixel[..3] {
-                *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+        let bytes = image.width() as usize * image.height() as usize * 4;
+        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > 64 * 1024 * 1024 {
+            return Err(GpuError(
+                "visible image textures exceed the 64 MiB budget".into(),
+            ));
+        }
+        let mut display = None;
+        let texture = if let Some(chain) = image.effect_chain() {
+            if !self.image_textures.contains_key(&chain.input.id()) {
+                self.upload_image(&chain.input)?;
             }
-        }
-        if self.mapped.is_some() {
-            self.texture_uploads
-                .push(&texture, (0, 0, image.width(), image.height()), &pixels);
-        } else {
-            self.queue.write_texture(
-                texture.as_image_copy(),
-                &pixels,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(image.width() * 4),
-                    rows_per_image: None,
-                },
-                texture.size(),
+            if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > 64 * 1024 * 1024 {
+                return Err(GpuError(
+                    "visible image textures exceed the 64 MiB budget".into(),
+                ));
+            }
+            let mut encoder = self
+                .procedural_encoder
+                .take()
+                .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
+            // Mapped uploads must precede any stage sampling its source.
+            self.texture_uploads.encode(&self.device, &mut encoder);
+            let stamp = self.profile_start(&mut encoder, "effect_chain");
+            let result = self
+                .chain_cache
+                .render(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &self.image_textures[&chain.input.id()],
+                    image.id(),
+                    chain,
+                )
+                .map_err(|error| GpuError(error.into()));
+            profiling::Profiler::end(&mut encoder, stamp);
+            // Earlier recursive uploads and procedural fills may already be
+            // cached. Keep their commands even if this chain rejects its budget.
+            self.procedural_encoder = Some(encoder);
+            result?
+        } else if let Some(program) = image.procedural() {
+            let limits = self.device.limits();
+            if program.parameters.is_empty()
+                || program.parameters.len() as u64 * 4 > limits.max_storage_buffer_binding_size
+                || program
+                    .dispatch
+                    .iter()
+                    .any(|n| *n == 0 || *n > limits.max_compute_workgroups_per_dimension)
+            {
+                return Err(GpuError(
+                    "procedural parameters or dispatch exceed GPU limits".into(),
+                ));
+            }
+            let mut encoder = self
+                .procedural_encoder
+                .take()
+                .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
+            let stamp = self.profile_start(&mut encoder, "dither");
+            let result = self.procedural.render(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &self.context.inner.texture_layout,
+                image,
             );
-        }
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("image"),
-            layout: &self.context.inner.texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(
-                        &texture.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.device.create_sampler(
-                        &wgpu::SamplerDescriptor {
-                            mag_filter: wgpu::FilterMode::Linear,
-                            min_filter: wgpu::FilterMode::Linear,
-                            ..Default::default()
-                        },
-                    )),
-                },
-            ],
+            profiling::Profiler::end(&mut encoder, stamp);
+            self.procedural_encoder = Some(encoder);
+            let (texture, bind) = result.map_err(|error| GpuError(error.into()))?;
+            display = Some(bind);
+            texture
+        } else {
+            let texture = texture(&self.device, image.width(), image.height(), "image");
+            let mut pixels = image.pixels().to_vec();
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                let alpha = u16::from(pixel[3]);
+                for channel in &mut pixel[..3] {
+                    *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+                }
+            }
+            if self.mapped.is_some() {
+                self.texture_uploads
+                    .push(&texture, (0, 0, image.width(), image.height()), &pixels);
+            } else {
+                // Direct writes use the storage format; mapped uploads convert
+                // RGBA into BGRA through a render pass instead.
+                for pixel in pixels.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+                self.queue.write_texture(
+                    texture.as_image_copy(),
+                    &pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(image.width() * 4),
+                        rows_per_image: None,
+                    },
+                    texture.size(),
+                );
+            }
+            texture
+        };
+        let bind = display.unwrap_or_else(|| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("image"),
+                layout: &self.context.inner.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            &texture.create_view(&Default::default()),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.device.create_sampler(
+                            &wgpu::SamplerDescriptor {
+                                mag_filter: wgpu::FilterMode::Linear,
+                                min_filter: wgpu::FilterMode::Linear,
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                ],
+            })
         });
         self.images.insert(image.id(), (bind, bytes));
+        self.image_textures.insert(image.id(), texture);
         Ok(())
     }
     fn reset_atlas(&mut self, size: u32) {
@@ -3300,7 +4143,9 @@ impl GpuRenderer {
                 SwashContent::Mask => {
                     for (row, alphas) in image.data.chunks_exact(p.width as usize).enumerate() {
                         let start = row_start(row as u32);
-                        for (texel, alpha) in rgba[start..].chunks_exact_mut(4).zip(alphas) {
+                        for (texel, alpha) in
+                            rgba[start..].as_chunks_mut::<4>().0.iter_mut().zip(alphas)
+                        {
                             texel.copy_from_slice(&[255, 255, 255, *alpha]);
                         }
                     }
@@ -3317,7 +4162,9 @@ impl GpuRenderer {
                     for (row, pixels) in image.data.chunks_exact(bytes).enumerate() {
                         let start = row_start(row as u32);
                         for (texel, pixel) in rgba[start..]
-                            .chunks_exact_mut(4)
+                            .as_chunks_mut::<4>()
+                            .0
+                            .iter_mut()
                             .zip(pixels.as_chunks::<4>().0)
                         {
                             texel.copy_from_slice(&[
@@ -3447,14 +4294,18 @@ impl GpuRenderer {
             });
             self.present_single_pass(&mut encoder, &deferred, &raw, format);
         } else if self.copy_present {
+            let stamp = self.profile_start(&mut encoder, "presentation_copy");
             encoder.copy_texture_to_texture(
                 self.target.as_image_copy(),
                 frame.texture.as_image_copy(),
                 self.target.size(),
             );
+            profiling::Profiler::end(&mut encoder, stamp);
         } else {
             let view = frame.texture.create_view(&Default::default());
+            let stamp = self.profile_pass("presentation_blit");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                timestamp_writes: stamp.as_ref().map(|s| s.writes()),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -3470,7 +4321,7 @@ impl GpuRenderer {
             pass.set_bind_group(0, self.blit_bind.as_ref().unwrap(), &[]);
             pass.draw(0..3, 0..1);
         }
-        self.queue.submit([encoder.finish()]);
+        self.submit_profiled(encoder, true);
         self.belt.get_mut().recall();
         self.submitted();
         if let Some(mapped) = self.mapped.as_mut() {
@@ -3499,8 +4350,14 @@ impl GpuRenderer {
     /// window has stopped presenting for a while.
     pub fn trim(&mut self) {
         self.flush_pending();
-        self.blur_scratch = None;
+        self.blur_cache.clear();
+        self.gaussian_scratch = None;
+        if let Some(kawase) = &mut self.kawase {
+            kawase.scratch = None;
+        }
         self.spare = None;
+        self.scroll_history = None;
+        self.scroll_state = None;
         if let Some(mapped) = &mut self.mapped {
             mapped.get_mut().trim();
         }
@@ -3588,6 +4445,10 @@ impl GpuRenderer {
     pub fn debug_split_shading(&mut self, split: bool) {
         self.split_shading = split;
     }
+    /// Ablate opaque-fill decomposition while retaining the same shader selection.
+    pub fn debug_opaque_interiors(&mut self, enabled: bool) {
+        self.opaque_interiors = enabled;
+    }
     /// Test hook: treat an offscreen `Bgra8Unorm` texture as the drawable, so
     /// single-pass presentation runs without a window.
     pub fn debug_enable_single_pass(&mut self) {
@@ -3629,7 +4490,9 @@ impl GpuRenderer {
             let pipeline = blit_pipeline(&self.device, srgb, !cfg!(target_os = "macos"));
             let bind = blit_group(&self.device, &pipeline, &self.view);
             let view = drawable.create_view(&Default::default());
+            let stamp = self.profile_pass("presentation_blit");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                timestamp_writes: stamp.as_ref().map(|s| s.writes()),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -3645,7 +4508,7 @@ impl GpuRenderer {
             pass.set_bind_group(0, &bind, &[]);
             pass.draw(0..3, 0..1);
         }
-        self.queue.submit([encoder.finish()]);
+        self.submit_profiled(encoder, true);
         self.submitted();
         if let Some(mapped) = self.mapped.as_mut() {
             mapped.get_mut().submitted();
@@ -3657,8 +4520,71 @@ impl GpuRenderer {
         Ok(pixels)
     }
     pub fn readback(&self) -> Result<Vec<u8>, GpuError> {
-        self.flush_pending();
+        self.flush_pending_inner(true);
         self.read_texture(&self.target)
+    }
+    /// Finish submitted rendering without a texture readback. For benchmarks
+    /// and diagnostics only: normal frames must stay asynchronous.
+    pub fn wait_idle(&self) -> Result<(), GpuError> {
+        self.flush_pending_inner(true);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| GpuError(e.to_string()))?;
+        Ok(())
+    }
+    /// Submit an offscreen frame asynchronously; unlike wait_idle this never waits.
+    pub fn submit(&self) {
+        self.flush_pending_inner(true);
+    }
+    /// Enable bounded GPU pass timestamps. Returns false on unsupported adapters.
+    /// No device waits or readbacks are added when profiling is disabled.
+    pub fn set_gpu_profiling(&mut self, enabled: bool) -> bool {
+        self.flush_pending_inner(true);
+        *self.profiler.get_mut() = if enabled {
+            profiling::Profiler::new(&self.device, &self.queue)
+        } else {
+            None
+        };
+        self.profiler.borrow().is_some()
+    }
+    /// Poll completed timestamps without waiting for GPU work.
+    pub fn take_gpu_profiles(&self) -> Vec<profiling::GpuFrameProfile> {
+        if self.profiler.borrow().is_none() {
+            return Vec::new();
+        }
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.profiler
+            .borrow_mut()
+            .as_mut()
+            .map_or_else(Vec::new, |p| p.take())
+    }
+    pub fn dropped_gpu_profiles(&self) -> u64 {
+        self.profiler.borrow().as_ref().map_or(0, |p| p.dropped)
+    }
+    fn profile_pass(&self, label: &'static str) -> Option<profiling::PassStamp> {
+        self.profiler
+            .borrow_mut()
+            .as_mut()
+            .and_then(|p| p.pass(label))
+    }
+    fn profile_start(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &'static str,
+    ) -> Option<profiling::PassStamp> {
+        self.profiler
+            .borrow_mut()
+            .as_mut()
+            .and_then(|p| p.start(encoder, label))
+    }
+    fn submit_profiled(&self, mut encoder: wgpu::CommandEncoder, finish: bool) {
+        if finish && let Some(p) = self.profiler.borrow_mut().as_mut() {
+            p.resolve(&mut encoder);
+        }
+        self.queue.submit([encoder.finish()]);
+        if finish && let Some(p) = self.profiler.borrow_mut().as_mut() {
+            p.submitted();
+        }
     }
     fn read_texture(&self, texture: &wgpu::Texture) -> Result<Vec<u8>, GpuError> {
         let stride = (self.width * 4).div_ceil(256) * 256;
@@ -3699,7 +4625,7 @@ impl GpuRenderer {
         }
         // Retained textures are BGRA (see `FORMAT`); callers read RGBA.
         if texture.format() == wgpu::TextureFormat::Bgra8Unorm {
-            for pixel in pixels.chunks_exact_mut(4) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
         }
@@ -3759,8 +4685,7 @@ fn quad_pipeline(
 ) -> wgpu::RenderPipeline {
     let blend = blend.then_some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
     let all = wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4,3=>Float32x4,4=>Float32x4,5=>Float32x4,6=>Float32x4,7=>Float32x4];
-    // `basic` reads rect, uv, colour and options only.
-    let basic_attributes = [all[0], all[1], all[2], all[4]];
+    let basic_attributes = [all[0], all[1], all[2], all[3], all[4], all[5]];
     let target = |format| {
         Some(wgpu::ColorTargetState {
             format,
@@ -3787,9 +4712,9 @@ fn quad_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            // Single-pass presentation draws with the full shader alone.
             entry_point: Some(match (basic, drawable.is_some()) {
-                (true, _) => "fs_basic",
+                (true, true) => "fs_basic_both",
+                (true, false) => "fs_basic",
                 (false, true) => "fs_both",
                 (false, false) => "fs",
             }),
@@ -3949,25 +4874,12 @@ fn rounded_damage(rect: Rect, viewport: Rect, scale: f32) -> Option<Rect> {
 fn merge_damage(damage: &[Rect], viewport: Rect, scale: f32) -> Vec<Rect> {
     // Each region redraws every batch it touches: nearby small ones (the
     // dots of a spinner) are fewer draws as one, for a few more pixels.
-    let area = |r: Rect| r.width * r.height * scale * scale;
-    let close = |a: Rect, b: Rect| {
-        a.intersects(b) || area(a.union(b)) <= (area(a) + area(b)) * 1.5 + NEAR_PIXELS
-    };
     let mut regions: Vec<Rect> = Vec::new();
     for r in damage {
-        let Some(mut r) = rounded_damage(*r, viewport, scale) else {
+        let Some(r) = rounded_damage(*r, viewport, scale) else {
             continue;
         };
-        let mut i = 0;
-        while i < regions.len() {
-            if close(regions[i], r) {
-                r = r.union(regions.swap_remove(i));
-                i = 0;
-            } else {
-                i += 1;
-            }
-        }
-        regions.push(r);
+        zgui::scene::merge_damage(&mut regions, r, Some(NEAR_PIXELS / (scale * scale)));
     }
     regions
 }
@@ -4168,6 +5080,75 @@ pub mod svg;
 
 #[cfg(test)]
 mod native_surface_shader_tests {
+    #[test]
+    fn isolated_layer_budget_checks_rounded_texture_allocation_before_creation() {
+        use super::*;
+        let mut gpu = GpuRenderer::new(4, 4).unwrap();
+        let mut scene = Scene::new(5000., 3300.);
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(20, 40, 60, 255)),
+            zgui::scene::Style {
+                width: Some(5000.),
+                height: Some(3300.),
+                ..Default::default()
+            },
+        );
+        scene.set_isolated(node, true);
+        scene.flush();
+        // Requested pixels fit64MiB, but the rounded5056x3328 allocation does not.
+        let requested = scene.layer_bounds(node).expand(1.);
+        assert!(requested.width * requested.height * 4. < (64 * 1024 * 1024) as f32);
+        let mut stats = GpuStats::default();
+        assert!(
+            gpu.prepare_layer(&scene, node, &mut stats)
+                .unwrap_err()
+                .0
+                .contains("64 MiB")
+        );
+        assert!(gpu.layers.is_empty());
+        assert_eq!(stats.layer_texture_allocations, 0);
+    }
+
+    #[test]
+    fn flat_decoration_releases_its_previous_raster_resources() {
+        use super::*;
+        let mut gpu = GpuRenderer::new(16, 16).unwrap();
+        let mut scene = Scene::new(16., 16.);
+        let mut style = zgui::scene::QuadStyle {
+            fill: Color(20, 40, 60, 255),
+            border_color: Color(200, 100, 50, 255),
+            border_width: 2.,
+            decoration: Some(Arc::new(zgui::decoration::Decoration::default())),
+            ..Default::default()
+        };
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Quad(style.clone()),
+            zgui::scene::Style {
+                width: Some(16.),
+                height: Some(16.),
+                ..Default::default()
+            },
+        );
+        let damage = scene.flush().damage;
+        gpu.render(&scene, &damage).unwrap();
+        assert_eq!(gpu.image_textures.len(), 1);
+        assert!(gpu.canvases.bytes() > 0);
+        let old = gpu.node_images[&node];
+        gpu.images.remove(&old);
+        gpu.image_textures.remove(&old);
+        gpu.render(&scene, &damage).unwrap();
+        assert!(gpu.image_textures.contains_key(&gpu.node_images[&node]));
+        style.border_width = 0.;
+        scene.set_kind(node, NodeKind::Quad(style));
+        let damage = scene.flush().damage;
+        gpu.render(&scene, &damage).unwrap();
+        assert!(gpu.images.is_empty());
+        assert!(gpu.image_textures.is_empty());
+        assert_eq!(gpu.canvases.bytes(), 0);
+    }
+
     #[test]
     fn nv12_compute_shader_validates_on_the_available_gpu_backend() {
         let gpu = super::GpuRenderer::new(4, 4).unwrap();

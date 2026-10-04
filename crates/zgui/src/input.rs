@@ -988,21 +988,16 @@ impl InputDispatcher {
                 })
                 .collect()
         };
+        let cleanup = matches!(&ctx.event, InputEvent::Drag(event) if matches!(event.phase, DragPhase::End | DragPhase::Leave))
+            || matches!(
+                ctx.event,
+                InputEvent::Blur
+                    | InputEvent::Focus
+                    | InputEvent::PointerCancel
+                    | InputEvent::FocusScopeClosed
+            );
         for (id, phase, callbacks) in routes {
             if !scene.borrow().contains(id) {
-                continue;
-            }
-            let disabled = self.options(id).is_some_and(|o| o.disabled);
-            if disabled
-                && !matches!(&ctx.event, InputEvent::Drag(event) if matches!(event.phase, DragPhase::End | DragPhase::Leave))
-                && !matches!(
-                    ctx.event,
-                    InputEvent::Blur
-                        | InputEvent::Focus
-                        | InputEvent::PointerCancel
-                        | InputEvent::FocusScopeClosed
-                )
-            {
                 continue;
             }
             ctx.current_target = id;
@@ -1016,6 +1011,11 @@ impl InputDispatcher {
                     .is_some_and(|entries| entries.iter().any(|entry| entry.token == token));
                 if !attached || !scene.borrow().contains(id) {
                     continue;
+                }
+                // Earlier handlers can disable an ancestor or open another modal.
+                // Recheck ownership before delivering the rest of this event.
+                if !cleanup && !self.enabled(&scene.borrow(), id) {
+                    break;
                 }
                 // Reentrant delivery to the same callback is skipped, never panics.
                 if let Ok(mut callback) = callback.try_borrow_mut() {
@@ -1775,6 +1775,44 @@ mod tests {
         d.dispatch(&scene, down(10.0, 10.0));
         assert_eq!(d.focused(), None);
         d.dispatch(&scene, up(10.0, 10.0));
+    }
+    #[test]
+    fn disabling_an_ancestor_during_delivery_skips_remaining_activation_handlers() {
+        for disable_in_capture in [true, false] {
+            let (scene, target, _) = setup();
+            let input = InputDispatcher::new();
+            let root = scene.borrow().root();
+            let dispatcher = input.clone();
+            let callback_scene = scene.clone();
+            let _capture = input.listen(root, move |cx| {
+                if disable_in_capture
+                    && cx.phase == EventPhase::Capture
+                    && cx.event == InputEvent::Activate
+                {
+                    dispatcher.set_disabled(&callback_scene, root, true);
+                }
+            });
+            let dispatcher = input.clone();
+            let callback_scene = scene.clone();
+            let _first = input.listen(target, move |cx| {
+                if !disable_in_capture && cx.event == InputEvent::Activate {
+                    dispatcher.set_disabled(&callback_scene, root, true);
+                }
+            });
+            let activations = Rc::new(std::cell::Cell::new(0));
+            let cancellations = Rc::new(std::cell::Cell::new(0));
+            let activate = activations.clone();
+            let cancel = cancellations.clone();
+            let _last = input.listen(target, move |cx| match cx.event {
+                InputEvent::Activate => activate.set(activate.get() + 1),
+                InputEvent::PointerCancel => cancel.set(cancel.get() + 1),
+                _ => {}
+            });
+            input.dispatch_to(&scene, target, InputEvent::Activate);
+            assert_eq!(activations.get(), 0, "capture={disable_in_capture}");
+            input.route(&scene, target, InputEvent::PointerCancel);
+            assert_eq!(cancellations.get(), 1);
+        }
     }
     #[test]
     fn capture_target_bubble_and_raii() {

@@ -7,6 +7,9 @@ pub(crate) struct GpuStatsLog {
     since: Instant,
     frames: u32,
     sum: GpuStats,
+    gpu_frames: u64,
+    gpu_ms: f64,
+    gpu_stages: std::collections::BTreeMap<&'static str, f64>,
 }
 impl GpuStatsLog {
     pub(crate) fn from_env() -> Option<Self> {
@@ -14,9 +17,19 @@ impl GpuStatsLog {
             since: Instant::now(),
             frames: 0,
             sum: GpuStats::default(),
+            gpu_frames: 0,
+            gpu_ms: 0.,
+            gpu_stages: Default::default(),
         })
     }
     pub(crate) fn record(&mut self, frame: GpuStats, renderer: &GpuRenderer) {
+        for profile in renderer.take_gpu_profiles() {
+            self.gpu_frames += 1;
+            self.gpu_ms += profile.duration_ms;
+            for span in profile.spans {
+                *self.gpu_stages.entry(span.label).or_default() += span.duration_ms;
+            }
+        }
         let sum = &mut self.sum;
         self.frames += 1;
         sum.draw_calls += frame.draw_calls;
@@ -30,6 +43,9 @@ impl GpuStatsLog {
         sum.layer_repaints += frame.layer_repaints;
         sum.layer_cache_hits += frame.layer_cache_hits;
         sum.layer_texture_allocations += frame.layer_texture_allocations;
+        sum.scroll_copies += frame.scroll_copies;
+        sum.copied_pixels += frame.copied_pixels;
+        sum.scroll_phase_hits += frame.scroll_phase_hits;
         if self.since.elapsed() < Duration::from_secs(1) {
             return;
         }
@@ -37,13 +53,36 @@ impl GpuStatsLog {
         // Prepared text: shaped lines, then compact measurements.
         let prepared = renderer.text_cache().borrow().bytes();
         let mb = |bytes: usize| bytes as f64 / (1024. * 1024.);
+        if self.gpu_frames > 0 {
+            let per_frame = self
+                .gpu_stages
+                .iter()
+                .map(|(label, ms)| format!("{label}={:.3}ms", ms / self.gpu_frames as f64))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "GPU_TIME frames={} total={:.3}ms {} dropped={}",
+                self.gpu_frames,
+                self.gpu_ms / self.gpu_frames as f64,
+                per_frame,
+                renderer.dropped_gpu_profiles()
+            );
+        }
         eprintln!(
-            "GPU_STATS frames={} draws={} passes={} blur_passes={} instances={} \
+            "GPU_SCROLL copied_mpx={:.1} phase_hits={} phase_cache_mb={:.1}",
+            sum.copied_pixels as f64 / 1e6,
+            sum.scroll_phase_hits,
+            mb(caches.scroll_cache_bytes)
+        );
+        eprintln!(
+            "GPU_STATS frames={} render_hz={:.1} scroll_copies={} draws={} passes={} blur_passes={} instances={} \
              damaged_mpx={:.1} geometry={} glyphs={} vbuf_allocs={} layer_repaints={} \
              layer_hits={} layer_allocs={} | layers={} ({:.1} MB) atlas={:.1} MB \
              images={:.1} MB vertices={:.1} MB shaped={:.1} MB prepared={:.1}+{:.1} MB \
              device={}",
             self.frames,
+            self.frames as f64 / self.since.elapsed().as_secs_f64(),
+            sum.scroll_copies,
             sum.draw_calls,
             sum.render_passes,
             sum.blur_passes,
@@ -74,6 +113,9 @@ impl GpuStatsLog {
             since: Instant::now(),
             frames: 0,
             sum: GpuStats::default(),
+            gpu_frames: 0,
+            gpu_ms: 0.,
+            gpu_stages: Default::default(),
         };
     }
 }

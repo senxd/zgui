@@ -88,8 +88,7 @@ impl Key {
         for (range, font, size) in &self.spans {
             range.hash(&mut hasher);
             size.to_bits().hash(&mut hasher);
-            font.weight.hash(&mut hasher);
-            font.italic.hash(&mut hasher);
+            font.hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -167,12 +166,13 @@ impl Compact {
         Some(compact)
     }
     fn bytes(&self) -> usize {
-        self.words.len() * size_of::<Word>()
-            + self.glyphs.len() * size_of::<f32>()
+        self.words.capacity() * size_of::<Word>()
+            + self.glyphs.capacity() * size_of::<f32>()
+            + self.lines.capacity() * size_of::<(Vec<Range<u32>>, Option<f32>)>()
             + self
                 .lines
                 .iter()
-                .map(|(spans, _)| 40 + spans.len() * 8)
+                .map(|(spans, _)| spans.capacity() * size_of::<Range<u32>>())
                 .sum::<usize>()
     }
     fn advances(&self, word: usize) -> &[f32] {
@@ -306,7 +306,17 @@ impl Entry {
             .map_or(0, |_| self.key.text.len() * SHAPED_BYTES_PER_CHAR + 512)
     }
     fn compact_bytes(&self) -> usize {
-        256 + self.key.spans.len() * 32 + self.compact.as_ref().map_or(0, Compact::bytes)
+        std::mem::size_of::<Self>()
+            + self.key.text.len()
+            + self.key.spans.capacity() * std::mem::size_of::<(Range<usize>, FontStyle, f32)>()
+            + self
+                .key
+                .spans
+                .iter()
+                .map(|(_, font, _)| font.storage_bytes())
+                .sum::<usize>()
+            + self.sizes.capacity() * std::mem::size_of::<(Option<f32>, (f32, f32))>()
+            + self.compact.as_ref().map_or(0, Compact::bytes)
     }
     fn lay_out(&mut self, fonts: &mut FontSystem, width: Option<f32>) {
         if self.laid == Some(width) {
@@ -776,6 +786,72 @@ mod tests {
     use super::*;
     use crate::text::ShapedText;
     use zgui::{rich_text::TextRun, text_layout::LineHeight};
+
+    #[test]
+    fn alternating_font_styles_keep_distinct_prepared_entries() {
+        use zgui::text_layout::{FontFamily, LetterSpacing};
+        let mut fonts = FontSystem::new();
+        let text: Arc<str> = "Same label, different typography".into();
+        let styles = [
+            FontStyle::default(),
+            FontStyle {
+                family: FontFamily::Monospace,
+                ..Default::default()
+            },
+            FontStyle {
+                letter_spacing: LetterSpacing::px(2.),
+                ..Default::default()
+            },
+            FontStyle {
+                line_height: LineHeight::px(30.),
+                ..Default::default()
+            },
+        ];
+        let mut cache = TextCache::default();
+        for style in &styles {
+            cache.measure_plain(&mut fonts, &text, 14., style, Some(180.));
+        }
+        assert_eq!(cache.shaped, styles.len() as u64);
+        for style in &styles {
+            assert_eq!(
+                cache.measure_plain(&mut fonts, &text, 14., style, Some(180.)),
+                ShapedText::with_font(&mut fonts, text.clone(), 14., Some(180.), style).size()
+            );
+        }
+        assert_eq!(
+            cache.shaped,
+            styles.len() as u64,
+            "interleaved styles must hit their own entries"
+        );
+    }
+
+    #[test]
+    fn compact_budget_counts_retained_text_and_font_key_payloads() {
+        let payload: Arc<str> = "x".repeat(1024).into();
+        let font = FontStyle {
+            family: zgui::text_layout::FontFamily::Named(payload.clone()),
+            ..Default::default()
+        };
+        let entry = Entry {
+            key: Key {
+                text: payload,
+                spans: vec![(0..1024, font, 14.)],
+                caret_row: false,
+            },
+            lines: None,
+            compact: None,
+            metrics: Metrics::new(14., 20.),
+            laid: None,
+            sizes: Vec::new(),
+            used: 0,
+        };
+        assert!(
+            entry.compact_bytes()
+                >= std::mem::size_of::<Entry>()
+                    + 2048
+                    + std::mem::size_of::<(Range<usize>, FontStyle, f32)>()
+        );
+    }
 
     fn rich(text: &str, runs: &[(usize, FontStyle, f32)]) -> RichText {
         let mut start = 0;

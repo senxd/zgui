@@ -342,7 +342,15 @@ impl Demo {
             gpu.render(&scene, damage).expect("GPU render");
             gpu.present().expect("GPU present");
         } else {
-            let raster = self.raster.get_or_insert_with(|| Raster::new(960, 720));
+            let bounds = scene.bounds(scene.root());
+            let logical_size = (
+                bounds.width.ceil().max(1.) as usize,
+                bounds.height.ceil().max(1.) as usize,
+            );
+            let raster = self
+                .raster
+                .get_or_insert_with(|| Raster::new(logical_size.0, logical_size.1));
+            raster.resize(logical_size.0, logical_size.1);
             raster.render(&scene, damage);
             if let Some(surface) = self.surface.as_mut() {
                 let mut buffer = surface.buffer_mut().expect("window buffer");
@@ -359,24 +367,20 @@ impl Demo {
                         )
                     })
                     .collect();
-                let pixels = if self.physical_size == (960, 720) && self.scale_factor == 1.0 {
+                let pixels = if (width as usize, height as usize) == logical_size
+                    && self.scale_factor == 1.0
+                {
                     &raster.pixels
                 } else {
                     // The explicit reference backend keeps its logical raster and
                     // scales into the native physical surface on HiDPI monitors.
-                    self.software_pixels
-                        .resize(width as usize * height as usize, 0x10141c);
-                    for y in 0..height as usize {
-                        for x in 0..width as usize {
-                            let lx = (x as f32 / self.scale_factor) as usize;
-                            let ly = (y as f32 / self.scale_factor) as usize;
-                            self.software_pixels[y * width as usize + x] = if lx < 960 && ly < 720 {
-                                raster.pixels[ly * 960 + lx]
-                            } else {
-                                0x10141c
-                            };
-                        }
-                    }
+                    scale_software_pixels(
+                        &raster.pixels,
+                        logical_size,
+                        &mut self.software_pixels,
+                        (width, height),
+                        self.scale_factor,
+                    );
                     &self.software_pixels
                 };
                 let damage = self.presentation.copy(
@@ -458,6 +462,29 @@ impl Demo {
         );
     }
 }
+
+fn scale_software_pixels(
+    source: &[u32],
+    logical: (usize, usize),
+    target: &mut Vec<u32>,
+    physical: (u32, u32),
+    scale: f32,
+) {
+    let (width, height) = (physical.0 as usize, physical.1 as usize);
+    target.resize(width * height, 0x10141c);
+    for y in 0..height {
+        let ly = (y as f32 / scale) as usize;
+        for x in 0..width {
+            let lx = (x as f32 / scale) as usize;
+            target[y * width + x] = if lx < logical.0 && ly < logical.1 {
+                source[ly * logical.0 + lx]
+            } else {
+                0x10141c
+            };
+        }
+    }
+}
+
 impl ApplicationHandler for Demo {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -622,5 +649,26 @@ fn main() {
             .expect("event loop")
             .run_app(&mut app)
             .expect("run");
+    }
+}
+
+#[cfg(test)]
+mod software_resize_tests {
+    use super::*;
+
+    #[test]
+    fn resized_hidpi_reference_uses_actual_logical_stride_and_extent() {
+        let mut target = Vec::new();
+        scale_software_pixels(&[1, 2, 3, 4, 5, 6], (3, 2), &mut target, (6, 4), 2.);
+        assert_eq!(
+            target,
+            vec![
+                1, 1, 2, 2, 3, 3, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 4, 4, 5, 5, 6, 6
+            ]
+        );
+        // Widths above the original fixture size must render through the right edge.
+        let source: Vec<_> = (0..1280 * 2).collect();
+        scale_software_pixels(&source, (1280, 2), &mut target, (1280, 2), 1.);
+        assert_eq!(target, source);
     }
 }

@@ -6,6 +6,7 @@ use zgui_gpu::PresentationStatus;
 pub(crate) struct Presentation {
     pending: bool,
     occluded: bool,
+    drawable: bool,
     timeouts: u8,
     retry_at: Option<Instant>,
 }
@@ -26,11 +27,17 @@ impl Presentation {
             && minimized != Some(true)
             && !native_occluded
             && !self.occluded;
+        self.drawable = allowed;
         if !allowed {
             self.retry_at = None;
             self.timeouts = 0;
         }
         allowed
+    }
+
+    /// Last native visibility/size check, shared by drawing and frame scheduling.
+    pub fn drawable(&self) -> bool {
+        self.drawable
     }
 
     pub fn damaged(&mut self) {
@@ -46,6 +53,7 @@ impl Presentation {
     }
     pub fn occlude(&mut self) {
         self.occluded = true;
+        self.drawable = false;
         self.retry_at = None;
     }
     pub fn ready(&self, now: Instant) -> bool {
@@ -155,8 +163,10 @@ mod visibility_tests {
             p.completed(PresentationStatus::Timeout, now);
             assert!(p.deadline().is_some());
             assert!(!p.render_allowed(size, visible, minimized, occluded));
+            assert!(!p.drawable());
             assert_eq!(p.deadline(), None);
             assert!(p.render_allowed((100, 100), None, None, false));
+            assert!(p.drawable());
             assert!(p.ready(now));
         }
     }

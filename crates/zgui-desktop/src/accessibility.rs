@@ -7,6 +7,8 @@ use zgui::{
     semantics::{Role, ScrollAxis, SemanticRevision, Semantics},
 };
 
+type TraversalKey = ((u64, u64, u64, u64), (u64, u64));
+
 #[derive(Default)]
 pub struct AccessibilityTree {
     ids: HashMap<NodeId, AccessibleId>,
@@ -15,6 +17,10 @@ pub struct AccessibilityTree {
     projection_revisions: HashMap<NodeId, SemanticRevision>,
     text_runs: HashMap<NodeId, Vec<AccessibleId>>,
     text_positions: HashMap<AccessibleId, (NodeId, Vec<usize>)>,
+    traversal_key: Option<TraversalKey>,
+    traversal: Vec<(NodeId, bool)>,
+    projected_children: HashMap<NodeId, Vec<AccessibleId>>,
+    traversal_rebuilds: u64,
 }
 impl AccessibilityTree {
     pub fn new() -> Self {
@@ -24,6 +30,7 @@ impl AccessibilityTree {
     pub fn reset(&mut self) {
         self.cache.clear();
         self.projection_revisions.clear();
+        self.traversal_key = None;
     }
     fn id(&mut self, node: NodeId) -> AccessibleId {
         *self.ids.entry(node).or_insert_with(|| {
@@ -62,73 +69,99 @@ impl AccessibilityTree {
         scale: f64,
     ) -> TreeUpdate {
         let root = self.id(scene.root());
-        let mut children: HashMap<NodeId, Vec<AccessibleId>> = HashMap::new();
-        // Scene order, not hash-map iteration order, determines accessible traversal.
-        // Paint order already provides world bounds and visits parents first.
-        // Carry semantic ancestry once instead of walking it again for every
-        // descendant on every scrolling frame.
-        let mut ancestry = HashMap::new();
-        let mut parents = HashMap::new();
-        let mut ordered = Vec::new();
-        for item in scene.paint_items().filter(|p| p.effects.opacity > 0.0) {
-            let (parent, blocked) = scene
-                .parent(item.id)
-                .and_then(|parent| ancestry.get(&parent).copied())
-                .unwrap_or((scene.root(), false));
-            let semantic = semantics.get(item.id);
-            let disabled = blocked || semantic.is_some_and(|s| s.disabled);
-            ancestry.insert(
-                item.id,
-                (if semantic.is_some() { item.id } else { parent }, disabled),
-            );
-            if let Some(semantic) = semantic {
-                ordered.push((item.id, semantic, item.bounds, disabled));
-                parents.insert(item.id, parent);
-            }
-        }
-        let visible: HashSet<_> = ordered
-            .iter()
-            .map(|(id, ..)| *id)
-            .chain(std::iter::once(scene.root()))
-            .collect();
-        self.ids.retain(|id, _| visible.contains(id));
-        self.projection_revisions
-            .retain(|id, _| visible.contains(id));
-        // Apply logical ownership without changing physical clipping or bounds.
-        // Each accepted edge keeps the graph acyclic; invalid overrides retain
-        // their physical parent and never introduce duplicate native children.
-        for (id, semantic, ..) in &ordered {
-            if *id == scene.root() {
-                continue;
-            }
-            let Some(parent) = semantic.logical_parent.filter(|p| visible.contains(p)) else {
-                continue;
-            };
-            let mut ancestor = parent;
-            let valid = loop {
-                if ancestor == *id {
-                    break false;
+        let key = (scene.projection_revision(), semantics.topology_revision());
+        // Scroll translations change bounds, not ownership or traversal.
+        // Cache that graph until membership/layout/visibility/disabled ancestry
+        // changes. Values and focus still update below on every call.
+        if self.traversal_key != Some(key) {
+            let mut children: HashMap<NodeId, Vec<AccessibleId>> = HashMap::new();
+            // Scene order, not hash-map iteration order, determines accessible traversal.
+            // Paint order already provides world bounds and visits parents first.
+            // Carry semantic ancestry once instead of walking it again for every
+            // descendant on every scrolling frame.
+            let mut ancestry = HashMap::new();
+            let mut parents = HashMap::new();
+            let mut ordered = Vec::new();
+            for item in scene.paint_items().filter(|p| p.effects.opacity > 0.0) {
+                let (parent, blocked) = scene
+                    .parent(item.id)
+                    .and_then(|parent| ancestry.get(&parent).copied())
+                    .unwrap_or((scene.root(), false));
+                let semantic = semantics.get(item.id);
+                let disabled = blocked || semantic.is_some_and(|s| s.disabled);
+                ancestry.insert(
+                    item.id,
+                    (if semantic.is_some() { item.id } else { parent }, disabled),
+                );
+                if let Some(semantic) = semantic {
+                    ordered.push((item.id, semantic, item.bounds, disabled));
+                    parents.insert(item.id, parent);
                 }
-                if ancestor == scene.root() {
-                    break true;
+            }
+            let visible: HashSet<_> = ordered
+                .iter()
+                .map(|(id, ..)| *id)
+                .chain(std::iter::once(scene.root()))
+                .collect();
+            self.ids.retain(|id, _| visible.contains(id));
+            self.projection_revisions
+                .retain(|id, _| visible.contains(id));
+            // Apply logical ownership without changing physical clipping or bounds.
+            // Each accepted edge keeps the graph acyclic; invalid overrides retain
+            // their physical parent and never introduce duplicate native children.
+            for (id, semantic, ..) in &ordered {
+                if *id == scene.root() {
+                    continue;
                 }
-                let Some(next) = parents.get(&ancestor) else {
-                    break false;
+                let Some(parent) = semantic.logical_parent.filter(|p| visible.contains(p)) else {
+                    continue;
                 };
-                ancestor = *next;
-            };
-            if valid {
-                parents.insert(*id, parent);
+                let mut ancestor = parent;
+                let valid = loop {
+                    if ancestor == *id {
+                        break false;
+                    }
+                    if ancestor == scene.root() {
+                        break true;
+                    }
+                    let Some(next) = parents.get(&ancestor) else {
+                        break false;
+                    };
+                    ancestor = *next;
+                };
+                if valid {
+                    parents.insert(*id, parent);
+                }
             }
-        }
-        for (id, ..) in &ordered {
-            if *id == scene.root() {
-                continue;
+            for (id, ..) in &ordered {
+                if *id == scene.root() {
+                    continue;
+                }
+                let child = self.id(*id);
+                children.entry(parents[id]).or_default().push(child);
             }
-            let child = self.id(*id);
-            children.entry(parents[id]).or_default().push(child);
+            self.text_runs.retain(|owner, _| visible.contains(owner));
+            self.traversal = ordered
+                .iter()
+                .map(|(id, _, _, disabled)| (*id, *disabled))
+                .collect();
+            self.projected_children = children;
+            self.traversal_key = Some(key);
+            self.traversal_rebuilds += 1;
         }
-        self.text_runs.retain(|owner, _| visible.contains(owner));
+        let ordered: Vec<_> = self
+            .traversal
+            .iter()
+            .map(|(id, disabled)| {
+                (
+                    *id,
+                    semantics.get(*id).expect("cached semantic node"),
+                    scene.bounds(*id),
+                    *disabled,
+                )
+            })
+            .collect();
+        let mut children = self.projected_children.clone();
         let mut nodes = Vec::with_capacity(ordered.len() + 1);
         let mut window = Node::new(accesskit::Role::Window);
         window.set_label(title);
@@ -913,6 +946,122 @@ mod editor_text_tests {
 mod projection_key_tests {
     use super::*;
     use zgui::scene::{Color, Effects, Layout, NodeKind, Style, Transform};
+
+    #[test]
+    fn animated_images_reuse_ownership_but_roles_and_child_order_stay_current() {
+        let mut scene = Scene::new(200., 120.);
+        let mut shader = zgui::image::ShaderInstance::new("test shader");
+        let image = |shader: &mut zgui::image::ShaderInstance, phase| {
+            shader
+                .render(16, 16, &[phase], [1, 1], || vec![255; 16 * 16 * 4].into())
+                .unwrap()
+        };
+        let animated = scene.append(
+            scene.root(),
+            NodeKind::Image(image(&mut shader, 0.)),
+            fixed(16., 16.),
+        );
+        let label = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(1, 2, 3, 255)),
+            fixed(100., 20.),
+        );
+        let mut semantics = Semantics::new();
+        semantics.set(
+            animated,
+            zgui::semantics::SemanticNode::new(Role::Image, "animated"),
+        );
+        semantics.set(
+            label,
+            zgui::semantics::SemanticNode::new(Role::Label, "label"),
+        );
+        scene.flush();
+        let mut tree = AccessibilityTree::new();
+        tree.update(&scene, &semantics, None, "test", 1.);
+        let revision = scene.projection_revision();
+        let rebuilds = tree.traversal_rebuilds;
+        for phase in 1..5 {
+            let resource_revision = scene.content_revision();
+            scene.set_kind(animated, NodeKind::Image(image(&mut shader, phase as f32)));
+            scene.flush();
+            assert_ne!(scene.content_revision(), resource_revision);
+            assert_eq!(scene.projection_revision(), revision);
+            tree.update(&scene, &semantics, None, "test", 1.);
+            assert_eq!(tree.traversal_rebuilds, rebuilds);
+        }
+        // Roles change the projected node and text runs, not its ownership graph.
+        semantics.update(animated, |node| node.role = Role::Label);
+        tree.update(&scene, &semantics, None, "test", 1.);
+        assert_eq!(
+            tree.cache[&tree.ids[&animated]].role(),
+            accesskit::Role::Label
+        );
+        assert!(!tree.text_runs[&animated].is_empty());
+        assert_eq!(tree.traversal_rebuilds, rebuilds);
+
+        assert!(scene.reorder_children(scene.root(), &[label, animated]));
+        tree.update(&scene, &semantics, None, "test", 1.);
+        assert_eq!(tree.traversal_rebuilds, rebuilds + 1);
+        assert_eq!(
+            tree.cache[&tree.ids[&scene.root()]].children(),
+            &[tree.ids[&label], tree.ids[&animated]]
+        );
+        // Membership is invalidated immediately, even before the layout flush.
+        scene.remove(label);
+        tree.update(&scene, &semantics, None, "test", 1.);
+        assert_eq!(tree.traversal_rebuilds, rebuilds + 2);
+        assert!(!tree.ids.contains_key(&label));
+    }
+
+    #[test]
+    fn rigid_scroll_reuses_ownership_but_values_visibility_and_disabled_ancestry_update() {
+        let mut scene = Scene::new(200., 120.);
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Column),
+            fixed(200., 400.),
+        );
+        let child = scene.append(
+            parent,
+            NodeKind::Rect(Color(1, 2, 3, 255)),
+            fixed(100., 20.),
+        );
+        let mut semantics = Semantics::new();
+        semantics.set(
+            parent,
+            zgui::semantics::SemanticNode::new(Role::Group, "group"),
+        );
+        semantics.set(
+            child,
+            zgui::semantics::SemanticNode::new(Role::Label, "value"),
+        );
+        scene.prepare_layout();
+        let mut tree = AccessibilityTree::new();
+        tree.update(&scene, &semantics, None, "test", 1.);
+        let rebuilds = tree.traversal_rebuilds;
+        scene.set_transform(parent, Transform { x: 0., y: -20. });
+        scene.flush();
+        semantics.update(child, |node| node.label = "changed".into());
+        let update = tree.update(&scene, &semantics, Some(child), "test", 1.5);
+        assert_eq!(tree.traversal_rebuilds, rebuilds);
+        assert_eq!(update.focus, tree.ids[&child]);
+        let native = &tree.cache[&tree.ids[&child]];
+        assert_eq!(native.value(), Some("changed"));
+        assert_eq!(native.bounds().unwrap().y0, -30.);
+        semantics.update(parent, |node| node.disabled = true);
+        tree.update(&scene, &semantics, None, "test", 1.);
+        assert!(tree.cache[&tree.ids[&child]].is_disabled());
+        assert_eq!(tree.traversal_rebuilds, rebuilds + 1);
+        scene.set_effects(
+            parent,
+            Effects {
+                opacity: 0.,
+                ..Default::default()
+            },
+        );
+        tree.update(&scene, &semantics, None, "test", 1.);
+        assert!(!tree.ids.contains_key(&child));
+    }
 
     fn fixed(width: f32, height: f32) -> Style {
         Style {

@@ -1,5 +1,10 @@
 # Reproducible GUI comparison
 
+For reusable CPU/GPU stage measurements, standard rendering workloads, traces,
+repeatable JSONL evidence and CI regression gates, see [Rendering performance
+tools](render-profiling.md). The historical cross-framework comparison below
+uses a separate workload and measurement protocol.
+
 The three adapters use the same `comparisons/workload` Rust crate. GPUI is pinned to crates.io **0.2.2**; QuickGUI is pinned to upstream commit **811d6e2816d5229711f59683c4c9dfbb6fc74133**. Their standalone Cargo workspaces isolate large platform dependency graphs from zgui core. Commit the generated Cargo.lock files to preserve transitive versions.
 
 The target UI is a 960×720 logical-pixel dark window. Header: “zgui performance lab”. Three controls append three items, perform two equal writes to the first item, and set done to 999. Count/title/duplicate count match the provided service example. The list initially has capacity four and count zero; append preserves successful earlier writes if the fourth-slot limit is reached, reporting done=-1; the virtual dataset is independently 100,000 synthetic rows. Streaming pane: (20,110), 920×160. List: (20,290), 920×400. Rows: 28px. Font: DejaVu Sans, 14px; header 20px. OS window decorations are outside the content coordinates.

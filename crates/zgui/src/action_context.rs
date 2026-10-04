@@ -1,5 +1,8 @@
 //! Bounded keyboard-context predicate parser. Context stack is root to focus.
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyContext {
     pub(crate) entries: BTreeMap<String, Option<String>>,
@@ -41,6 +44,9 @@ impl fmt::Display for ContextParseError {
     }
 }
 impl std::error::Error for ContextParseError {}
+// Descendant and negated predicates can revisit the same combinations many times.
+// Keep this local to one match, including the slice scope used by negation.
+type MatchCache = HashMap<(*const ContextPredicate, *const KeyContext, usize, usize), bool>;
 impl ContextPredicate {
     /// Parse identifiers, ==, !=, !, &&, ||, > and parentheses. Input is limited
     /// to 4096 bytes and 64 nested expressions to keep configuration work bounded.
@@ -57,15 +63,26 @@ impl ContextPredicate {
         Ok(result)
     }
     pub fn matches(&self, stack: &[KeyContext]) -> bool {
+        let mut cache = MatchCache::new();
         (0..stack.len())
             .rev()
-            .any(|index| self.at(stack, index, stack))
+            .any(|index| self.at(stack, index, &mut cache))
     }
-    fn at(&self, stack: &[KeyContext], index: usize, all: &[KeyContext]) -> bool {
+    fn at(&self, stack: &[KeyContext], index: usize, cache: &mut MatchCache) -> bool {
         let Some(context) = stack.get(index) else {
             return false;
         };
-        match self {
+        let key = match self {
+            Self::Not(_) => Some((self as *const Self, stack.as_ptr(), stack.len(), usize::MAX)),
+            Self::Descendant(_, _) => {
+                Some((self as *const Self, stack.as_ptr(), stack.len(), index))
+            }
+            _ => None,
+        };
+        if let Some(result) = key.and_then(|key| cache.get(&key)) {
+            return *result;
+        }
+        let result = match self {
             Self::Flag(name) => context.entries.contains_key(name),
             Self::Equal(name, value) => {
                 context.entries.get(name).and_then(Option::as_ref) == Some(value)
@@ -73,18 +90,18 @@ impl ContextPredicate {
             Self::NotEqual(name, value) => {
                 context.entries.get(name).and_then(Option::as_ref) != Some(value)
             }
-            Self::Not(predicate) => !(0..all.len()).any(|i| predicate.at(all, i, all)),
-            Self::And(a, b) => a.at(stack, index, all) && b.at(stack, index, all),
-            Self::Or(a, b) => a.at(stack, index, all) || b.at(stack, index, all),
+            Self::Not(predicate) => !(0..stack.len()).any(|i| predicate.at(stack, i, cache)),
+            Self::And(a, b) => a.at(stack, index, cache) && b.at(stack, index, cache),
+            Self::Or(a, b) => a.at(stack, index, cache) || b.at(stack, index, cache),
             Self::Descendant(parent, child) => (0..index).any(|ancestor| {
-                parent.at(stack, ancestor, all)
-                    && child.at(
-                        &stack[ancestor + 1..=index],
-                        index - ancestor - 1,
-                        &stack[ancestor + 1..=index],
-                    )
+                parent.at(stack, ancestor, cache)
+                    && child.at(&stack[ancestor + 1..=index], index - ancestor - 1, cache)
             }),
+        };
+        if let Some(key) = key {
+            cache.insert(key, result);
         }
+        result
     }
 }
 struct Parser<'a> {
@@ -226,5 +243,39 @@ mod tests {
         }
         assert!(ContextPredicate::parse(&"!".repeat(65)).is_err());
         assert!(ContextPredicate::parse(&"a".repeat(4097)).is_err());
+    }
+    #[test]
+    fn long_descendant_chains_finish_and_negation_keeps_its_slice_scope() {
+        let source = std::iter::once("Missing")
+            .chain(std::iter::repeat_n("A", 31))
+            .collect::<Vec<_>>()
+            .join(" > ");
+        let predicate = ContextPredicate::parse(&source).unwrap();
+        let stack = vec![KeyContext::new().flag("A"); 64];
+        assert!(!predicate.matches(&stack));
+        for depth in [31, 32] {
+            let source = format!("{}Missing", "!".repeat(depth));
+            assert_eq!(
+                ContextPredicate::parse(&source).unwrap().matches(&stack),
+                depth % 2 != 0
+            );
+        }
+        let source = source.replacen("Missing", "A", 1);
+        assert!(ContextPredicate::parse(&source).unwrap().matches(&stack));
+        let scoped = [
+            KeyContext::new().flag("X"),
+            KeyContext::new().flag("A"),
+            KeyContext::new().flag("B"),
+        ];
+        assert!(
+            ContextPredicate::parse("A > (B && !X)")
+                .unwrap()
+                .matches(&scoped)
+        );
+        assert!(
+            !ContextPredicate::parse("A > (B && !B)")
+                .unwrap()
+                .matches(&scoped)
+        );
     }
 }

@@ -39,10 +39,12 @@ impl TextMeasure {
         }
     }
     pub(crate) fn install(&self, measure: Box<RichMeasurer>) {
-        self.0.borrow_mut().layout = Some(measure);
+        let previous = self.0.borrow_mut().layout.replace(measure);
+        drop(previous);
     }
     pub(crate) fn install_detached(&self, measure: Box<RichMeasurer>) {
-        self.0.borrow_mut().detached = Some(measure);
+        let previous = self.0.borrow_mut().detached.replace(measure);
+        drop(previous);
     }
 }
 
@@ -272,6 +274,43 @@ pub fn fallback_measure(rich: &RichText, width: Option<f32>) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replacing_measurers_drops_captures_outside_the_shared_borrow() {
+        use std::{
+            cell::{Cell, RefCell},
+            rc::{Rc, Weak},
+        };
+        struct Capture(Weak<RefCell<Measurers>>, Rc<Cell<f32>>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                if let Some(shared) = self.0.upgrade() {
+                    self.1.set(
+                        TextMeasure(shared)
+                            .measure(&RichText::new("", Vec::new()).unwrap(), None)
+                            .0,
+                    );
+                }
+            }
+        }
+        for detached in [false, true] {
+            let measure = TextMeasure::default();
+            let observed = Rc::new(Cell::new(0.));
+            let capture = Capture(Rc::downgrade(&measure.0), observed.clone());
+            let first: Box<RichMeasurer> = Box::new(move |_, _| {
+                let _ = &capture;
+                (1., 1.)
+            });
+            if detached {
+                measure.install_detached(first);
+                measure.install_detached(Box::new(|_, _| (2., 2.)));
+            } else {
+                measure.install(first);
+                measure.install(Box::new(|_, _| (2., 2.)));
+            }
+            assert_eq!(observed.get(), 2.);
+        }
+    }
+
     fn run(range: Range<usize>) -> TextRun {
         TextRun {
             range,

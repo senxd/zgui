@@ -18,6 +18,223 @@ fn fixed(w: f32, h: f32) -> Style {
     }
 }
 #[test]
+fn fractional_scroll_cache_matches_full_repaint_and_invalidates() {
+    let _gpu_fixture = gpu_fixture();
+    use zgui::{compose::prelude::*, widgets::Ui};
+    let mut gpu = GpuRenderer::new(192, 144).unwrap();
+    let mut reference = GpuRenderer::new_with_context(192, 144, &gpu.context()).unwrap();
+    gpu.set_scale_factor(1.5);
+    reference.set_scale_factor(1.5);
+    let mut ui = Ui::new(128., 96.);
+    gpu.install_text(&mut ui.scene.borrow_mut());
+    let y = ui.signal(0_f32);
+    let root = ui.mount(
+        overlay()
+            .w_full()
+            .h_full()
+            .bg(rgb(0x152030))
+            .child(scroll(y.clone()).w_full().h_full().child(
+                column().id("content").w_full().children((0..12).map(|i| {
+                    row().h(32.).bg(rgb(0x243546)).child(
+                        div()
+                            .id(if i == 0 { "changed" } else { "row" })
+                            .size(40., 20.)
+                            .rounded(6.)
+                            .bg(rgba(0xff8050b0)),
+                    )
+                })),
+            ))
+            .child(
+                div()
+                    .id("overlay")
+                    .absolute()
+                    .left(22.)
+                    .top(20.)
+                    .size(18., 14.)
+                    .bg(rgba(0x50e0b0a0)),
+            ),
+    );
+    let changed = root.find("changed").unwrap();
+    let overlay = root.find("overlay").unwrap();
+    let mut hits = 0;
+    for i in 0..30 {
+        // One physical half-pixel per frame, including odd integer cache shifts.
+        y.set(i as f32 / 3.);
+        if i == 12 {
+            ui.scene.borrow_mut().set_effects(
+                changed,
+                Effects {
+                    opacity: 0.4,
+                    ..Default::default()
+                },
+            );
+        }
+        if i == 18 {
+            ui.scene
+                .borrow_mut()
+                .set_transform(overlay, Transform { x: 7., y: 3. });
+        }
+        if i == 24 {
+            ui.scene
+                .borrow_mut()
+                .set_kind(changed, NodeKind::Rect(Color(40, 160, 200, 255)));
+        }
+        ui.prepare_frame();
+        let report = ui.scene.borrow_mut().flush();
+        let stats = gpu.render(&ui.scene.borrow(), &report.damage).unwrap();
+        hits += stats.scroll_phase_hits;
+        if i == 12 || i == 24 {
+            assert_eq!(
+                stats.scroll_phase_hits, 0,
+                "paint changes invalidate history"
+            );
+        }
+        reference
+            .render(&ui.scene.borrow(), &[Rect::new(0., 0., 128., 96.)])
+            .unwrap();
+        let (actual, expected) = (gpu.readback().unwrap(), reference.readback().unwrap());
+        let worst = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| a.abs_diff(b))
+            .max()
+            .unwrap();
+        assert!(worst <= 1, "frame {i}: fractional cache differs by {worst}");
+    }
+    if !cfg!(target_os = "macos") {
+        assert!(hits > 10, "cache must actually be exercised: {hits}");
+    }
+    assert!(gpu.debug_cache_stats().scroll_cache_bytes <= 64 * 1024 * 1024);
+    gpu.trim();
+    assert_eq!(gpu.debug_cache_stats().scroll_cache_bytes, 0);
+}
+
+#[test]
+fn gpu_timestamps_are_opt_in_and_match_encoded_work() {
+    let _gpu_fixture = gpu_fixture();
+    let mut gpu = GpuRenderer::new(80, 60).unwrap();
+    let mut scene = Scene::new(80., 60.);
+    scene.append(
+        scene.root(),
+        NodeKind::Rect(Color(40, 80, 120, 255)),
+        fixed(80., 60.),
+    );
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    gpu.wait_idle().unwrap();
+    assert!(gpu.take_gpu_profiles().is_empty());
+    if !gpu.set_gpu_profiling(true) {
+        return;
+    }
+    gpu.render(&scene, &[Rect::new(0., 0., 80., 60.)]).unwrap();
+    gpu.wait_idle().unwrap();
+    let profiles = gpu.take_gpu_profiles();
+    assert_eq!(profiles.len(), 1);
+    assert!(!profiles[0].spans.is_empty());
+    assert!(profiles[0].duration_ms.is_finite() && profiles[0].duration_ms >= 0.);
+    assert!(profiles[0].spans.iter().any(|s| s.label == "repaint"));
+    assert_eq!(gpu.dropped_gpu_profiles(), 0);
+    gpu.set_gpu_profiling(false);
+}
+
+#[test]
+fn large_opaque_interiors_preserve_fractional_edges_borders_and_masks() {
+    let _gpu_fixture = gpu_fixture();
+    use std::sync::Arc;
+    let mut gpu = GpuRenderer::new(480, 360).unwrap();
+    let mut reference = GpuRenderer::new_with_context(480, 360, &gpu.context()).unwrap();
+    gpu.debug_split_shading(true);
+    reference.debug_split_shading(true);
+    reference.debug_opaque_interiors(false);
+    let mut exercised = false;
+    for scale in [1., 1.5, 2., 4.] {
+        gpu.set_scale_factor(scale);
+        reference.set_scale_factor(scale);
+        let (w, h) = (480. / scale, 360. / scale);
+        let mut scene = Scene::new(w, h);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(180, 40, 110, 255)),
+            fixed(w, h),
+        );
+        let panel = scene.append(
+            scene.root(),
+            NodeKind::Quad(QuadStyle::default()),
+            fixed(w - 20. / scale, h - 20. / scale),
+        );
+        scene.set_transform(
+            panel,
+            Transform {
+                x: 7.125 / scale,
+                y: 6.375 / scale,
+            },
+        );
+        for variant in 0..7 {
+            scene.set_kind(
+                panel,
+                NodeKind::Quad(QuadStyle {
+                    fill: Color(40, 130, 210, if variant == 4 { 150 } else { 255 }),
+                    radius: if variant == 0 { 0. } else { 9. / scale },
+                    border_width: if variant == 1 || variant == 2 {
+                        5. / scale
+                    } else {
+                        0.
+                    },
+                    border_color: Color(250, 160, 30, if variant == 1 { 80 } else { 255 }),
+                    shadow: Some(BoxShadow {
+                        color: Color(0, 0, 0, 120),
+                        offset: Transform { x: 2., y: 3. },
+                        blur_radius: 3.,
+                        spread: 1.,
+                    }),
+                    decoration: (variant == 3).then(|| {
+                        Arc::new(zgui::decoration::Decoration {
+                            corners: Some(zgui::decoration::Corners {
+                                top_left: 3.,
+                                top_right: 11.,
+                                bottom_right: 7.,
+                                bottom_left: 17.,
+                            }),
+                            ..Default::default()
+                        })
+                    }),
+                }),
+            );
+            scene.set_effects(
+                panel,
+                Effects {
+                    opacity: if variant == 5 { 0.6 } else { 1. },
+                    ..Default::default()
+                },
+            );
+            scene.set_style(
+                scene.root(),
+                Style {
+                    width: Some(w),
+                    height: Some(h),
+                    clip: variant == 6,
+                    fade_edges: if variant == 6 { [12., 15.] } else { [0.; 2] },
+                    ..Default::default()
+                },
+            );
+            let report = scene.flush();
+            let stats = gpu.render(&scene, &report.damage).unwrap();
+            let plain = reference
+                .render(&scene, &[Rect::new(0., 0., w, h)])
+                .unwrap();
+            exercised |= stats.instances > plain.instances;
+            let (a, b) = (gpu.readback().unwrap(), reference.readback().unwrap());
+            let worst = a.iter().zip(&b).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            assert!(
+                worst <= 1,
+                "scale {scale}, variant {variant}: error {worst}"
+            );
+        }
+    }
+    assert!(exercised, "must exercise the decomposed geometry");
+}
+#[test]
 fn retained_damage_alpha_text_and_scale() {
     let _gpu_fixture = gpu_fixture();
     let mut gpu = GpuRenderer::new(128, 64).expect("a Vulkan/Metal adapter is required");
@@ -329,7 +546,14 @@ fn thousand_streaming_frames_keep_caches_bounded_and_reuse_vertices() {
         assert!(c.shaped_bytes <= 8 * 1024 * 1024);
         assert_eq!(c.swash_images, 0);
         assert_eq!(c.swash_outlines, 0);
-        assert!(c.vertex_buffer_bytes <= initial.max(8192));
+        // Warmup may reuse one or two buffers on an idle adapter, then need
+        // all four under load. This fixture's geometry fits one 4 KiB slot;
+        // assert the bounded ring, not a scheduling-dependent warmup peak.
+        assert!(
+            c.vertex_buffer_bytes <= initial.max(4 * 4096),
+            "vertex bytes: {}",
+            c.vertex_buffer_bytes
+        );
         assert!(c.atlas_entries < 5000);
     }
     gpu.readback().unwrap();
@@ -3104,9 +3328,27 @@ fn assert_blur_matches_fresh(
     let mut fresh = GpuRenderer::new_with_context(width, height, &gpu.context()).unwrap();
     fresh.set_scale_factor(scale);
     fresh.render(scene, &[scene.bounds(scene.root())]).unwrap();
+    let expected = fresh.readback().unwrap();
+    let changed: Vec<_> = partial
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .take(12)
+        .map(|(i, (a, b))| {
+            (
+                i % width as usize,
+                i / width as usize,
+                a.to_vec(),
+                b.to_vec(),
+            )
+        })
+        .collect();
     assert!(
-        partial == fresh.readback().unwrap(),
-        "bounded blur reconstruction differs from a fresh full frame"
+        partial == expected,
+        "bounded blur reconstruction differs: {changed:?}"
     );
 }
 
@@ -3186,7 +3428,7 @@ fn bounded_blur_damage_distant_and_backdrop_halo_updates() {
         "small blur halo should remain local: {stats:?}"
     );
     assert_blur_matches_fresh(&gpu, &scene, 240, 160, 1.);
-    assert_eq!(stats.blur_passes, 2);
+    assert_eq!(stats.blur_passes, 3);
     assert!(stats.render_passes > stats.blur_passes);
     let after = gpu.readback().unwrap();
     let sample = (53 * 240 + 37) * 4;
@@ -4013,7 +4255,7 @@ fn clean_blur_streaming_uses_one_pass_including_isolated_layer_accounting() {
         scene.set_transform(text, Transform { x: 130., y: 120. });
         let damage = scene.flush().damage;
         let initial = gpu.render(&scene, &damage).unwrap();
-        assert_eq!(initial.blur_passes, 2);
+        assert_eq!(initial.blur_passes, 3);
         assert!(initial.render_passes > initial.blur_passes);
         for n in 1..5 {
             scene.set_kind(text, text_kind(n));
@@ -4023,7 +4265,7 @@ fn clean_blur_streaming_uses_one_pass_including_isolated_layer_accounting() {
                 // Repainted isolated layers currently redraw their whole target.
                 assert_eq!(stats.layer_repaints, 1);
                 assert_eq!(
-                    stats.blur_passes, 2,
+                    stats.blur_passes, 1,
                     "nested passes reach caller statistics"
                 );
                 assert!(stats.render_passes > stats.blur_passes + 1);
@@ -4367,10 +4609,10 @@ fn damaged_blur_batches_surrounding_draws_instead_of_one_pass_each() {
         );
         let d = s.flush().damage;
         let stats = gpu.render(&s, &d).unwrap();
-        assert_eq!(stats.blur_passes, 2);
-        // Clear+draws, the horizontal blur, then the vertical blur and the rest.
+        assert_eq!(stats.blur_passes, 3);
+        // Scene, two cached filter passes, then the composite and foreground.
         assert!(
-            stats.render_passes <= 3,
+            stats.render_passes <= 4,
             "{} render passes for one filter",
             stats.render_passes
         );
@@ -4639,8 +4881,9 @@ fn scroll_copies_match_a_fresh_render_and_decline_when_inexact() {
         Plain,
         Faded,
         Covered,
+        Isolated,
     }
-    for case in [Case::Plain, Case::Faded, Case::Covered] {
+    for case in [Case::Plain, Case::Faded, Case::Covered, Case::Isolated] {
         let mut gpu = GpuRenderer::new(160, 120).unwrap();
         let mut ui = Ui::new(160., 120.);
         let offset = ui.signal(0_f32);
@@ -4650,9 +4893,10 @@ fn scroll_copies_match_a_fresh_render_and_decline_when_inexact() {
             2,
             || 1000,
             |i| i,
-            |_, key, _| {
+            move |_, key, _| {
                 div()
                     .size(144., 24.)
+                    .isolated(case == Case::Isolated)
                     .bg(if key % 2 == 0 {
                         rgb(0x223344)
                     } else {
@@ -4713,11 +4957,11 @@ fn scroll_copies_match_a_fresh_render_and_decline_when_inexact() {
         match case {
             // 0→14, 14→28 and 28→100 copy. 100→101.5 and 101.5→150 shift by
             // fractions of a pixel; 150→40 jumps past the viewport.
-            Case::Plain => assert_eq!(copies, 3),
+            Case::Plain | Case::Isolated => assert_eq!(copies, 3),
             Case::Faded => assert_eq!(copies, 0),
-            // Only 28→100 copies: its 72 px exposed strip repaints the whole
-            // overlay, which the smaller moves would have shifted.
-            Case::Covered => assert_eq!(copies, 1),
+            // The stationary overlay and its shifted ghost are repaired,
+            // allowing the same three copies as an uncovered viewport.
+            Case::Covered => assert_eq!(copies, 3),
         }
     }
 }

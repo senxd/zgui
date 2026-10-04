@@ -50,6 +50,8 @@ impl Frame {
 pub struct FrameClock(Rc<Inner>);
 #[derive(Default)]
 struct Inner {
+    motions: RefCell<Vec<std::rc::Weak<crate::motion::Scheduler>>>,
+    effects: RefCell<Vec<std::rc::Weak<crate::effects::Scheduler>>>,
     waiters: RefCell<BTreeMap<u64, Waiter>>,
     next_id: Cell<u64>,
     last: Cell<Option<Frame>>,
@@ -60,11 +62,50 @@ struct Inner {
 }
 struct Waiter {
     max_rate: Option<f64>,
+    after_index: Option<u64>,
     waker: Option<Waker>,
     frame: Option<Frame>,
 }
 
 impl FrameClock {
+    pub(crate) fn effect_scheduler(
+        &self,
+        runtime: crate::reactive::Runtime,
+        runner: crate::compose::TaskRunner,
+    ) -> Rc<crate::effects::Scheduler> {
+        let existing = {
+            let mut effects = self.0.effects.borrow_mut();
+            effects.retain(|effect| effect.strong_count() > 0);
+            effects
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .find(|effect| effect.matches(&runtime))
+        };
+        if let Some(existing) = existing {
+            return existing;
+        }
+        let effect = crate::effects::Scheduler::new(runtime, self.clone(), Some(runner));
+        self.0.effects.borrow_mut().push(Rc::downgrade(&effect));
+        effect
+    }
+    pub(crate) fn motion_scheduler(
+        &self,
+        runtime: crate::reactive::Runtime,
+        runner: Option<crate::compose::TaskRunner>,
+    ) -> Rc<crate::motion::Scheduler> {
+        let mut motions = self.0.motions.borrow_mut();
+        motions.retain(|motion| motion.strong_count() > 0);
+        if let Some(motion) = motions
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .find(|motion| motion.matches(&runtime))
+        {
+            return motion;
+        }
+        let motion = crate::motion::Scheduler::new(runtime, self.clone(), runner);
+        motions.push(Rc::downgrade(&motion));
+        motion
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -74,6 +115,7 @@ impl FrameClock {
         NextFrame {
             clock: self.clone(),
             max_rate: None,
+            after_index: None,
             id: None,
         }
     }
@@ -119,13 +161,16 @@ impl FrameClock {
             let mut due: HashMap<u64, bool> = HashMap::new();
             for waiter in waiters.values_mut().filter(|waiter| waiter.frame.is_none()) {
                 let divisor = self.divisor(waiter.max_rate, refresh);
-                let ready = *due.entry(divisor).or_insert_with(|| {
+                let shared_ready = *due.entry(divisor).or_insert_with(|| {
                     cadence
                         .get(&divisor)
                         // A restarted source counts from a lower index again.
                         .is_none_or(|&last| {
                             frame.index >= last.saturating_add(divisor) || frame.index < last
                         })
+                });
+                let ready = waiter.after_index.map_or(shared_ready, |last| {
+                    frame.index >= last.saturating_add(divisor) || frame.index < last
                 });
                 if ready {
                     waiter.frame = Some(frame);
@@ -158,7 +203,7 @@ impl FrameClock {
 
 /// Whole refreshes per frame so a request never exceeds `rate`. A 50 Hz cap on
 /// a 120 Hz display ticks every third refresh (40 Hz) rather than unevenly.
-fn divisor(refresh: f64, rate: f64) -> u64 {
+pub(crate) fn divisor(refresh: f64, rate: f64) -> u64 {
     if !refresh.is_finite() || refresh <= rate {
         return 1;
     }
@@ -174,9 +219,15 @@ fn valid_rate(hz: Option<f64>) -> Option<f64> {
 pub struct NextFrame {
     clock: FrameClock,
     max_rate: Option<f64>,
+    after_index: Option<u64>,
     id: Option<u64>,
 }
 impl NextFrame {
+    /// Keep a shared effect driver's cadence aligned when its rate changes.
+    pub(crate) fn after_index(mut self, index: u64) -> Self {
+        self.after_index = Some(index);
+        self
+    }
     /// Accept at most `hz` frames per second, evenly spaced in whole display
     /// refreshes. Requests with the same effective rate tick together.
     pub fn max_rate(mut self, hz: f64) -> Self {
@@ -195,6 +246,7 @@ impl Future for NextFrame {
                 id,
                 Waiter {
                     max_rate: self.max_rate,
+                    after_index: self.after_index,
                     waker: Some(cx.waker().clone()),
                     frame: None,
                 },

@@ -45,6 +45,7 @@ accesskit_consumer = "0.38.0"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+zgui-gpu = { path = "../zgui-gpu", features = ["benchmark"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-core-foundation = "0.3.2"

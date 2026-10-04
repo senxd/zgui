@@ -50,6 +50,8 @@ pub struct WindowOptions {
     /// example to save power. Input-driven redraws are not limited. `None`
     /// follows the display.
     pub max_frame_rate: Option<f64>,
+    /// Interchangeable GPU backdrop filter; scene effects keep the same API.
+    pub blur_algorithm: zgui_gpu::BlurAlgorithm,
 }
 impl Default for WindowOptions {
     fn default() -> Self {
@@ -65,6 +67,7 @@ impl Default for WindowOptions {
             bounds: None,
             display: None,
             max_frame_rate: None,
+            blur_algorithm: Default::default(),
         }
     }
 }
@@ -392,6 +395,8 @@ pub struct WindowContext {
     /// Display-paced animation frames for this window. Components reach it
     /// through `Context::frames`.
     pub frames: FrameClock,
+    /// Optional native presentation counter, independent of animation requests.
+    pub frame_counter: crate::FrameCounter,
     close_requested: Option<Box<dyn FnMut() -> bool>>,
     closed: Option<Box<dyn FnOnce()>>,
     menu_action: Option<Box<dyn FnMut(crate::MenuAction)>>,
@@ -458,7 +463,10 @@ impl WindowContext {
         });
         self.ui.render(zgui::compose::provide(
             self.frames.clone(),
-            zgui::compose::provide(runner, view),
+            zgui::compose::provide(
+                self.frame_counter.clone(),
+                zgui::compose::provide(runner, view),
+            ),
         ))
     }
 
@@ -709,6 +717,7 @@ struct Host {
     ime_geometry: Option<Rect>,
     ime_target: Option<NodeId>,
     gpu_stats: Option<crate::gpu_stats::GpuStatsLog>,
+    counter_frame_pending: bool,
     /// `ZGUI_DAMAGE_CHECK=1`: compare every damaged frame with a full
     /// repaint and report stale pixels (slow; for debugging damage).
     damage_check: Option<u64>,
@@ -758,6 +767,7 @@ impl Host {
             ui,
             viewport,
             frames: frames.clone(),
+            frame_counter: crate::FrameCounter::default(),
             close_requested: None,
             closed: None,
             tasks: TaskSpawner {
@@ -811,6 +821,7 @@ impl Host {
             frame_paced: false,
             present_ready: false,
             gpu_stats: crate::gpu_stats::GpuStatsLog::from_env(),
+            counter_frame_pending: false,
             damage_check: std::env::var_os("ZGUI_DAMAGE_CHECK").map(|_| 0),
             frames,
             #[cfg(target_os = "macos")]
@@ -915,25 +926,37 @@ impl Host {
             return Ok(());
         };
         let size = window.inner_size();
-        let visible = window.is_visible();
+        let visible = if self.state.visible {
+            window.is_visible()
+        } else {
+            Some(false)
+        };
         // X11's minimized query is a synchronous property roundtrip. Focused
         // windows cannot be minimized, and known-hidden windows need no query.
-        let minimized = if window.has_focus()
-            || visible == Some(false)
+        let minimized = if window.has_focus() {
+            Some(false)
+        } else if visible == Some(false)
             || self.native_occluded
             || size.width == 0
             || size.height == 0
         {
             None
         } else {
-            window.is_minimized()
+            window.is_minimized().or(Some(self.state.minimized))
         };
-        if !self.presentation.render_allowed(
+        if let Some(minimized) = minimized {
+            // Native minimize/restore controls can change this independently of
+            // WindowHandle commands, including on Windows without Occluded events.
+            self.state.minimized = minimized;
+        }
+        let presented = self.presentation.render_allowed(
             (size.width, size.height),
             visible,
             minimized,
             self.native_occluded,
-        ) {
+        );
+        self.context.ui.set_presented(presented);
+        if !presented {
             self.context.ui.cancel_interactions();
             return Ok(());
         }
@@ -946,6 +969,7 @@ impl Host {
         let mut scene = scene.borrow_mut();
         let report = scene.flush();
         self.accessibility_geometry_dirty |= !report.damage.is_empty();
+        self.counter_frame_pending |= self.context.frame_counter.content_damage(&report.damage);
         let full = [scene.bounds(scene.root())];
         let damage = if self.force {
             &full[..]
@@ -984,6 +1008,9 @@ impl Host {
             } else {
                 let status = renderer.present_with_notify(|| window.pre_present_notify())?;
                 if status == zgui_gpu::PresentationStatus::Presented {
+                    self.context
+                        .frame_counter
+                        .presented(std::mem::take(&mut self.counter_frame_pending));
                     self.present_ready = false;
                     let now = std::time::Instant::now();
                     self.trim_at = Some(now + TRIM_DELAY);
@@ -1191,6 +1218,7 @@ impl Host {
         };
         self.scale_factor = window.scale_factor();
         renderer.set_scale_factor(self.scale_factor as f32);
+        renderer.set_blur_algorithm(self.options.blur_algorithm);
         renderer.set_background(if self.options.transparent {
             zgui::scene::Color(0, 0, 0, 0)
         } else {
@@ -1724,6 +1752,7 @@ impl Host {
     }
     fn frames_presented(&self) -> bool {
         self.window.is_some()
+            && self.presentation.drawable()
             && self.state.visible
             && !self.state.minimized
             && !self.native_occluded

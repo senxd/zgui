@@ -18,9 +18,17 @@ unicode-segmentation = "1.12"
 rustc-hash = "2.1"
 
 gif = { version = "=0.14.2", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.151", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-core-foundation = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-metal = "0.3.2"
+
+[features]
+benchmark = ["dep:serde_json"]
+
+[[example]]
+name = "effects_bench"
+required-features = ["benchmark"]

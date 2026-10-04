@@ -154,13 +154,17 @@ pub fn measured_rows<K: Eq + std::hash::Hash + Clone + 'static>(
         let described: Rc<RefCell<Vec<K>>> = Rc::default();
         // Keys still at the default height, awaiting their estimate.
         let pending: Rc<RefCell<Vec<K>>> = Rc::default();
+        // Rebuild lookup only when the key order changes, rather than spending
+        // every estimation slice indexing the entire offscreen collection.
+        let positions: Rc<RefCell<HashMap<K, usize>>> = Rc::default();
         let estimate = Rc::new(RefCell::new(estimate));
         // Estimate pending rows, newest first, while `slice` allows.
         let refine = {
-            let (heights, described, pending, estimate) = (
+            let (heights, described, pending, positions, estimate) = (
                 heights.clone(),
                 described.clone(),
                 pending.clone(),
+                positions.clone(),
                 estimate.clone(),
             );
             let runtime = cx.runtime();
@@ -170,11 +174,7 @@ pub fn measured_rows<K: Eq + std::hash::Hash + Clone + 'static>(
                 let mut exact = Vec::new();
                 {
                     let described = described.borrow();
-                    let index: HashMap<&K, usize> = described
-                        .iter()
-                        .enumerate()
-                        .map(|(i, key)| (key, i))
-                        .collect();
+                    let index = positions.borrow();
                     let mut pending = pending.borrow_mut();
                     let mut estimate = estimate.borrow_mut();
                     while slice.is_none_or(|slice| started.elapsed() < slice)
@@ -225,14 +225,23 @@ pub fn measured_rows<K: Eq + std::hash::Hash + Clone + 'static>(
             }
         };
         {
-            let (heights, described, pending) =
-                (heights.clone(), described.clone(), pending.clone());
+            let (heights, described, pending, positions) = (
+                heights.clone(),
+                described.clone(),
+                pending.clone(),
+                positions.clone(),
+            );
             let runtime = cx.runtime();
             let effect = cx.runtime().effect(move || {
                 let current = rows();
                 runtime.untracked(|| {
                     let default = heights.index.borrow().estimate();
                     let old = described.replace(current.clone());
+                    *positions.borrow_mut() = current
+                        .iter()
+                        .enumerate()
+                        .map(|(i, key)| (key.clone(), i))
+                        .collect();
                     let known: HashMap<&K, f32> = {
                         let index = heights.index.borrow();
                         old.iter()
@@ -512,7 +521,10 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                     // Construct first: a failed row constructor leaves old rows intact.
                     let mut added = Vec::new();
                     for (key, index, _, row_height) in &keys {
-                        if entries.contains_key(key) {
+                        if entries
+                            .get(key)
+                            .is_some_and(|entry| ui.scene.borrow().contains(entry.node))
+                        {
                             continue;
                         }
                         let index_signal = ui.signal(*index);
@@ -649,4 +661,104 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
             });
         },
     )))
+}
+
+#[cfg(test)]
+mod estimation_tests {
+    use super::*;
+    use std::{
+        hash::{Hash, Hasher},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn removed_virtual_rows_are_recreated_on_the_next_reconciliation() {
+        for variable in [false, true] {
+            let mut ui = Ui::new(100., 40.);
+            let offset = ui.signal(0.);
+            let row = |_: Signal<usize>, key: usize, _: &mut Context| {
+                div().id(format!("row-{key}")).h(20.)
+            };
+            let view = if variable {
+                variable_virtual_list(
+                    offset.clone(),
+                    VariableHeights::new(&ui.runtime, 4, 20.),
+                    0,
+                    |index| index,
+                    row,
+                )
+            } else {
+                virtual_list(offset.clone(), 20., 0, || 4, |index| index, row)
+            };
+            let root = ui.mount(view.size(100., 40.));
+            ui.prepare_frame();
+            let child = root.find("row-0").unwrap();
+            let wrapper = ui.scene.borrow().parent(child).unwrap();
+            ui.remove(wrapper);
+            offset.set(1.);
+            ui.prepare_frame();
+            let replacement = root.find("row-0").unwrap();
+            assert_ne!(replacement, child);
+            assert!(ui.scene.borrow().contains(replacement));
+            root.unmount();
+        }
+    }
+
+    #[derive(Clone)]
+    struct Key(usize, Rc<Cell<usize>>);
+    impl PartialEq for Key {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+    }
+    impl Eq for Key {}
+    impl Hash for Key {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.1.set(self.1.get() + 1);
+            self.0.hash(state);
+        }
+    }
+
+    #[test]
+    fn estimation_slices_hash_only_pending_rows_instead_of_the_entire_collection() {
+        let executor = Rc::new(RefCell::new(crate::task::LocalExecutor::new()));
+        let mut ui = Ui::new(100., 20.);
+        let heights = VariableHeights::new(&ui.runtime, 0, 10.);
+        let hashes = Rc::new(Cell::new(0));
+        let keys: Vec<_> = (0..500).map(|id| Key(id, hashes.clone())).collect();
+        let estimated = Rc::new(Cell::new(0));
+        let calls = estimated.clone();
+        let root = ui.mount(provide(
+            TaskRunner::from_executor(executor.clone()),
+            measured_rows(
+                ui.signal(0.),
+                heights,
+                0,
+                move || keys.clone(),
+                move |_, _| {
+                    calls.set(calls.get() + 1);
+                    std::thread::sleep(Duration::from_millis(2));
+                    12.
+                },
+                |_, _, _| div().h(10.),
+            )
+            .size(100., 20.),
+        ));
+        ui.prepare_frame();
+        hashes.set(0);
+        executor.borrow_mut().tick();
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while !executor.borrow().has_ready() && Instant::now() < timeout {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        executor.borrow_mut().tick();
+        assert!(estimated.get() > 0, "bounded estimation must make progress");
+        assert!(
+            hashes.get() < 100,
+            "one slice reindexed the entire collection: {} hashes",
+            hashes.get()
+        );
+        root.unmount();
+        executor.borrow_mut().tick();
+    }
 }

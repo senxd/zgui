@@ -66,18 +66,20 @@ pub fn canvas(style: &QuadStyle, width: f32, height: f32) -> Result<Canvas, GpuE
         return Err(GpuError("missing detailed decoration".into()));
     };
     let corners = detail.corners.unwrap_or(Corners::all(style.radius));
-    if ![
-        width,
-        height,
-        corners.top_left,
-        corners.top_right,
-        corners.bottom_right,
-        corners.bottom_left,
-    ]
-    .iter()
-    .all(|v| v.is_finite())
+    if width <= 0.
+        || height <= 0.
+        || ![
+            width,
+            height,
+            corners.top_left,
+            corners.top_right,
+            corners.bottom_right,
+            corners.bottom_left,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
     {
-        return Err(GpuError("nonfinite decoration dimensions".into()));
+        return Err(GpuError("invalid decoration dimensions".into()));
     }
     let radius = radii(corners, width, height);
     let outer = rounded(Rect::new(0., 0., width, height), radius);

@@ -1,5 +1,6 @@
 //! Bounded image decoding and SVG rasterization, independent of a GPU device.
 use crate::GpuError;
+use image::ImageDecoder;
 use std::{io::Cursor, sync::Arc};
 use zgui::image::ImageData;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -15,14 +16,26 @@ pub fn decode_image(bytes: &[u8]) -> Result<Arc<ImageData>, GpuError> {
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
     limits.max_alloc = Some(MAX_BYTES as u64);
-    reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .map_err(|e| GpuError(e.to_string()))?
-        .into_rgba8();
-    if decoded.as_raw().len() > MAX_BYTES {
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().map_err(|e| GpuError(e.to_string()))?;
+    let (width, height) = decoder.dimensions();
+    // An RGB/greyscale decoder can fit its own limit while conversion to RGBA
+    // would allocate a larger, rejected output. Check before decoding pixels.
+    if (u64::from(width) * u64::from(height))
+        .checked_mul(4)
+        .is_none_or(|bytes| bytes > MAX_BYTES as u64)
+    {
         return Err(GpuError("decoded image exceeds 64 MiB".into()));
     }
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|e| GpuError(e.to_string()))?;
+    decoder
+        .set_limits(limits)
+        .map_err(|e| GpuError(e.to_string()))?;
+    let decoded = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| GpuError(e.to_string()))?
+        .into_rgba8();
     ImageData::new(decoded.width(), decoded.height(), decoded.into_raw())
         .map(Arc::new)
         .map_err(|e| GpuError(e.into()))
@@ -30,6 +43,16 @@ pub fn decode_image(bytes: &[u8]) -> Result<Arc<ImageData>, GpuError> {
 /// Rasterize an SVG at the requested physical size. External resources are disabled.
 /// SVG text needs conversion to outlines; the lightweight SVG dependency disables fonts.
 pub fn decode_svg(bytes: &[u8], width: u32, height: u32) -> Result<Arc<ImageData>, GpuError> {
+    decode_svg_at(bytes, width, height, [width as f32, height as f32, 0., 0.])
+}
+/// Rasterize at the exact device-space size and fractional origin, leaving
+/// transparent padding instead of scaling the rounded allocation back down.
+pub(crate) fn decode_svg_at(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    geometry: [f32; 4],
+) -> Result<Arc<ImageData>, GpuError> {
     if bytes.len() > 4 * 1024 * 1024
         || width == 0
         || height == 0
@@ -45,9 +68,13 @@ pub fn decode_svg(bytes: &[u8], width: u32, height: u32) -> Result<Arc<ImageData
         resvg::usvg::Tree::from_data(bytes, &options).map_err(|e| GpuError(e.to_string()))?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| GpuError("SVG image allocation failed".into()))?;
-    let transform = resvg::tiny_skia::Transform::from_scale(
-        width as f32 / tree.size().width(),
-        height as f32 / tree.size().height(),
+    let transform = resvg::tiny_skia::Transform::from_row(
+        geometry[0] / tree.size().width(),
+        0.,
+        0.,
+        geometry[1] / tree.size().height(),
+        geometry[2],
+        geometry[3],
     );
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     let mut pixels = pixmap.take();

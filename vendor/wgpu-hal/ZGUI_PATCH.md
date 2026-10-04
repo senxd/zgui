@@ -24,6 +24,9 @@ system CPU for zgui vs 1.4% for GPUI on the same animation
    with no buffer, and `submit` skips them. The fence signal attaches to the
    last real buffer (or, as upstream, to an internal one when a submission is
    entirely empty), so completion ordering is unchanged.
+   Encoding reserves the upstream command-buffer budget atomically even before
+   first use; finishing or discarding an empty encoder releases that reservation.
+   Lazy allocation therefore cannot bypass Metal's hard exhaustion guard.
 2. **Present without an extra command buffer.** `presentDrawable:` presents
    from the command buffer's scheduled handler. `submit` now registers that
    handler on its last buffer before commit, and `present` hands the drawable

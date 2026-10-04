@@ -83,3 +83,47 @@ fn affine_pixels_damage_clipping_and_isolated_coordinates() {
         }
     }
 }
+
+#[test]
+fn affine_images_keep_ancestor_fades_fixed_to_the_viewport() {
+    let data = Arc::new(ImageData::new(1, 1, vec![255, 0, 0, 255]).unwrap());
+    for isolated in [false, true] {
+        let mut gpu = GpuRenderer::new(120, 120).unwrap();
+        gpu.set_background(Color(0, 0, 0, 0));
+        let mut scene = Scene::new(120., 120.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                fade_edges: [20., 20.],
+                clip: true,
+                ..fixed(80., 80.)
+            },
+        );
+        scene.set_transform(parent, Transform { x: 20., y: 20. });
+        scene.set_isolated(parent, isolated);
+        let node = scene.append(parent, NodeKind::Image(data.clone()), fixed(80., 80.));
+        let damage = scene.flush().damage;
+        gpu.render(&scene, &damage).unwrap();
+        let identity = gpu.readback().unwrap();
+        scene.set_kind(
+            node,
+            NodeKind::Image(Arc::new(
+                data.transformed(Affine::rotation(std::f32::consts::FRAC_PI_2)),
+            )),
+        );
+        let damage = scene.flush().damage;
+        gpu.render(&scene, &damage).unwrap();
+        let rotated = gpu.readback().unwrap();
+        for y in [22, 25, 40, 60, 79, 95, 97] {
+            assert_eq!(
+                pixel(&rotated, 60, y),
+                pixel(&identity, 60, y),
+                "ancestor mask y={y}, isolated={isolated}"
+            );
+        }
+        assert!(pixel(&rotated, 60, 22)[3] < 10);
+        assert_eq!(pixel(&rotated, 60, 60), &[255, 0, 0, 255]);
+    }
+}
