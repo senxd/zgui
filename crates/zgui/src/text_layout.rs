@@ -28,17 +28,32 @@ impl From<String> for FontFamily {
 /// overlap internally and ink at the outer text-box edges may be clipped.
 /// Private normalized bits give font caches stable equality and hashing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct LineHeight(u32);
+pub struct LineHeight(u32, u32);
 impl LineHeight {
-    pub const NORMAL: Self = Self(0);
+    pub const NORMAL: Self = Self(0, 0);
 
     /// Invalid, zero, or negative values reset the normal line pitch.
     pub fn px(value: f32) -> Self {
         if value.is_finite() && value > 0. {
-            Self(value.to_bits())
+            Self(value.to_bits(), value.to_bits())
         } else {
             Self::NORMAL
         }
+    }
+
+    /// Round the line advance to logical pixels while retaining the natural
+    /// line height for glyph baseline placement. Explicit `px` stays exact.
+    pub fn rounded_px(value: f32) -> Self {
+        if value.is_finite() && value > 0. {
+            Self(value.round().max(1.).to_bits(), value.to_bits())
+        } else {
+            Self::NORMAL
+        }
+    }
+
+    /// Baseline correction from rounded advance to natural line-box height.
+    pub fn baseline_offset(self) -> f32 {
+        (f32::from_bits(self.1) - f32::from_bits(self.0)) * 0.5
     }
 
     pub fn pixels(self) -> Option<f32> {
@@ -614,6 +629,23 @@ mod tests {
             LineHeight::px(f32::from_bits(1)).pixels(),
             Some(f32::from_bits(1))
         );
+    }
+    #[test]
+    fn rounded_pitch_preserves_natural_baseline_and_cache_identity() {
+        let natural = LineHeight::rounded_px(16.25);
+        assert_eq!(natural.resolve(12.5), 16.);
+        assert_eq!(natural.baseline_offset(), 0.125);
+        assert_ne!(natural, LineHeight::px(16.));
+        assert_eq!(LineHeight::rounded_px(17.), LineHeight::px(17.));
+        assert_eq!(LineHeight::px(16.).baseline_offset(), 0.);
+        assert_eq!(LineHeight::NORMAL.baseline_offset(), 0.);
+        assert_eq!(LineHeight::rounded_px(0.25).resolve(10.), 1.);
+        for value in [f32::NAN, f32::INFINITY, -1., 0.] {
+            assert_eq!(LineHeight::rounded_px(value), LineHeight::NORMAL);
+        }
+        let layout = FallbackTextLayout::with_line_height("a\nb", 12.5, None, natural);
+        assert_eq!(layout.size().1, 32.);
+        assert_eq!(layout.caret(2).y, 16.);
     }
     #[test]
     fn explicit_pitch_keeps_wrapped_unicode_hit_selection_and_caret_aligned() {

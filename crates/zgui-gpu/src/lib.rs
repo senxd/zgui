@@ -176,6 +176,7 @@ fn shading(quad: &Quad, _scale: f32) -> Shading {
         && quad.options[3] < 0.5
         && quad.rect == quad.fade;
     let plain = quad.options[0] == 0.
+        && !(quad.options[1] > 1.5 && quad.options[3] > 0.5)
         && quad.options[2] < 0.5
         && quad.shape[2] <= 0.
         && (quad.shape[3] <= 0.5 || square)
@@ -475,6 +476,7 @@ fn glyphs_of<'a>(
     runs: impl Iterator<Item = cosmic_text::LayoutRun<'a>>,
     starts: &[usize],
     rich: Option<&zgui::rich_text::RichText>,
+    font: &zgui::text_layout::FontStyle,
     scale: f32,
 ) -> Vec<Glyph> {
     let mut glyphs = Vec::new();
@@ -483,6 +485,9 @@ fn glyphs_of<'a>(
             let p = glyph.physical((0., 0.), scale);
             let run_index = rich.map_or(0, |rich| {
                 text::run_at(rich, starts[run.line_i] + glyph.start)
+            });
+            let line_height = rich.map_or(font.line_height, |rich| {
+                rich.runs()[run_index].font.line_height
             });
             glyphs.push(Glyph {
                 key: p.cache_key,
@@ -494,7 +499,7 @@ fn glyphs_of<'a>(
                 },
                 run: run_index,
                 x: (glyph.x + glyph.font_size * glyph.x_offset) * scale,
-                y: (glyph.y - glyph.font_size * glyph.y_offset + run.line_y) * scale,
+                y: text::glyph_y(glyph, run.line_y + line_height.baseline_offset()) * scale,
             });
         }
     }
@@ -662,10 +667,52 @@ impl Glyph {
             self.key.font_id,
             self.key.glyph_id,
             f32::from_bits(self.key.font_size_bits),
-            (self.x + origin.0, (self.y + origin.1).trunc()),
+            (self.x + origin.0, self.y + origin.1),
             self.key.font_weight,
             self.key.flags,
         )
+    }
+}
+#[cfg(test)]
+mod glyph_baseline_tests {
+    use super::*;
+    #[test]
+    fn rounded_logical_baselines_preserve_scaled_origin_phase() {
+        let (key, _, _) = CacheKey::new(
+            cosmic_text::fontdb::ID::dummy(),
+            1,
+            11.,
+            (0.25, 0.),
+            cosmic_text::Weight::NORMAL,
+            cosmic_text::CacheKeyFlags::empty(),
+        );
+        let glyph = Glyph {
+            key,
+            color: None,
+            run: 0,
+            x: 0.25,
+            // collect_glyphs rounds the logical line baseline before scaling.
+            y: 11.,
+        };
+        for (origin, expected, phase) in [
+            (0., 11, cosmic_text::SubpixelBin::Zero),
+            (0.5, 11, cosmic_text::SubpixelBin::Two),
+            (-11.5, -1, cosmic_text::SubpixelBin::Two),
+        ] {
+            let (raster, _, baseline) = glyph.at((0., origin));
+            assert_eq!(baseline, expected);
+            assert_eq!(raster.flags, key.flags);
+            assert_eq!(raster.font_size_bits, key.font_size_bits);
+            assert_eq!(raster.x_bin, key.x_bin);
+            assert_eq!(raster.y_bin, phase);
+        }
+        let scaled = Glyph {
+            y: glyph.y * 1.5,
+            ..glyph.clone()
+        };
+        let (raster, _, baseline) = scaled.at((0., 0.));
+        assert_eq!(baseline, 16);
+        assert_eq!(raster.y_bin, cosmic_text::SubpixelBin::Two);
     }
 }
 struct Shaped {
@@ -677,6 +724,7 @@ struct Shaped {
     size: f32,
     width: f32,
     height: f32,
+    unwrapped: bool,
     glyphs: Vec<Glyph>,
     quads: Vec<Quad>,
     atlas_epoch: u64,
@@ -1162,6 +1210,10 @@ pub struct GpuRenderer {
     /// resized or restyled node gets a new raster; the old texture goes at
     /// once instead of waiting for a structural prune.
     node_images: FxHashMap<NodeId, u64>,
+    /// Mounted direct images and their chain inputs, rebuilt on content changes.
+    direct_image_ids: std::collections::HashSet<u64>,
+    /// Textures referenced by draws already assembled during this outer frame.
+    frame_image_ids: std::collections::HashSet<u64>,
     /// The viewport of the target currently being rendered.
     viewport_bind: Option<wgpu::BindGroup>,
     /// Reused upload memory for per-frame vertices; `write_buffer` would
@@ -1437,6 +1489,8 @@ impl GpuRenderer {
             pending: RefCell::new(None),
             viewports: FxHashMap::default(),
             node_images: FxHashMap::default(),
+            direct_image_ids: Default::default(),
+            frame_image_ids: Default::default(),
             viewport_bind: None,
             belt: RefCell::new(wgpu::util::StagingBelt::new(device.clone(), 256 * 1024)),
             mapped: context
@@ -1753,6 +1807,7 @@ impl GpuRenderer {
         // A frame deferred but never presented draws into the retained target
         // before this one prunes images or layers it may reference.
         self.flush_pending();
+        self.frame_image_ids.clear();
         if self.scene_identity != Some(scene.identity()) {
             self.scene_identity = Some(scene.identity());
             self.layers.clear();
@@ -1921,8 +1976,10 @@ impl GpuRenderer {
         let mut snapshots = std::collections::HashSet::new();
         let mut instances = std::collections::HashSet::new();
         let mut chains = std::collections::HashSet::new();
-        for item in scene.paint_items() {
-            if let NodeKind::Image(image) = item.kind {
+        let mut nodes = vec![scene.root()];
+        while let Some(node) = nodes.pop() {
+            nodes.extend_from_slice(scene.children(node));
+            if let NodeKind::Image(image) = scene.kind(node) {
                 let mut image = image.as_ref();
                 loop {
                     snapshots.insert(image.id());
@@ -1937,10 +1994,11 @@ impl GpuRenderer {
                 }
             }
             #[cfg(target_os = "macos")]
-            if let NodeKind::NativeSurface(frame) = item.kind {
+            if let NodeKind::NativeSurface(frame) = scene.kind(node) {
                 snapshots.insert(frame.id());
             }
         }
+        self.direct_image_ids.clone_from(&snapshots);
         self.procedural.retain(snapshots.clone(), &instances);
         self.chain_cache.retain(snapshots.clone(), &chains);
         self.node_images.retain(|id, _| scene.contains(*id));
@@ -2213,7 +2271,7 @@ impl GpuRenderer {
     }
     fn render_flat(
         &mut self,
-        _scene: &Scene,
+        scene: &Scene,
         items: Vec<zgui::scene::PaintItem<'_>>,
         damage: &[Rect],
     ) -> Result<GpuStats, GpuError> {
@@ -2679,13 +2737,11 @@ impl GpuRenderer {
                             } else {
                                 6
                             };
-                        if bytes + self.images.values().map(|e| e.1).sum::<usize>()
-                            > 64 * 1024 * 1024
-                        {
-                            return Err(GpuError(
+                        self.ensure_image_budget(bytes).map_err(|_| {
+                            GpuError(
                                 "visible image and native surface textures exceed 64 MiB".into(),
-                            ));
-                        }
+                            )
+                        })?;
                         if self.native_surfaces.is_none() {
                             self.native_surfaces = Some(native_surface::SurfaceCache::new(
                                 &self.device,
@@ -2738,7 +2794,11 @@ impl GpuRenderer {
                             item.effects.edge_fade,
                             2.,
                             if transformed { 1. } else { 0. },
-                            0.,
+                            if image.sampling() == zgui::image::ImageSampling::Nearest {
+                                1.
+                            } else {
+                                0.
+                            },
                         ],
                         shape: if transformed {
                             [transform.a, transform.c, transform.b, transform.d]
@@ -2775,6 +2835,11 @@ impl GpuRenderer {
                     if !font_size.is_finite() || font_size <= 0. {
                         return Err(GpuError("font size must be finite and positive".into()));
                     }
+                    let unwrapped = !scene.style(item.id).text_wrap
+                        && item.text_options == Default::default()
+                        && rich
+                            .as_ref()
+                            .is_none_or(|r| r.options() == Default::default());
                     // Colour-only rich changes (fades, highlights) keep glyph
                     // positions: recolour the cached shape instead of re-shaping.
                     if let (Some(new), Some(shaped)) = (&rich, self.shapes.get_mut(&item.id))
@@ -2783,6 +2848,7 @@ impl GpuRenderer {
                         && old.same_shape(new)
                         && shaped.width == bounds.width
                         && shaped.height == bounds.height
+                        && shaped.unwrapped == unwrapped
                         && shaped.text_options == item.text_options
                         && shaped.font == *item.font
                     {
@@ -2803,6 +2869,7 @@ impl GpuRenderer {
                             || s.size != font_size
                             || s.width != bounds.width
                             || s.height != bounds.height
+                            || s.unwrapped != unwrapped
                     });
                     if stale {
                         if let Some(old) = self.shapes.remove(&item.id) {
@@ -2819,29 +2886,45 @@ impl GpuRenderer {
                             && prepared::TextCache::handles_plain(text, font_size);
                         let b = if plain {
                             let mut cache = self.text_cache.borrow_mut();
-                            let laid = cache.layout_plain(
-                                &mut fonts,
-                                text,
-                                font_size,
-                                item.font,
-                                Some(bounds.width),
-                            );
+                            let laid = if unwrapped {
+                                cache.layout_plain_unwrapped(
+                                    &mut fonts,
+                                    text,
+                                    font_size,
+                                    item.font,
+                                    bounds.width,
+                                )
+                            } else {
+                                cache.layout_plain(
+                                    &mut fonts,
+                                    text,
+                                    font_size,
+                                    item.font,
+                                    Some(bounds.width),
+                                )
+                            };
                             let starts = laid.line_starts();
                             let glyphs = glyphs_of(
                                 laid.runs(Some(bounds.height)),
                                 &starts,
                                 None,
+                                &item.font,
                                 self.scale,
                             );
                             Err((glyphs, Vec::new(), laid.key()))
                         } else if let Some(rich) = prepared {
                             let mut cache = self.text_cache.borrow_mut();
-                            let laid = cache.layout(&mut fonts, rich, Some(bounds.width));
+                            let laid = if unwrapped {
+                                cache.layout_unwrapped(&mut fonts, rich, bounds.width)
+                            } else {
+                                cache.layout(&mut fonts, rich, Some(bounds.width))
+                            };
                             let starts = laid.line_starts();
                             let glyphs = glyphs_of(
                                 laid.runs(Some(bounds.height)),
                                 &starts,
                                 Some(rich),
+                                &item.font,
                                 self.scale,
                             );
                             let decorations = text::rich_decorations_in(
@@ -2851,12 +2934,21 @@ impl GpuRenderer {
                             );
                             Err((glyphs, decorations, laid.key()))
                         } else if let Some(rich) = &rich {
-                            Ok(text::rich_buffer(
-                                &mut fonts,
-                                rich,
-                                Some(bounds.width),
-                                Some(bounds.height),
-                            ))
+                            Ok(if unwrapped {
+                                text::rich_buffer_unwrapped(
+                                    &mut fonts,
+                                    rich,
+                                    bounds.width,
+                                    bounds.height,
+                                )
+                            } else {
+                                text::rich_buffer(
+                                    &mut fonts,
+                                    rich,
+                                    Some(bounds.width),
+                                    Some(bounds.height),
+                                )
+                            })
                         } else if item.text_options != Default::default() {
                             Ok(text::display_buffer(
                                 &mut fonts,
@@ -2876,12 +2968,16 @@ impl GpuRenderer {
                                 ),
                             );
                             b.set_size(Some(bounds.width), Some(bounds.height));
-                            text::set_buffer_text(
+                            if unwrapped {
+                                b.set_wrap(cosmic_text::Wrap::None);
+                            }
+                            text::set_buffer_text_shaping(
                                 &mut fonts,
                                 &mut b,
                                 text,
                                 item.font,
                                 font_size.max(1.),
+                                text::shaping(unwrapped),
                             );
                             b.shape_until_scroll(&mut fonts, false);
                             Ok(b)
@@ -2893,6 +2989,7 @@ impl GpuRenderer {
                                     b.layout_runs(),
                                     &text::line_starts(&b),
                                     rich.as_deref(),
+                                    &item.font,
                                     self.scale,
                                 ),
                                 rich.as_ref()
@@ -2909,6 +3006,7 @@ impl GpuRenderer {
                             size: font_size,
                             width: bounds.width,
                             height: bounds.height,
+                            unwrapped,
                             glyphs,
                             quads: Vec::new(),
                             atlas_epoch: 0,
@@ -3075,6 +3173,9 @@ impl GpuRenderer {
                         None
                     },
                 };
+                if let Some(image) = draw.image {
+                    self.frame_image_ids.insert(image);
+                }
                 push_draw(&mut draws, &quads, draw, self.split_shading, self.scale);
             }
         }
@@ -4106,10 +4207,35 @@ impl GpuRenderer {
     fn retire_node_image(&mut self, node: NodeId, id: u64) {
         if let Some(old) = self.node_images.insert(node, id)
             && old != id
+            && !self.frame_image_ids.contains(&old)
         {
             self.images.remove(&old);
             self.image_textures.remove(&old);
         }
+    }
+    /// Metadata caches evict rasters independently of scene content revisions.
+    /// Reclaim their orphan uploads only under pressure, keeping assembled draws
+    /// and mounted direct/chain images intact.
+    fn ensure_image_budget(&mut self, bytes: usize) -> Result<(), GpuError> {
+        const BUDGET: usize = 64 * 1024 * 1024;
+        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > BUDGET {
+            let mut retained = self.direct_image_ids.clone();
+            retained.extend(self.frame_image_ids.iter().copied());
+            retained.extend(self.canvases.image_ids());
+            retained.extend(self.svgs.image_ids());
+            self.images.retain(|id, _| retained.contains(id));
+            self.image_textures.retain(|id, _| retained.contains(id));
+            #[cfg(target_os = "macos")]
+            if let Some(cache) = &mut self.native_surfaces {
+                cache.retain(&retained);
+            }
+        }
+        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > BUDGET {
+            return Err(GpuError(
+                "visible image textures exceed the 64 MiB budget".into(),
+            ));
+        }
+        Ok(())
     }
     /// The texture of `node`'s canvas raster, uploaded if it is new; the
     /// cache then keeps no pixels. A lost texture rasterizes again.
@@ -4141,21 +4267,14 @@ impl GpuRenderer {
             return Err(GpuError("image exceeds GPU texture dimensions".into()));
         }
         let bytes = image.width() as usize * image.height() as usize * 4;
-        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > 64 * 1024 * 1024 {
-            return Err(GpuError(
-                "visible image textures exceed the 64 MiB budget".into(),
-            ));
-        }
+        self.frame_image_ids.insert(image.id());
+        self.ensure_image_budget(bytes)?;
         let mut display = None;
         let texture = if let Some(chain) = image.effect_chain() {
             if !self.image_textures.contains_key(&chain.input.id()) {
                 self.upload_image(&chain.input)?;
             }
-            if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > 64 * 1024 * 1024 {
-                return Err(GpuError(
-                    "visible image textures exceed the 64 MiB budget".into(),
-                ));
-            }
+            self.ensure_image_budget(bytes)?;
             let mut encoder = self
                 .procedural_encoder
                 .take()
@@ -5268,6 +5387,96 @@ pub mod svg;
 
 #[cfg(test)]
 mod native_surface_shader_tests {
+    #[test]
+    fn scrolling_reclaims_orphan_decoration_uploads_and_keeps_current_draws() {
+        use super::*;
+        use zgui::scene::{Layout, QuadStyle, Style, Transform};
+        let mut gpu = GpuRenderer::new(64, 32).unwrap();
+        let mut scene = Scene::new(64., 32.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        let group = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(2048.),
+                height: Some(3072.),
+                ..Default::default()
+            },
+        );
+        for row in 0..3 {
+            for column in 0..5 {
+                let color = Color(30 + column * 30, 40 + row * 30, 60, 255);
+                let node = scene.append(
+                    group,
+                    NodeKind::Quad(QuadStyle {
+                        fill: color,
+                        border_color: Color(255, 0, 0, 255),
+                        border_width: 1.,
+                        decoration: Some(Arc::new(zgui::decoration::Decoration::default())),
+                        ..Default::default()
+                    }),
+                    Style {
+                        absolute: true,
+                        width: Some(2048.),
+                        height: Some(1024.),
+                        ..Default::default()
+                    },
+                );
+                scene.set_transform(
+                    node,
+                    Transform {
+                        x: column as f32 * 8.,
+                        y: row as f32 * 1024.,
+                    },
+                );
+            }
+        }
+        scene.flush();
+        let revision = scene.content_revision();
+        let mut first_uploads = Vec::new();
+        for row in 0..3 {
+            scene.set_transform(
+                group,
+                Transform {
+                    x: 0.,
+                    y: -(row as f32) * 1024.,
+                },
+            );
+            let damage = scene.flush().damage;
+            assert_eq!(
+                scene.content_revision(),
+                revision,
+                "scrolling keeps content"
+            );
+            gpu.render(&scene, &damage).unwrap();
+            assert!(gpu.debug_cache_stats().image_bytes <= 64 * 1024 * 1024);
+            assert!(gpu.canvases.bytes() <= 32 * 1024 * 1024);
+            let pixels = gpu.readback().unwrap();
+            for column in 0..5 {
+                let offset = (8 * 64 + column * 8 + 4) * 4;
+                assert_eq!(
+                    &pixels[offset..offset + 4],
+                    &[30 + column as u8 * 30, 40 + row as u8 * 30, 60, 255],
+                    "row {row}, column {column}: metadata eviction must preserve assembled draws"
+                );
+            }
+            if row == 0 {
+                first_uploads.extend(gpu.images.keys().copied());
+            }
+        }
+        assert!(first_uploads.iter().any(|id| !gpu.images.contains_key(id)));
+        // The first row is still mounted. Returning to it must rasterize/upload
+        // reclaimed entries and reproduce the same pixels.
+        scene.set_transform(group, Transform::default());
+        let damage = scene.flush().damage;
+        let stats = gpu.render(&scene, &damage).unwrap();
+        assert!(stats.canvas_rasterizations > 0 && stats.image_uploads > 0);
+        assert_eq!(
+            &gpu.readback().unwrap()[(8 * 64 + 4) * 4..][..4],
+            &[30, 40, 60, 255]
+        );
+    }
+
     #[test]
     fn isolated_layer_budget_checks_rounded_texture_allocation_before_creation() {
         use super::*;

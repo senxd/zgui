@@ -59,9 +59,10 @@ struct Key {
     /// Plain text keeps a row after a final line break, for an editor's
     /// caret (as `ShapedText::with_font` lays it out); rich text does not.
     caret_row: bool,
+    unwrapped: bool,
 }
 impl Key {
-    fn of(rich: &RichText, caret_row: bool) -> Self {
+    fn of(rich: &RichText, caret_row: bool, unwrapped: bool) -> Self {
         let mut spans: Vec<(Range<usize>, FontStyle, f32)> = Vec::new();
         for run in rich.runs() {
             match spans.last_mut() {
@@ -79,12 +80,14 @@ impl Key {
             text: rich.text_arc(),
             spans,
             caret_row,
+            unwrapped,
         }
     }
     fn hash(&self) -> u64 {
         let mut hasher = FxHasher::default();
         self.text.hash(&mut hasher);
         self.caret_row.hash(&mut hasher);
+        self.unwrapped.hash(&mut hasher);
         for (range, font, size) in &self.spans {
             range.hash(&mut hasher);
             size.to_bits().hash(&mut hasher);
@@ -329,7 +332,11 @@ impl Entry {
                 fonts,
                 self.metrics.font_size,
                 width,
-                Wrap::WordOrGlyph,
+                if self.key.unwrapped {
+                    Wrap::None
+                } else {
+                    Wrap::WordOrGlyph
+                },
                 Ellipsize::None,
                 None,
                 TAB_WIDTH,
@@ -463,7 +470,15 @@ impl TextCache {
         rich: &RichText,
         width: Option<f32>,
     ) -> Laid<'_> {
-        self.laid_out(fonts, rich, false, width)
+        self.laid_out(fonts, rich, false, width, width.is_none())
+    }
+    pub(crate) fn layout_unwrapped(
+        &mut self,
+        fonts: &mut FontSystem,
+        rich: &RichText,
+        width: f32,
+    ) -> Laid<'_> {
+        self.laid_out(fonts, rich, false, Some(width), true)
     }
     /// Whether plain text goes through the cache: nonempty, at a valid size.
     pub fn handles_plain(text: &str, font_size: f32) -> bool {
@@ -496,7 +511,18 @@ impl TextCache {
         width: Option<f32>,
     ) -> Laid<'_> {
         let rich = plain(text, font_size, font);
-        self.laid_out(fonts, &rich, true, width)
+        self.laid_out(fonts, &rich, true, width, width.is_none())
+    }
+    pub(crate) fn layout_plain_unwrapped(
+        &mut self,
+        fonts: &mut FontSystem,
+        text: &Arc<str>,
+        font_size: f32,
+        font: &FontStyle,
+        width: f32,
+    ) -> Laid<'_> {
+        let rich = plain(text, font_size, font);
+        self.laid_out(fonts, &rich, true, Some(width), true)
     }
     fn sized(
         &mut self,
@@ -506,7 +532,7 @@ impl TextCache {
         need: Need,
         width: Option<f32>,
     ) -> (f32, f32) {
-        let hash = self.entry(fonts, rich, caret_row, need);
+        let hash = self.entry(fonts, rich, caret_row, need, width.is_none());
         let size = self.update(hash, |entry| entry.size(fonts, width));
         self.evict(hash);
         size
@@ -517,8 +543,9 @@ impl TextCache {
         rich: &RichText,
         caret_row: bool,
         width: Option<f32>,
+        unwrapped: bool,
     ) -> Laid<'_> {
-        let hash = self.entry(fonts, rich, caret_row, Need::Layout);
+        let hash = self.entry(fonts, rich, caret_row, Need::Layout, unwrapped);
         self.update(hash, |entry| entry.lay_out(fonts, width));
         self.evict(hash);
         let entry = &self.entries[&hash];
@@ -580,9 +607,10 @@ impl TextCache {
         rich: &RichText,
         caret_row: bool,
         need: Need,
+        unwrapped: bool,
     ) -> u64 {
         self.clock += 1;
-        let key = Key::of(rich, caret_row);
+        let key = Key::of(rich, caret_row, unwrapped);
         let hash = key.hash();
         let cached = self.entries.get_mut(&hash).filter(|entry| entry.key == key);
         if let Some(entry) = &cached
@@ -595,7 +623,7 @@ impl TextCache {
         }
         let known = cached.is_some();
         self.shaped += 1;
-        let (lines, metrics) = self.shape(fonts, rich, caret_row);
+        let (lines, metrics) = self.shape(fonts, rich, caret_row, unwrapped);
         if known {
             // Evicted lines, shaped again for drawing; measurements stay.
             let entry = self.entries.get_mut(&hash).expect("cached");
@@ -649,6 +677,7 @@ impl TextCache {
         fonts: &mut FontSystem,
         rich: &RichText,
         caret_row: bool,
+        unwrapped: bool,
     ) -> (Vec<BufferLine>, Metrics) {
         // `ShapedText::with_runs` adds an unshaped row for an editor's caret
         // after a final line break, which its size leaves out: so is it here.
@@ -656,10 +685,14 @@ impl TextCache {
         let mut buffer = match rich.runs() {
             // Plain text without per-span attributes, which cosmic-text looks
             // up for every word: shaped as `ShapedText::with_font` shapes it.
-            [run] if caret_row => {
-                crate::text::plain_buffer_unshaped(fonts, rich.text(), run.font_size, &run.font)
-            }
-            _ => crate::text::rich_buffer_unshaped(fonts, rich, false),
+            [run] if caret_row => crate::text::plain_buffer_unshaped(
+                fonts,
+                rich.text(),
+                run.font_size,
+                &run.font,
+                unwrapped,
+            ),
+            _ => crate::text::rich_buffer_unshaped(fonts, rich, false, unwrapped),
         };
         if caret_row
             && rich.text().ends_with(['\r', '\n'])
@@ -671,7 +704,7 @@ impl TextCache {
                 "",
                 cosmic_text::LineEnding::None,
                 cosmic_text::AttrsList::new(&crate::text::attrs(&run.font, size)),
-                cosmic_text::Shaping::Advanced,
+                crate::text::shaping(unwrapped),
             );
             line.set_align(crate::text::alignment(&run.font));
             buffer.lines.push(line);
@@ -682,7 +715,7 @@ impl TextCache {
             .recent
             .iter()
             .filter_map(|recent| Some((*recent, self.entries.get(recent)?)))
-            .filter(|(_, entry)| entry.metrics == metrics)
+            .filter(|(_, entry)| entry.metrics == metrics && entry.key.unwrapped == unwrapped)
             .filter_map(|(hash, entry)| {
                 let shared = entry
                     .lines
@@ -718,6 +751,7 @@ impl TextCache {
             .filter(|recent| {
                 self.entries.get(recent).is_some_and(|entry| {
                     entry.metrics == metrics
+                        && entry.key.unwrapped == unwrapped
                         && entry.key.text.len() >= SUPERSEDED
                         && entry.key.text.len() < text.len()
                         && text.starts_with(&*entry.key.text)
@@ -788,6 +822,41 @@ mod tests {
     use zgui::{rich_text::TextRun, text_layout::LineHeight};
 
     #[test]
+    fn wrapped_and_unwrapped_cache_entries_keep_kerning_and_alignment_separate() {
+        use zgui::text_layout::{FontFamily, TextAlign};
+        let mut fonts = crate::text::kerning_test_fonts();
+        let text: Arc<str> = "add/send.".into();
+        let font = FontStyle {
+            family: FontFamily::Named("Geist".into()),
+            line_height: LineHeight::px(17.),
+            align: TextAlign::Center,
+            ..Default::default()
+        };
+        let mut cache = TextCache::default();
+        let whole = cache.measure_plain(&mut fonts, &text, 13., &font, None);
+        let wrapped = cache.measure_plain(&mut fonts, &text, 13., &font, Some(200.));
+        assert!((wrapped.0 - whole.0 - 0.52).abs() < 0.002);
+        let shaped = cache.shaped;
+        for _ in 0..2 {
+            let laid = cache.layout_plain_unwrapped(&mut fonts, &text, 13., &font, 200.);
+            let row = laid.runs(None).next().unwrap();
+            assert!((row.glyphs[0].x - (200. - whole.0) / 2.).abs() < 0.002);
+            let laid = cache.layout_plain(&mut fonts, &text, 13., &font, Some(200.));
+            let row = laid.runs(None).next().unwrap();
+            assert!((row.glyphs[0].x - (200. - wrapped.0) / 2.).abs() < 0.002);
+        }
+        assert_eq!(
+            cache.shaped, shaped,
+            "each mode hits its own prepared entry"
+        );
+        assert_eq!(
+            cache.entries.len(),
+            2,
+            "streaming donor must retain the other mode"
+        );
+    }
+
+    #[test]
     fn alternating_font_styles_keep_distinct_prepared_entries() {
         use zgui::text_layout::{FontFamily, LetterSpacing};
         let mut fonts = FontSystem::new();
@@ -837,6 +906,7 @@ mod tests {
                 text: payload,
                 spans: vec![(0..1024, font, 14.)],
                 caret_row: false,
+                unwrapped: false,
             },
             lines: None,
             compact: None,
@@ -928,7 +998,7 @@ mod tests {
                 .count()
                 >= 3
         );
-        assert_eq!(cache.shaped, texts.len() as u64);
+        assert_eq!(cache.shaped, 2 * texts.len() as u64);
     }
 
     #[test]

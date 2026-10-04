@@ -866,6 +866,11 @@ pub trait Styled: Sized {
         self.styles_mut().line_height = Some(crate::text_layout::LineHeight::px(pixels));
         self
     }
+    /// Rounded line advance with the unrounded natural glyph baseline.
+    fn line_height_rounded(mut self, pixels: f32) -> Self {
+        self.styles_mut().line_height = Some(crate::text_layout::LineHeight::rounded_px(pixels));
+        self
+    }
     /// Reset inherited line spacing to the normal metric for each text size.
     fn line_height_normal(mut self) -> Self {
         self.styles_mut().line_height = Some(crate::text_layout::LineHeight::NORMAL);

@@ -1202,6 +1202,29 @@ mod tests {
     use super::*;
     use zgui::scene::{Effects, Layout, NodeKind, Style, Transform};
     #[test]
+    fn nearest_image_cells_stay_crisp_at_fractional_origin() {
+        let image = std::sync::Arc::new(
+            zgui::image::ImageData::new(2, 1, vec![0, 0, 0, 255, 255, 255, 255, 255])
+                .unwrap()
+                .sampled(zgui::image::ImageSampling::Nearest),
+        );
+        let mut scene = Scene::new(3., 1.);
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Image(image),
+            Style {
+                width: Some(2.),
+                height: Some(1.),
+                ..Default::default()
+            },
+        );
+        scene.set_transform(node, Transform { x: 0.5, y: 0. });
+        let mut raster = Raster::new(3, 1);
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        assert_eq!(raster.pixels[1] & 0xffffff, 0xffffff);
+    }
+    #[test]
     fn affine_mattes_reuse_pixels_until_content_changes_and_prune_removed_nodes() {
         use zgui::affine::Affine;
         let mut scene = Scene::new(100., 100.);

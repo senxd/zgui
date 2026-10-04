@@ -172,12 +172,32 @@ pub fn set_buffer_text(
     font: &zgui::text_layout::FontStyle,
     size: f32,
 ) {
+    let shaping = shaping(buffer.size().0.is_none());
+    set_buffer_text_shaping(fonts, buffer, text, font, size, shaping);
+}
+
+pub(crate) fn shaping(unwrapped: bool) -> Shaping {
+    if unwrapped {
+        Shaping::AdvancedUnwrapped
+    } else {
+        Shaping::Advanced
+    }
+}
+
+pub(crate) fn set_buffer_text_shaping(
+    fonts: &mut FontSystem,
+    buffer: &mut Buffer,
+    text: &str,
+    font: &zgui::text_layout::FontStyle,
+    size: f32,
+    shaping: Shaping,
+) {
     let base = attrs(font, size);
     if font.fallbacks.is_empty() {
-        buffer.set_text(text, &base, Shaping::Advanced, alignment(font));
+        buffer.set_text(text, &base, shaping, alignment(font));
     } else {
         let spans = fallback_spans(fonts, text, font, base.clone());
-        buffer.set_rich_text(spans, &base, Shaping::Advanced, alignment(font));
+        buffer.set_rich_text(spans, &base, shaping, alignment(font));
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +244,7 @@ impl ShapedText {
                 "",
                 cosmic_text::LineEnding::None,
                 cosmic_text::AttrsList::new(&attrs(font, size)),
-                Shaping::Advanced,
+                shaping(width.is_none()),
             ));
             buffer.lines.last_mut().unwrap().set_align(alignment(font));
         }
@@ -266,7 +286,7 @@ impl ShapedText {
                 "",
                 cosmic_text::LineEnding::None,
                 cosmic_text::AttrsList::new(&attrs(&font.font, font.font_size)),
-                Shaping::Advanced,
+                shaping(width.is_none()),
             ));
             buffer
                 .lines
@@ -583,6 +603,243 @@ pub type RichRaster = (
     Vec<(i32, i32, zgui::scene::Color, cosmic_text::SwashImage)>,
     Vec<RichDecoration>,
 );
+
+/// Snap the logical line baseline, preserving mark offsets and node/DPI phases.
+pub(crate) fn glyph_y(glyph: &cosmic_text::LayoutGlyph, baseline: f32) -> f32 {
+    glyph.y - glyph.font_size * glyph.y_offset + baseline.round()
+}
+
+fn raster_glyph(glyph: &cosmic_text::LayoutGlyph, baseline: f32) -> cosmic_text::PhysicalGlyph {
+    raster_glyph_scaled(glyph, baseline, 1.)
+}
+
+fn raster_glyph_scaled(
+    glyph: &cosmic_text::LayoutGlyph,
+    baseline: f32,
+    scale: f32,
+) -> cosmic_text::PhysicalGlyph {
+    let original = glyph.physical((0., 0.), scale);
+    let (cache_key, x, y) = cosmic_text::CacheKey::new(
+        glyph.font_id,
+        glyph.glyph_id,
+        glyph.font_size * scale,
+        (
+            (glyph.x + glyph.font_size * glyph.x_offset) * scale,
+            glyph_y(glyph, baseline) * scale,
+        ),
+        glyph.font_weight,
+        original.cache_key.flags,
+    );
+    cosmic_text::PhysicalGlyph { cache_key, x, y }
+}
+
+#[cfg(test)]
+pub(crate) fn kerning_test_fonts() -> FontSystem {
+    let mut db = cosmic_text::fontdb::Database::new();
+    db.load_font_data(
+        include_bytes!("../../../vendor/cosmic-text/tests/fonts/Geist-kerning.ttf").to_vec(),
+    );
+    FontSystem::new_with_locale_and_db("en-US".into(), db)
+}
+
+#[cfg(test)]
+mod unwrapped_tests {
+    use super::*;
+    use cosmic_text::{CacheKey, CacheKeyFlags};
+    use zgui::text_layout::{FontFamily, FontStyle, LineHeight};
+
+    fn font() -> FontStyle {
+        FontStyle {
+            family: FontFamily::Named("Geist".into()),
+            line_height: LineHeight::px(17.),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unwrapped_slash_keeps_kerning_and_wrapped_slash_keeps_its_break() {
+        let mut fonts = kerning_test_fonts();
+        let text = "add/send.";
+        let mut whole = plain_buffer_unshaped(&mut fonts, text, 13., &font(), true);
+        whole.shape_until_scroll(&mut fonts, false);
+        let whole_glyphs = whole.layout_runs().next().unwrap().glyphs.to_vec();
+        let mut wrapped = plain_buffer_unshaped(&mut fonts, text, 13., &font(), false);
+        wrapped.set_size(Some(200.), None);
+        wrapped.shape_until_scroll(&mut fonts, false);
+        let wrapped_glyphs = wrapped.layout_runs().next().unwrap().glyphs.to_vec();
+        for byte in 4..text.len() {
+            let a = whole_glyphs.iter().find(|g| g.start == byte).unwrap();
+            let b = wrapped_glyphs.iter().find(|g| g.start == byte).unwrap();
+            assert!((b.x - a.x - 0.52).abs() < 0.002, "byte {byte}");
+        }
+        wrapped.set_size(Some(32.), None);
+        wrapped.shape_until_scroll(&mut fonts, false);
+        let rows: Vec<_> = wrapped.layout_runs().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].glyphs.last().unwrap().start, 3, "wrap after slash");
+        assert_eq!(rows[1].glyphs.first().unwrap().start, 4);
+    }
+
+    #[test]
+    fn cpu_raster_key_preserves_mark_offset_after_logical_baseline_rounding() {
+        let mut fonts = kerning_test_fonts();
+        let mut buffer = plain_buffer_unshaped(&mut fonts, "a", 13., &font(), true);
+        buffer.shape_until_scroll(&mut fonts, false);
+        let mut glyph = buffer.layout_runs().next().unwrap().glyphs[0].clone();
+        glyph.y = 0.125;
+        glyph.y_offset = 0.01;
+        let y = glyph_y(&glyph, 10.905);
+        assert!((y - 10.995).abs() < 0.0001);
+        let raster = raster_glyph(&glyph, 10.905);
+        let expected = cosmic_text::SubpixelBin::new(y);
+        assert_eq!((raster.y, raster.cache_key.y_bin), expected);
+    }
+
+    #[test]
+    fn cpu_fractional_y_phase_moves_glyph_ink_down() {
+        let mut fonts = kerning_test_fonts();
+        let mut buffer = plain_buffer_unshaped(&mut fonts, "a", 12., &font(), true);
+        buffer.shape_until_scroll(&mut fonts, false);
+        let run = buffer.layout_runs().next().unwrap();
+        let glyph = raster_glyph(&run.glyphs[0], run.line_y);
+        let mut swash = cosmic_text::SwashCache::new();
+        for flags in [CacheKeyFlags::empty(), CacheKeyFlags::PIXEL_FONT] {
+            let mut first = None;
+            for phase in [0., 0.25, 0.5, 0.75] {
+                let (key, _, baseline) = CacheKey::new(
+                    glyph.cache_key.font_id,
+                    glyph.cache_key.glyph_id,
+                    f32::from_bits(glyph.cache_key.font_size_bits),
+                    (glyph.x as f32, glyph.y as f32 + phase),
+                    glyph.cache_key.font_weight,
+                    flags,
+                );
+                let image = swash.get_image_uncached(&mut fonts, key).unwrap();
+                assert_eq!(image.content, cosmic_text::SwashContent::Mask);
+                let mut mass = 0.;
+                let mut moment = 0.;
+                for (index, &alpha) in image.data.iter().enumerate() {
+                    let y = baseline as f32 - image.placement.top as f32
+                        + (index / image.placement.width as usize) as f32
+                        + 0.5;
+                    mass += alpha as f32;
+                    moment += alpha as f32 * y;
+                }
+                assert!(mass > 0.);
+                let centroid = moment / mass;
+                let zero = *first.get_or_insert(centroid);
+                let expected = if flags.contains(CacheKeyFlags::PIXEL_FONT) {
+                    phase.round()
+                } else {
+                    phase
+                };
+                assert!(
+                    (centroid - zero - expected).abs() < 0.04,
+                    "{flags:?}, Y phase {phase}: centroid {centroid}, zero {zero}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_line_advance_keeps_natural_baseline_in_cpu_and_gpu_at_all_dpis() {
+        use zgui::rich_text::{RichText, TextRun};
+        let mut raster = CpuTextRaster {
+            fonts: kerning_test_fonts(),
+            swash: cosmic_text::SwashCache::new(),
+        };
+        for (size, height, baseline, pitch) in [
+            (12.5, LineHeight::rounded_px(12.5 * 1.3), 13., 16.),
+            (12.5, LineHeight::px(16.), 12., 16.),
+            (12.5, LineHeight::px(18.), 13., 18.),
+            (13., LineHeight::rounded_px(13. * 1.3), 13., 17.),
+            (22., LineHeight::rounded_px(22. * 1.3), 22., 29.),
+        ] {
+            let style = FontStyle {
+                line_height: height,
+                ..font()
+            };
+            let content = "M\nM";
+            let rich = RichText::new(
+                content,
+                vec![TextRun {
+                    range: 0..content.len(),
+                    font: style.clone(),
+                    font_size: size,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            let mut buffer = plain_buffer_unshaped(&mut raster.fonts, content, size, &style, true);
+            buffer.shape_until_scroll(&mut raster.fonts, false);
+            let starts = line_starts(&buffer);
+            let rich_buffer = rich_buffer(&mut raster.fonts, &rich, Some(200.), Some(100.));
+            for scale in [1., 1.5, 2.] {
+                let gpu = crate::glyphs_of(buffer.layout_runs(), &starts, None, &style, scale);
+                let rich_gpu = crate::glyphs_of(
+                    rich_buffer.layout_runs(),
+                    &line_starts(&rich_buffer),
+                    Some(&rich),
+                    &style,
+                    scale,
+                );
+                let cpu = raster.rasterize_scaled(content, size, 200., 100., &style, scale, true);
+                assert_eq!(gpu.len(), 2);
+                assert_eq!(cpu.len(), 2);
+                for (row, ((glyph, rich_glyph), image)) in
+                    gpu.iter().zip(&rich_gpu).zip(&cpu).enumerate()
+                {
+                    let expected = (baseline + row as f32 * pitch) * scale;
+                    assert!(
+                        (glyph.y - expected).abs() < 0.001,
+                        "{size}px {height:?} row {row} at {scale}x: {} vs {expected}",
+                        glyph.y
+                    );
+                    assert_eq!(glyph.y, rich_glyph.y);
+                    assert_eq!(image.1, cosmic_text::SubpixelBin::new(expected).0);
+                }
+            }
+            let plain = raster.rasterize(content, size, 200., 100., &style);
+            let (rich_images, _) = raster.rasterize_rich(&rich, 200., 100.);
+            assert_eq!(plain.len(), rich_images.len());
+            for (plain, rich) in plain.iter().zip(&rich_images) {
+                assert_eq!((plain.0, plain.1), (rich.0, rich.1));
+                assert_eq!(plain.2.data, rich.3.data);
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_scaled_raster_rounds_logical_baselines_and_keeps_unwrapped_kerning() {
+        let mut raster = CpuTextRaster {
+            fonts: kerning_test_fonts(),
+            swash: cosmic_text::SwashCache::new(),
+        };
+        for (size, line_height, scale, baseline) in [(13., 17., 1.5, 19), (22., 29., 2., 44)] {
+            let style = FontStyle {
+                line_height: LineHeight::px(line_height),
+                ..font()
+            };
+            let images = raster.rasterize_scaled("a", size, 200., 80., &style, scale, true);
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].1, baseline);
+        }
+        let mut buffer = plain_buffer_unshaped(&mut raster.fonts, "a", 13., &font(), true);
+        buffer.shape_until_scroll(&mut raster.fonts, false);
+        let run = buffer.layout_runs().next().unwrap();
+        let physical = raster_glyph_scaled(&run.glyphs[0], run.line_y, 1.5);
+        assert_eq!(physical.cache_key.y_bin, cosmic_text::SubpixelBin::Two);
+
+        let whole = raster.rasterize_scaled("add/send.", 13., 200., 80., &font(), 4., true);
+        let wrapped = raster.rasterize_scaled("add/send.", 13., 200., 80., &font(), 4., false);
+        assert_eq!(whole.len(), 9);
+        assert_eq!(wrapped.len(), 9);
+        for (a, b) in whole[4..].iter().zip(&wrapped[4..]) {
+            assert!((2..=3).contains(&(b.0 - a.0)), "cross-slash kerning at 4x");
+        }
+    }
+}
+
 impl CpuTextRaster {
     pub fn register_font(&mut self, font: &FontData) {
         font.install(&mut self.fonts);
@@ -598,14 +855,13 @@ impl CpuTextRaster {
         let mut images = Vec::new();
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
-                let p = glyph.physical((0., 0.), 1.);
+                let rich_run = &rich.runs()[run_at(rich, starts[run.line_i] + glyph.start)];
+                let p = raster_glyph(
+                    glyph,
+                    run.line_y + rich_run.font.line_height.baseline_offset(),
+                );
                 if let Some(image) = self.swash.get_image_uncached(&mut self.fonts, p.cache_key) {
-                    images.push((
-                        p.x,
-                        p.y + run.line_y as i32,
-                        rich.runs()[run_at(rich, starts[run.line_i] + glyph.start)].color,
-                        image,
-                    ));
+                    images.push((p.x, p.y, rich_run.color, image));
                 }
             }
         }
@@ -619,23 +875,37 @@ impl CpuTextRaster {
         height: f32,
         font: &zgui::text_layout::FontStyle,
     ) -> Vec<(i32, i32, cosmic_text::SwashImage)> {
-        let size = size.max(1.);
-        let mut buffer = Buffer::new(
-            &mut self.fonts,
-            Metrics::new(size, font.line_height.resolve(size)),
-        );
+        self.rasterize_scaled(text, size, width, height, font, 1., false)
+    }
+
+    /// Shape in logical coordinates, then rasterize at the requested DPI scale.
+    /// Baseline snapping happens before scaling, matching the GPU text path.
+    pub fn rasterize_scaled(
+        &mut self,
+        text: &str,
+        size: f32,
+        width: f32,
+        height: f32,
+        font: &zgui::text_layout::FontStyle,
+        scale: f32,
+        unwrapped: bool,
+    ) -> Vec<(i32, i32, cosmic_text::SwashImage)> {
+        let mut buffer = plain_buffer_unshaped(&mut self.fonts, text, size, font, unwrapped);
         buffer.set_size(Some(width), Some(height));
-        set_buffer_text(&mut self.fonts, &mut buffer, text, font, size);
         buffer.shape_until_scroll(&mut self.fonts, false);
         let mut images = Vec::new();
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
-                let physical = glyph.physical((0., 0.), 1.);
+                let physical = raster_glyph_scaled(
+                    glyph,
+                    run.line_y + font.line_height.baseline_offset(),
+                    scale,
+                );
                 if let Some(image) = self
                     .swash
                     .get_image_uncached(&mut self.fonts, physical.cache_key)
                 {
-                    images.push((physical.x, physical.y + run.line_y as i32, image));
+                    images.push((physical.x, physical.y, image));
                 }
             }
         }
@@ -1154,6 +1424,18 @@ pub fn display_buffer(
     rich_buffer(fonts, &rich, width, height)
 }
 /// Shared native mixed-run shaping used for measurement and rasterization.
+pub(crate) fn rich_buffer_unwrapped(
+    fonts: &mut FontSystem,
+    rich: &zgui::rich_text::RichText,
+    width: f32,
+    height: f32,
+) -> Buffer {
+    let mut buffer = rich_buffer_unshaped(fonts, rich, false, true);
+    buffer.set_size(Some(width), Some(height));
+    buffer.shape_until_scroll(fonts, false);
+    buffer
+}
+
 fn rich_buffer_raw(
     fonts: &mut FontSystem,
     rich: &zgui::rich_text::RichText,
@@ -1161,7 +1443,7 @@ fn rich_buffer_raw(
     height: Option<f32>,
     ellipsis: bool,
 ) -> Buffer {
-    let mut buffer = rich_buffer_unshaped(fonts, rich, ellipsis);
+    let mut buffer = rich_buffer_unshaped(fonts, rich, ellipsis, width.is_none());
     buffer.set_size(width, height);
     buffer.shape_until_scroll(fonts, false);
     buffer
@@ -1174,21 +1456,29 @@ pub(crate) fn plain_buffer_unshaped(
     text: &str,
     font_size: f32,
     font: &zgui::text_layout::FontStyle,
+    unwrapped: bool,
 ) -> Buffer {
     let size = font_size.max(1.);
     let mut buffer = Buffer::new(fonts, Metrics::new(size, font.line_height.resolve(size)));
-    set_buffer_text(fonts, &mut buffer, text, font, size);
+    if unwrapped {
+        buffer.set_wrap(cosmic_text::Wrap::None);
+    }
+    set_buffer_text_shaping(fonts, &mut buffer, text, font, size, shaping(unwrapped));
     buffer
 }
 pub(crate) fn rich_buffer_unshaped(
     fonts: &mut FontSystem,
     rich: &zgui::rich_text::RichText,
     ellipsis: bool,
+    unwrapped: bool,
 ) -> Buffer {
     let base = rich.runs().first();
     let size = base.map_or(1., |run| run.font_size.max(1.));
     let line_height = base.map_or(1., |run| run.font.line_height.resolve(size));
     let mut buffer = Buffer::new(fonts, Metrics::new(size, line_height));
+    if unwrapped {
+        buffer.set_wrap(cosmic_text::Wrap::None);
+    }
     let default_font = zgui::text_layout::FontStyle::default();
     let default_attrs = attrs(base.map_or(&default_font, |run| &run.font), size);
     let mut spans = Vec::new();
@@ -1234,7 +1524,7 @@ pub(crate) fn rich_buffer_unshaped(
     buffer.set_rich_text(
         spans,
         &default_attrs,
-        Shaping::Advanced,
+        shaping(unwrapped),
         alignment(base.map_or(&default_font, |run| &run.font)),
     );
     buffer
@@ -1594,9 +1884,10 @@ pub fn rich_decorations_in<'a>(
                         strike: false,
                     });
                 }
+                let baseline = line.line_y + run.font.line_height.baseline_offset();
                 for (decoration, y, strike) in [
-                    (run.underline, line.line_y + run.font_size * 0.1, false),
-                    (run.strikethrough, line.line_y - run.font_size * 0.3, true),
+                    (run.underline, baseline + run.font_size * 0.1, false),
+                    (run.strikethrough, baseline - run.font_size * 0.3, true),
                 ] {
                     if let Some(style) = decoration {
                         output.push(RichDecoration {

@@ -12,7 +12,14 @@ pub(crate) fn next_identity() -> Result<u64, &'static str> {
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| "image identity exhausted")
 }
-#[derive(Debug)]
+/// Texture filtering at paint time. Pixel art and ordered dither use nearest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageSampling {
+    #[default]
+    Linear,
+    Nearest,
+}
+#[derive(Clone, Debug)]
 pub struct ImageData {
     id: u64,
     width: u32,
@@ -21,6 +28,7 @@ pub struct ImageData {
     procedural: Option<Arc<ProceduralImage>>,
     chain: Option<Arc<FilteredImage>>,
     transform: crate::affine::Affine,
+    sampling: ImageSampling,
 }
 /// A compute shader producing premultiplied RGBA8, with a lazy straight-alpha
 /// fallback for software consumers. Binding 0 is a read-only f32 storage buffer;
@@ -61,6 +69,7 @@ impl ImageData {
             procedural: None,
             chain: None,
             transform: crate::affine::Affine::IDENTITY,
+            sampling: ImageSampling::default(),
         })
     }
     pub fn id(&self) -> u64 {
@@ -112,6 +121,7 @@ impl ImageData {
             })),
             chain: None,
             transform: crate::affine::Affine::IDENTITY,
+            sampling: ImageSampling::default(),
         })
     }
     /// Share decoded pixels and GPU upload identity with a different paint
@@ -126,6 +136,7 @@ impl ImageData {
             pixels: self.pixels.clone(),
             procedural: self.procedural.clone(),
             chain: self.chain.clone(),
+            sampling: self.sampling,
             transform: if transform.is_finite() {
                 transform
             } else {
@@ -135,6 +146,16 @@ impl ImageData {
     }
     pub fn transform(&self) -> crate::affine::Affine {
         self.transform
+    }
+    pub fn sampling(&self) -> ImageSampling {
+        self.sampling
+    }
+    /// Change filtering while sharing decoded pixels and GPU upload identity.
+    pub fn sampled(&self, sampling: ImageSampling) -> Self {
+        Self {
+            sampling,
+            ..self.clone()
+        }
     }
     pub fn paint_transform(&self, bounds: crate::scene::Rect) -> crate::affine::Affine {
         if self.transform == crate::affine::Affine::IDENTITY {
@@ -157,7 +178,7 @@ impl ImageData {
 }
 impl PartialEq for ImageData {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.transform == other.transform
+        self.id == other.id && self.transform == other.transform && self.sampling == other.sampling
     }
 }
 impl Eq for ImageData {}

@@ -86,6 +86,7 @@ impl EffectChain {
             pixels: Arc::new(OnceLock::new()),
             procedural: None,
             transform: input.transform,
+            sampling: input.sampling,
             chain: Some(Arc::new(FilteredImage {
                 instance: self.id,
                 input,

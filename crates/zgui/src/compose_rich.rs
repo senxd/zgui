@@ -112,6 +112,10 @@ impl TextSpan {
         self.styles.line_height = Some(LineHeight::px(px));
         self
     }
+    pub fn line_height_rounded(mut self, px: f32) -> Self {
+        self.styles.line_height = Some(LineHeight::rounded_px(px));
+        self
+    }
     pub fn letter_spacing(mut self, px: f32) -> Self {
         self.styles.letter_spacing = Some(LetterSpacing::px(px));
         self

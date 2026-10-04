@@ -22,3 +22,4 @@ codegen-units = 1
 # See vendor/wgpu-hal/ZGUI_PATCH.md.
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }
+cosmic-text = { path = "vendor/cosmic-text" }

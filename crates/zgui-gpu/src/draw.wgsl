@@ -76,7 +76,17 @@ fn shade(v:Out)->vec4<f32> {
    else {let aa=shape_pixel_width(q,v.point);let outer=clamp(0.5-distance/aa,0.,1.);let inner=clamp(0.5-(distance+v.shape.y)/aa,0.,1.);let alpha=color.a*inner+v.border.a*(outer-inner);let rgb=select(vec3(0.),(color.rgb*color.a*inner+v.border.rgb*v.border.a*(outer-inner))/max(alpha,0.00001),alpha>0.);color=vec4(rgb,alpha);}
  }
 
- if v.options.y>0.5 {let tex=textureSample(atlas,tex_sampler,v.uv);let rgb=select(tex.rgb,tex.rgb/max(tex.a,0.00001),v.options.y>1.5);color=vec4(color.rgb*rgb,color.a*tex.a);}
+ if v.options.y>0.5 {
+   var tex=textureSample(atlas,tex_sampler,v.uv);
+   if v.options.y>1.5 && v.options.w>0.5 {
+     let size=vec2<i32>(textureDimensions(atlas));
+     // Interpolated UVs can undershoot exact texel boundaries at half-pixel
+     // origins. Keep adjacent ordered cells stable across those roundoff ties.
+     let cell=clamp(vec2<i32>(floor(v.uv*vec2<f32>(size)+vec2(0.00001))),vec2<i32>(0),size-vec2<i32>(1));
+     tex=textureLoad(atlas,cell,0);
+   }
+   let rgb=select(tex.rgb,tex.rgb/max(tex.a,0.00001),v.options.y>1.5);color=vec4(color.rgb*rgb,color.a*tex.a);
+ }
  var edge_y=v.point.y;var edge_bounds=v.fade;
  if geometry.metadata.w==2u {edge_y=paint_point(geometry.inverse,v.world).y;edge_bounds=geometry.bounds;}
  if v.options.x>0. {let distance=min(edge_y-edge_bounds.y,edge_bounds.y+edge_bounds.w-edge_y); color.a*=clamp(distance/v.options.x,0.,1.);}

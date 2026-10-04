@@ -1,4 +1,4 @@
-use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, CacheKey, Family, Metrics, Shaping, SwashCache};
 use std::sync::Arc;
 use zgui::{
     scene::*,
@@ -90,9 +90,23 @@ fn text_matches_direct_device_grid_raster_at_fractional_origins() {
             let mut swash = SwashCache::new();
             for run in buffer.layout_runs() {
                 for glyph in run.glyphs {
-                    let p =
-                        glyph.physical((bounds.x * scale, (bounds.y + run.line_y) * scale), scale);
-                    let Some(image) = swash.get_image_uncached(&mut fonts, p.cache_key) else {
+                    // Snap the logical line baseline before DPI scaling. Keep
+                    // mark offsets and the final node origin's subpixel phase.
+                    let flags = glyph.physical((0., 0.), scale).cache_key.flags;
+                    let (key, baseline_x, baseline_y) = CacheKey::new(
+                        glyph.font_id,
+                        glyph.glyph_id,
+                        glyph.font_size * scale,
+                        (
+                            (glyph.x + glyph.font_size * glyph.x_offset) * scale + bounds.x * scale,
+                            (glyph.y - glyph.font_size * glyph.y_offset + run.line_y.round())
+                                * scale
+                                + bounds.y * scale,
+                        ),
+                        glyph.font_weight,
+                        flags,
+                    );
+                    let Some(image) = swash.get_image_uncached(&mut fonts, key) else {
                         continue;
                     };
                     assert_eq!(
@@ -101,8 +115,8 @@ fn text_matches_direct_device_grid_raster_at_fractional_origins() {
                     );
                     for gy in 0..image.placement.height as usize {
                         for gx in 0..image.placement.width as usize {
-                            let x = p.x + image.placement.left + gx as i32;
-                            let y = p.y - image.placement.top + gy as i32;
+                            let x = baseline_x + image.placement.left + gx as i32;
+                            let y = baseline_y - image.placement.top + gy as i32;
                             if x < 0 || y < 0 || x >= WIDTH as i32 || y >= HEIGHT as i32 {
                                 continue;
                             }
