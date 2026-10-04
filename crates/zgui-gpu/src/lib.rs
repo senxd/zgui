@@ -662,7 +662,9 @@ impl Glyph {
             self.key.font_id,
             self.key.glyph_id,
             f32::from_bits(self.key.font_size_bits),
-            (self.x + origin.0, (self.y + origin.1).trunc()),
+            // Hint the final baseline to the nearest physical pixel. Flooring
+            // it biases fractional font sizes upward (the 12.5px menu rows).
+            (self.x + origin.0, (self.y + origin.1).round()),
             self.key.font_weight,
             self.key.flags,
         )
