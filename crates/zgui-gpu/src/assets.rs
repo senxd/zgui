@@ -43,6 +43,16 @@ pub fn decode_image(bytes: &[u8]) -> Result<Arc<ImageData>, GpuError> {
 /// Rasterize an SVG at the requested physical size. External resources are disabled.
 /// SVG text needs conversion to outlines; the lightweight SVG dependency disables fonts.
 pub fn decode_svg(bytes: &[u8], width: u32, height: u32) -> Result<Arc<ImageData>, GpuError> {
+    decode_svg_at(bytes, width, height, [width as f32, height as f32, 0., 0.])
+}
+/// Rasterize at the exact device-space size and fractional origin, leaving
+/// transparent padding instead of scaling the rounded allocation back down.
+pub(crate) fn decode_svg_at(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    geometry: [f32; 4],
+) -> Result<Arc<ImageData>, GpuError> {
     if bytes.len() > 4 * 1024 * 1024
         || width == 0
         || height == 0
@@ -58,9 +68,13 @@ pub fn decode_svg(bytes: &[u8], width: u32, height: u32) -> Result<Arc<ImageData
         resvg::usvg::Tree::from_data(bytes, &options).map_err(|e| GpuError(e.to_string()))?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| GpuError("SVG image allocation failed".into()))?;
-    let transform = resvg::tiny_skia::Transform::from_scale(
-        width as f32 / tree.size().width(),
-        height as f32 / tree.size().height(),
+    let transform = resvg::tiny_skia::Transform::from_row(
+        geometry[0] / tree.size().width(),
+        0.,
+        0.,
+        geometry[1] / tree.size().height(),
+        geometry[2],
+        geometry[3],
     );
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     let mut pixels = pixmap.take();

@@ -493,8 +493,8 @@ fn glyphs_of<'a>(
                         .map(|c| zgui::scene::Color(c.r(), c.g(), c.b(), c.a())),
                 },
                 run: run_index,
-                x: p.x as f32,
-                y: p.y as f32 + run.line_y * scale,
+                x: (glyph.x + glyph.font_size * glyph.x_offset) * scale,
+                y: (glyph.y - glyph.font_size * glyph.y_offset + run.line_y) * scale,
             });
         }
     }
@@ -656,6 +656,18 @@ struct Glyph {
     x: f32,
     y: f32,
 }
+impl Glyph {
+    fn at(&self, origin: (f32, f32)) -> (CacheKey, i32, i32) {
+        CacheKey::new(
+            self.key.font_id,
+            self.key.glyph_id,
+            f32::from_bits(self.key.font_size_bits),
+            (self.x + origin.0, (self.y + origin.1).trunc()),
+            self.key.font_weight,
+            self.key.flags,
+        )
+    }
+}
 struct Shaped {
     rich: Option<Arc<zgui::rich_text::RichText>>,
     text_options: zgui::text_layout::TextOptions,
@@ -668,6 +680,8 @@ struct Shaped {
     glyphs: Vec<Glyph>,
     quads: Vec<Quad>,
     atlas_epoch: u64,
+    /// Fractional physical node origin used for the cached glyph rasters.
+    raster_origin: (f32, f32),
     last_used: u64,
     /// The prepared text these glyphs were laid out from, kept while drawn.
     prepared: Option<u64>,
@@ -1962,6 +1976,12 @@ impl GpuRenderer {
         let root = scene.bounds(id);
         if let Some(cache) = self.layers.get_mut(&id)
             && cache.revision == revision
+            && [root.x - cache.root_origin.0, root.y - cache.root_origin.1]
+                .into_iter()
+                .all(|delta| {
+                    let pixels = delta * self.scale;
+                    (pixels - pixels.round()).abs() < 1e-3
+                })
         {
             cache.bounds.x += root.x - cache.root_origin.0;
             cache.bounds.y += root.y - cache.root_origin.1;
@@ -1969,13 +1989,18 @@ impl GpuRenderer {
             stats.layer_cache_hits += 1;
             return Ok(());
         }
-        // A transparent texel border lets linear sampling preserve fractional
-        // translation coverage instead of clamping opaque edge pixels.
+        // Align the layer to device pixels so compositing does not resample
+        // already-antialiased text/icons. Fractional movement repaints above;
+        // whole-pixel movement can still reuse the retained texture.
         let bounds = scene.layer_bounds(id).expand(1. / self.scale);
-        let x = bounds.x;
-        let y = bounds.y;
-        let width = (bounds.width * self.scale).ceil().max(1.) as u32;
-        let height = (bounds.height * self.scale).ceil().max(1.) as u32;
+        let x = (bounds.x * self.scale).floor() / self.scale;
+        let y = (bounds.y * self.scale).floor() / self.scale;
+        let width = (((bounds.x + bounds.width) * self.scale).ceil()
+            - (bounds.x * self.scale).floor())
+        .max(1.) as u32;
+        let height = (((bounds.y + bounds.height) * self.scale).ceil()
+            - (bounds.y * self.scale).floor())
+        .max(1.) as u32;
         let bounds = Rect::new(x, y, width as f32 / self.scale, height as f32 / self.scale);
         let items = scene.layer_items(Some(id));
         for item in &items {
@@ -2455,7 +2480,10 @@ impl GpuRenderer {
                         return Err(GpuError("panel exceeds 32 shadows".into()));
                     }
                     for shadow in style.shadows() {
-                        let core = bounds.expand(shadow.spread.max(0.));
+                        let core = bounds.expand(shadow.spread);
+                        if core.width <= 0. || core.height <= 0. {
+                            continue;
+                        }
                         let core = Rect::new(
                             core.x + shadow.offset.x,
                             core.y + shadow.offset.y,
@@ -2470,7 +2498,7 @@ impl GpuRenderer {
                             fade: [core.x, core.y, core.width, core.height],
                             options: [0., 0., 0., 1.],
                             shape: [
-                                style.radius + shadow.spread.max(0.),
+                                (style.radius + shadow.spread).max(0.),
                                 0.,
                                 shadow.blur_radius.max(0.001),
                                 0.,
@@ -2479,7 +2507,7 @@ impl GpuRenderer {
                                 style,
                                 core.width,
                                 core.height,
-                                shadow.spread.max(0.),
+                                shadow.spread,
                             ),
                             mask: NO_MASK,
                         });
@@ -2565,9 +2593,17 @@ impl GpuRenderer {
                         continue;
                     }
                     let before = self.svgs.rasterizations();
-                    let image =
-                        self.svgs
-                            .get(item.id, svg, bounds.width, bounds.height, self.scale)?;
+                    let (image, raster_bounds) = if svg.transform()
+                        == zgui::affine::Affine::IDENTITY
+                    {
+                        self.svgs.get_at(item.id, svg, bounds, self.scale)?
+                    } else {
+                        (
+                            self.svgs
+                                .get(item.id, svg, bounds.width, bounds.height, self.scale)?,
+                            bounds,
+                        )
+                    };
                     stats.svg_rasterizations += (self.svgs.rasterizations() - before) as usize;
                     // Nodes share SVG rasters: `prune` releases their textures
                     // once no node shows them (a new source prunes).
@@ -2605,7 +2641,12 @@ impl GpuRenderer {
                             [0., 0., 1., 1.]
                         };
                     quads.push(Quad {
-                        rect: fade,
+                        rect: [
+                            raster_bounds.x,
+                            raster_bounds.y,
+                            raster_bounds.width,
+                            raster_bounds.height,
+                        ],
                         uv,
                         color: [1., 1., 1., item.effects.opacity],
                         fade,
@@ -2871,6 +2912,7 @@ impl GpuRenderer {
                             glyphs,
                             quads: Vec::new(),
                             atlas_epoch: 0,
+                            raster_origin: (f32::NAN, f32::NAN),
                             last_used: self.frame,
                             prepared,
                         };
@@ -2880,7 +2922,11 @@ impl GpuRenderer {
                     }
                     let mut shaped = self.shapes.remove(&item.id).unwrap();
                     self.shaped_bytes -= shaped.bytes();
-                    if shaped.atlas_epoch != self.atlas_epoch {
+                    let origin = (
+                        (bounds.x * self.scale).rem_euclid(1.),
+                        (bounds.y * self.scale).rem_euclid(1.),
+                    );
+                    if shaped.atlas_epoch != self.atlas_epoch || shaped.raster_origin != origin {
                         shaped.quads.clear();
                         shaped.quads.extend(
                             shaped
@@ -2890,11 +2936,15 @@ impl GpuRenderer {
                                 .map(rich_decoration_quad),
                         );
                         for glyph in &shaped.glyphs {
-                            if let Some(a) = self.glyph(glyph.key, &mut stats)? {
+                            // Rasterize at the final physical phase. Translating an
+                            // antialiased bitmap by a fraction of a pixel blurs it
+                            // again; include the baseline before vertical hinting.
+                            let (key, x, y) = glyph.at(origin);
+                            if let Some(a) = self.glyph(key, &mut stats)? {
                                 shaped.quads.push(Quad {
                                     rect: [
-                                        (glyph.x + a.left as f32) / self.scale,
-                                        (glyph.y - a.top as f32) / self.scale,
+                                        (x as f32 + a.left as f32 - origin.0) / self.scale,
+                                        (y as f32 - a.top as f32 - origin.1) / self.scale,
                                         a.width as f32 / self.scale,
                                         a.height as f32 / self.scale,
                                     ],
@@ -2921,6 +2971,7 @@ impl GpuRenderer {
                                 .map(rich_decoration_quad),
                         );
                         shaped.atlas_epoch = self.atlas_epoch;
+                        shaped.raster_origin = origin;
                         stats.geometry_rebuilds += 1;
                     }
                     for cached in &shaped.quads {
