@@ -137,7 +137,7 @@ impl EditorHandle {
         if !scene.contains(self.node) {
             return;
         }
-        let bounds = scene.bounds(self.node);
+        let bounds = scene.layout_bounds(self.node);
         let next = (
             Rect::new(0., 0., bounds.width, bounds.height),
             scene.style(self.node),
@@ -330,6 +330,7 @@ impl EditorDrag {
         self.generation.set(self.generation.get().wrapping_add(1));
     }
 }
+type PaintTransforms = (crate::affine::Affine, crate::affine::Affine);
 struct UiStorage {
     runtime: Runtime,
     text_geometry_revision: Signal<u64>,
@@ -346,7 +347,7 @@ struct UiStorage {
     content_sizes: RefCell<HashMap<NodeId, Signal<(f32, f32)>>>,
     observed_bounds: RefCell<HashMap<NodeId, Signal<Rect>>>,
     observed_layout_bounds: RefCell<HashMap<NodeId, Signal<Option<Rect>>>>,
-    projected_layout: RefCell<std::collections::HashSet<NodeId>>,
+    observed_paint: RefCell<HashMap<NodeId, Signal<PaintTransforms>>>,
     observed_visibility: RefCell<HashMap<NodeId, Signal<bool>>>,
     mount_initialization: RefCell<Option<Rc<MountInitialization>>>,
     interaction: RefCell<Option<InteractionDeadline>>,
@@ -458,7 +459,7 @@ impl Ui {
             content_sizes: RefCell::new(HashMap::new()),
             observed_bounds: RefCell::new(HashMap::new()),
             observed_layout_bounds: RefCell::new(HashMap::new()),
-            projected_layout: RefCell::default(),
+            observed_paint: RefCell::default(),
             observed_visibility: RefCell::new(HashMap::new()),
             mount_initialization: RefCell::new(None),
             interaction: RefCell::new(None),
@@ -830,18 +831,28 @@ impl Ui {
 
                 InputEvent::PointerDown {
                     x,
+                    y,
                     button: PointerButton::Primary,
                     ..
                 } => {
+                    let scene = scene.borrow();
+                    let Some((x, _)) = scene.world_to_local(root, *x, *y) else {
+                        return;
+                    };
                     dragging = true;
-                    let x = *x;
                     cx.capture_pointer();
-                    let (origin, width) = slider_content_bounds(&scene.borrow(), root);
+                    let (origin, width) = slider_content_bounds(&scene, root);
+                    drop(scene);
                     value.set(at_position(x, origin, width));
                 }
-                InputEvent::PointerMove { x, .. } if dragging => {
-                    let (origin, width) = slider_content_bounds(&scene.borrow(), root);
-                    value.set(at_position(*x, origin, width));
+                InputEvent::PointerMove { x, y } if dragging => {
+                    let scene = scene.borrow();
+                    let Some((x, _)) = scene.world_to_local(root, *x, *y) else {
+                        return;
+                    };
+                    let (origin, width) = slider_content_bounds(&scene, root);
+                    drop(scene);
+                    value.set(at_position(x, origin, width));
                 }
                 InputEvent::PointerUp {
                     button: PointerButton::Primary,
@@ -982,16 +993,63 @@ impl Ui {
     }
     /// Layout-only allocation. None until the next settled layout publication;
     /// paint translations and ancestor scrolling do not invalidate this signal.
-    pub(crate) fn mark_layout_projected(&self, node: NodeId) {
-        self.storage.projected_layout.borrow_mut().insert(node);
+    fn observe_paint_transforms(&self, node: NodeId) -> Signal<PaintTransforms> {
+        if let Some(signal) = self.storage.observed_paint.borrow().get(&node) {
+            return signal.clone();
+        }
+        let value = {
+            let scene = self.scene.borrow();
+            (
+                scene.local_paint_transform(node),
+                scene.local_user_transform(node),
+            )
+        };
+        let signal = self.signal(value);
+        self.storage
+            .observed_paint
+            .borrow_mut()
+            .insert(node, signal.clone());
+        self.storage.bounds_geometry_revision.set(None);
+        signal
     }
-    pub(crate) fn projected_ancestor_bounds(&self, node: NodeId) -> Option<(NodeId, Rect)> {
-        let projected = self.storage.projected_layout.borrow();
+    pub(crate) fn publish_paint_transform(&self, node: NodeId) {
+        let signal = self.storage.observed_paint.borrow().get(&node).cloned();
+        if let Some(signal) = signal {
+            let value = {
+                let scene = self.scene.borrow();
+                (
+                    scene.local_paint_transform(node),
+                    scene.local_user_transform(node),
+                )
+            };
+            signal.set(value);
+        }
+    }
+    /// Inverse inherited projection in the correct user-transform coordinate frame.
+    /// Only observed ancestors own signals, and every publication is change-deduped.
+    pub(crate) fn ancestor_layout_compensation(&self, node: NodeId) -> crate::affine::Affine {
+        use crate::affine::Affine;
+        let parent = self.scene.borrow().parent(node);
+        let mut current = parent;
+        let mut projected = false;
+        while let Some(ancestor) = current {
+            let (full, user) = self.observe_paint_transforms(ancestor).get();
+            projected |= full != user;
+            self.observe_layout_bounds(ancestor).get();
+            current = self.scene.borrow().parent(ancestor);
+        }
+        if !projected {
+            return Affine::IDENTITY;
+        }
         let scene = self.scene.borrow();
-        scene
-            .ancestors(node)
-            .find(|id| projected.contains(id))
-            .map(|id| (id, scene.layout_bounds(id)))
+        parent
+            .and_then(|parent| {
+                scene
+                    .world_paint_transform(parent)
+                    .inverse()
+                    .map(|inverse| scene.world_user_transform(parent).then(inverse))
+            })
+            .unwrap_or(Affine::IDENTITY)
     }
     pub fn observe_layout_bounds(&self, node: NodeId) -> Signal<Option<Rect>> {
         if let Some(signal) = self.storage.observed_layout_bounds.borrow().get(&node) {
@@ -1129,9 +1187,35 @@ impl Ui {
             } else {
                 Vec::new()
             };
+            let paint: Vec<_> = if geometry_changed {
+                let scene = self.scene.borrow();
+                self.storage
+                    .observed_paint
+                    .borrow()
+                    .iter()
+                    .filter(|(node, _)| scene.contains(**node))
+                    .map(|(node, signal)| {
+                        (
+                            *node,
+                            signal.clone(),
+                            (
+                                scene.local_paint_transform(*node),
+                                scene.local_user_transform(*node),
+                            ),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // Publish outside every storage/scene borrow: geometry subscribers can
             // mount, dispose, translate, or reenter frame preparation.
             self.runtime.batch(|| {
+                for (node, signal, paint) in paint {
+                    if self.scene.borrow().contains(node) {
+                        signal.set(paint);
+                    }
+                }
                 for (node, signal, bounds) in layout_bounds {
                     if self.scene.borrow().contains(node) {
                         signal.set(bounds);
@@ -1374,7 +1458,7 @@ impl Ui {
             self.storage.content_sizes.borrow_mut().remove(&id);
             self.storage.observed_bounds.borrow_mut().remove(&id);
             self.storage.observed_layout_bounds.borrow_mut().remove(&id);
-            self.storage.projected_layout.borrow_mut().remove(&id);
+            self.storage.observed_paint.borrow_mut().remove(&id);
             self.storage.observed_visibility.borrow_mut().remove(&id);
             self.input.unregister(id);
             self.semantics.borrow_mut().remove(id);
@@ -1552,7 +1636,7 @@ impl Ui {
                 return;
             }
             s.prepare_layout();
-            let bounds = s.bounds(root);
+            let bounds = s.layout_bounds(root);
             let root_style = s.style(root);
             *draw_geometry.borrow_mut() = Some((
                 Rect::new(0., 0., bounds.width, bounds.height),
@@ -1827,7 +1911,7 @@ impl Ui {
                 if !s.contains(root) {
                     return;
                 }
-                let bounds = s.bounds(viewport);
+                let bounds = s.layout_bounds(viewport);
                 let offset = *scroll.borrow();
                 let (_, size, font) = typography.borrow().clone();
                 let mut edit = editor.borrow_mut();
@@ -1841,9 +1925,12 @@ impl Ui {
                     &font,
                 );
                 let (px, py) = gesture.pointer.get();
+                let Some((px, py)) = s.world_to_local(viewport, px, py) else {
+                    return;
+                };
                 // Hit the visible edge, not an arbitrarily distant text row.
-                let x = (px - bounds.x).clamp(0., bounds.width.max(0.)) + offset.0;
-                let y = (py - bounds.y).clamp(0., (bounds.height - 0.01).max(0.)) + offset.1;
+                let x = px.clamp(0., bounds.width.max(0.)) + offset.0;
+                let y = py.clamp(0., (bounds.height - 0.01).max(0.)) + offset.1;
                 let hit = layout.hit_position(x, y);
                 let (anchor, focus) = match mode {
                     EditorPointerSelection::Character(anchor) => (anchor, hit),
@@ -1881,18 +1968,21 @@ impl Ui {
                 if !s.contains(viewport) || gesture.mode.get().is_none() {
                     return (0., 0.);
                 }
-                let bounds = s.bounds(viewport);
-                let point = gesture.pointer.get();
+                let bounds = s.layout_bounds(viewport);
+                let (x, y) = gesture.pointer.get();
+                let Some(point) = s.world_to_local(viewport, x, y) else {
+                    return (0., 0.);
+                };
                 let offset = *scroll.borrow();
                 let limit = limits.get();
                 (
                     if wrap.get() {
                         0.
                     } else {
-                        editor_drag_velocity(point.0, bounds.x, bounds.width, offset.0, limit.0)
+                        editor_drag_velocity(point.0, 0., bounds.width, offset.0, limit.0)
                     },
                     if multiline {
-                        editor_drag_velocity(point.1, bounds.y, bounds.height, offset.1, limit.1)
+                        editor_drag_velocity(point.1, 0., bounds.height, offset.1, limit.1)
                     } else {
                         0.
                     },
@@ -2100,10 +2190,11 @@ impl Ui {
                     y,
                     button: PointerButton::Primary,
                 } => {
+                    let s = scene.borrow();
+                    let Some((local_x, local_y)) = s.world_to_local(viewport, x, y) else { return; };
                     cx.capture_pointer();
                     gesture.pointer.set((x, y));
-                    let s = scene.borrow();
-                    let bounds = s.bounds(viewport);
+                    let bounds = s.layout_bounds(viewport);
                     let scroll = *scroll.borrow();
                     let (_, size, font) = typography.borrow().clone();
                     let mut edit = editor.borrow_mut();
@@ -2111,8 +2202,8 @@ impl Ui {
                         &input_storage, &s, root, edit.text(), size,
                         wrap.get().then_some(bounds.width.max(1.)), &font,
                     );
-                    let x = x - bounds.x + scroll.0;
-                    let y = y - bounds.y + scroll.1;
+                    let x = local_x + scroll.0;
+                    let y = local_y + scroll.1;
                     let hit = layout.hit_position(x, y);
                     let mode = if cx.pointer_modifiers().shift {
                         EditorPointerSelection::Character(edit.selection().anchor)
@@ -2192,7 +2283,7 @@ impl Ui {
                             root,
                             e.text(),
                             size,
-                            Some(s.bounds(viewport).width.max(1.)),
+                            Some(s.layout_bounds(viewport).width.max(1.)),
                             &font,
                         );
                         let old = position.get();
@@ -2258,7 +2349,7 @@ impl Ui {
                                     root,
                                     e.text(),
                                     size,
-                                    wrap.get().then_some(s.bounds(viewport).width.max(1.)),
+                                    wrap.get().then_some(s.layout_bounds(viewport).width.max(1.)),
                                     &font,
                                 );
                                 let old = position.get();
@@ -2284,7 +2375,7 @@ impl Ui {
                                     let pitch = if caret.height.is_finite() && caret.height > 0. {
                                         f64::from(caret.height)
                                     } else { 1. };
-                                    let height = s.bounds(viewport).height;
+                                    let height = s.layout_bounds(viewport).height;
                                     let height = if height.is_finite() { f64::from(height.max(0.)) } else { pitch };
                                     let lines = ((height / pitch).floor() - 1.).max(1.);
                                     let origin = if caret.y.is_finite() { f64::from(caret.y) } else { 0. };
@@ -2659,7 +2750,7 @@ mod ownership_tests {
 }
 
 fn allocated_content_size(scene: &Scene, node: NodeId) -> (f32, f32) {
-    let bounds = scene.bounds(node);
+    let bounds = scene.layout_bounds(node);
     let padding = scene.padding(node);
     (
         (bounds.width - padding.left - padding.right).max(0.),
@@ -2832,10 +2923,10 @@ mod layout_feedback_tests {
 }
 
 fn slider_content_bounds(scene: &Scene, root: NodeId) -> (f32, f32) {
-    let bounds = scene.bounds(root);
+    let bounds = scene.layout_bounds(root);
     let padding = scene.padding(root);
     (
-        bounds.x + padding.left,
+        padding.left,
         (bounds.width - padding.left - padding.right).max(0.),
     )
 }

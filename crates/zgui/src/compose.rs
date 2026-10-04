@@ -280,6 +280,7 @@ pub struct View {
     menu_checked: Option<bool>,
     visibility: Vec<Signal<bool>>,
     layout_motion: Option<crate::motion::Transition>,
+    layout_id: Option<String>,
     scroll_progress: Option<Signal<f32>>,
 }
 impl View {
@@ -359,6 +360,7 @@ impl View {
             menu_checked: None,
             visibility: Vec::new(),
             layout_motion: None,
+            layout_id: None,
             scroll_progress: None,
         }
     }
@@ -373,11 +375,22 @@ impl View {
         self.visibility.push(visible);
         self
     }
-    /// Translate from the previous layout position without laying out each frame.
+    /// Project from previous layout position and size without per-frame layout.
     /// Size changes apply immediately; this projects position only.
     pub fn layout_motion(mut self, transition: crate::motion::Transition) -> Self {
         transition.validate();
         self.layout_motion = Some(transition);
+        self
+    }
+    /// Match an earlier mount inside an explicit SharedLayoutScope provider.
+    /// Combine with layout_motion to choose its transition.
+    pub fn layout_id(mut self, id: impl Into<String>) -> Self {
+        let id = id.into();
+        assert!(
+            !id.is_empty() && id.len() <= 256,
+            "layout ID needs 1..=256 bytes"
+        );
+        self.layout_id = Some(id);
         self
     }
     /// Publish normalized progress using the scroll view's measured extent.
@@ -498,6 +511,7 @@ impl View {
     fn refine(self, mut inner: View) -> View {
         inner.visibility.extend(self.visibility);
         inner.layout_motion = self.layout_motion.or(inner.layout_motion);
+        inner.layout_id = self.layout_id.or(inner.layout_id);
         inner.scroll_progress = self.scroll_progress.or(inner.scroll_progress);
         if self.trigger_id.is_some() {
             inner.trigger_id = self.trigger_id;
@@ -1909,11 +1923,12 @@ fn mount_element(
     let image_fit = is_image.then(|| ui.signal(crate::style::ObjectFit::default()));
     let projection = view.layout_motion.map(|transition| {
         let mut cx = Context::new(ui.runtime.clone(), environment.clone());
-        let point = crate::motion::MotionPoint::new(&mut cx, crate::motion::Vec2::default());
-        let signal = crate::motion::project_layout(ui, root, point, transition);
+        let signal =
+            crate::motion::project_layout(ui, root, &mut cx, transition, view.layout_id.take());
         cx.finish(ui, root);
         signal
     });
+    assert!(view.layout_id.is_none(), "layout_id requires layout_motion");
     environment.typography = mount_style_with_intrinsic(
         ui,
         root,
@@ -2263,8 +2278,14 @@ fn mount_scroll(
                 if !scene.contains(cx.target) || !scene.contains(viewport) {
                     return;
                 }
-                let target = scene.bounds(cx.target);
-                let visible = scene.bounds(viewport);
+                let Some(inverse) = scene.world_paint_transform(viewport).inverse() else {
+                    return;
+                };
+                let target = scene
+                    .world_paint_transform(cx.target)
+                    .then(inverse)
+                    .bounds(scene.layout_bounds(cx.target));
+                let visible = scene.layout_bounds(viewport);
                 let (target_start, target_size, visible_start, visible_size) = if horizontal {
                     (target.x, target.width, visible.x, visible.width)
                 } else {
@@ -2706,14 +2727,15 @@ fn mount_slider(
         {
             return;
         }
-        let at_position = |x: f32| {
+        let at_position = |x: f32, y: f32| {
             let scene = scene.borrow();
-            let bounds = scene.bounds(rail);
+            let bounds = scene.layout_bounds(rail);
+            let (x, _) = scene.world_to_local(rail, x, y)?;
             if bounds.width <= 0. {
-                return min as f32;
+                return Some(min as f32);
             }
-            let fraction = ((x as f64 - bounds.x as f64) / bounds.width as f64).clamp(0., 1.);
-            (min + fraction * span).clamp(min, max) as f32
+            let fraction = (x as f64 / bounds.width as f64).clamp(0., 1.);
+            Some((min + fraction * span).clamp(min, max) as f32)
         };
         let step =
             |direction: f64| (value.get() as f64 + direction * span / 100.).clamp(min, max) as f32;
@@ -2735,16 +2757,20 @@ fn mount_slider(
             },
             InputEvent::PointerDown {
                 x,
+                y,
                 button: PointerButton::Primary,
                 ..
             } => {
-                let x = *x;
+                let next = at_position(*x, *y);
+                if next.is_none() {
+                    return;
+                }
                 dragging = true;
                 cx.focus();
                 cx.capture_pointer();
-                Some(at_position(x))
+                next
             }
-            InputEvent::PointerMove { x, .. } if dragging => Some(at_position(*x)),
+            InputEvent::PointerMove { x, y } if dragging => at_position(*x, *y),
             InputEvent::PointerUp {
                 button: crate::input::PointerButton::Primary,
                 ..
@@ -2894,8 +2920,8 @@ pub mod prelude {
     pub use crate::motion::{
         AnimationGroup, Completion, DragMotion, Easing, Interpolate, Keyframe, Keyframes,
         MotionAxis, MotionColor, MotionError, MotionInspector, MotionPoint, MotionPolicy,
-        MotionStates, MotionValue, Playback, Presence, Repeat, ScrollProgress, Spring, Timeline,
-        Transition, Vec2,
+        MotionStates, MotionValue, Playback, Presence, Repeat, ScrollProgress, SharedLayoutScope,
+        Spring, Timeline, Transition, Vec2,
     };
     pub use crate::rich_text::Decoration;
     pub use crate::style::{ObjectFit, Styled, Styles, rgb, rgba};

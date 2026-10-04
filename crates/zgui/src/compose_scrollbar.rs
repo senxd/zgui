@@ -62,17 +62,19 @@ pub(crate) fn mount(
         let thumb_length = (length * length / total.max(1.)).max(24.).min(length);
         let travel = (length - thumb_length).max(0.);
         let position = match cx.event {
-            InputEvent::PointerDown { x, y, .. } | InputEvent::PointerMove { x, y } => {
-                let bounds = scene.borrow().bounds(track);
-                Some(if horizontal {
-                    x as f64 - bounds.x as f64
-                } else {
-                    y as f64 - bounds.y as f64
-                })
-            }
+            InputEvent::PointerDown { x, y, .. } | InputEvent::PointerMove { x, y } => scene
+                .borrow()
+                .world_to_local(track, x, y)
+                .map(|(x, y)| if horizontal { x as f64 } else { y as f64 }),
             _ => None,
         };
-        if position.is_some_and(|position| !position.is_finite()) {
+        if position.is_some_and(|position| !position.is_finite())
+            || (position.is_none()
+                && matches!(
+                    cx.event,
+                    InputEvent::PointerDown { .. } | InputEvent::PointerMove { .. }
+                ))
+        {
             return;
         }
         let before = event_offset.get() as f64;

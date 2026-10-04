@@ -171,8 +171,22 @@ pub struct EventContext {
     click_count: u8,
     drag_request: Option<DragRequest>,
     drag_accepted: Option<NodeId>,
+    scene: Weak<RefCell<Scene>>,
 }
 impl EventContext {
+    /// Pointer position in the listener's parent's layout coordinates. Excludes
+    /// the listener's own animated translation, so dragging cannot feed back.
+    pub fn pointer_in_parent(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let scene = self.scene.upgrade()?;
+        let scene = scene.borrow();
+        if !scene.contains(self.current_target) {
+            return None;
+        }
+        match scene.parent(self.current_target) {
+            Some(parent) => scene.world_to_local(parent, x, y),
+            None => Some((x, y)),
+        }
+    }
     /// Request a typed drag from this listener during a pointer move.
     /// Start a drag from this pointer move; the current position is the grab point.
     pub fn start_drag<T: 'static>(&mut self, payload: T) {
@@ -963,6 +977,7 @@ impl InputDispatcher {
             click_count,
             drag_request: None,
             drag_accepted: None,
+            scene: Rc::downgrade(scene),
         };
         let phases = path
             .iter()

@@ -92,10 +92,47 @@ Reopening with `set_present(true, enter)` cancels earlier exit removal and
 retargets current progress. Presence controls painting lifetime; applications
 still manage modal focus, pointer interaction, and accessibility as appropriate.
 
-Translation and opacity use the retained style fast path. Width/height still
-perform layout, and expensive procedural image work remains expensive. Prefer
-paint properties for feedback and entrances. Position projection, drag/snap input and bounded timelines are described below.
-General scene scale/rotation is outside this API.
+Translation, scale, rotation and opacity use the retained paint fast path.
+Width/height still perform layout, and expensive procedural image work remains
+expensive. Prefer paint properties for feedback and entrances. Layout projection,
+drag/snap input and bounded timelines are described below.
+
+## Subtree paint transforms
+
+`.scale(x, y)` and `.rotate(radians)` transform a view and its descendants,
+including text, decoration, images and nested clips. `.transform_origin(x, y)`
+uses normalized fractions of the local layout size, defaulting to `(0.5, 0.5)`.
+The pivot follows resize. Fractions outside `0..=1` permit an external pivot;
+all arguments must be finite. Negative scale reflects geometry; zero scale
+is singular and does not receive pointer hits. Rotation is clockwise in screen
+coordinates, where positive Y points down.
+
+Layout projection acts in the allocation's axes first. Scale and rotation use
+the projected normalized origin, followed by translation and ancestor transforms.
+Nested projection compensates the complete ancestor matrix, including user
+rotation and nonuniform scale. Method call order changes property precedence
+rather than matrix order. The same methods work on reactive `Styles`:
+
+```rust,no_run
+use zgui::compose::prelude::*;
+let view = component(|cx| {
+    let hover = cx.motion_value(0.0);
+    let progress = hover.signal();
+    let target = hover.clone();
+    button().child("Tilt").transform_origin(0.5, 0.5)
+        .on_click(move || { target.animate_to(1.0, Transition::spring(Spring::default())); })
+        .reactive_style(move || {
+            let p = progress.get();
+            Styles::new().scale(1.0 + 0.05 * p, 1.0 + 0.05 * p).rotate(0.1 * p)
+        })
+});
+```
+
+These are paint transforms: layout allocation, text wrapping and scroll extent
+do not change. Hit tests and pointer-driven controls map through the inverse
+subtree transform. `Scene::layout_bounds` reads allocation; `Scene::bounds`
+reads transformed world coverage. Literal matrices remain available through
+`Scene::set_paint_transform`, independently of layout projection.
 
 Run correctness checks with `cargo test -p zgui motion`. The ignored release
 benchmark reports scheduling and reactive-consumer cost without claiming GPU
@@ -212,17 +249,57 @@ completion. Derived signals do not request frames.
 ## Layout, input and named states
 
 `.layout_motion(Transition::spring(Spring::default()))` opts a retained view
-into position projection. New layout applies once, then its previous visual
-position translates to the final position. Size changes apply immediately;
-projection composes with base/hover transforms and nested projected ancestors.
+into position and size projection. New layout applies once, then four owned
+scalar channels animate its displayed rectangle to that allocation. Frames
+change only paint matrices, including during resize. A retarget starts from
+the current displayed rectangle and preserves spring velocity. Child projections
+compensate ancestor projections, so nested positions and sizes do not animate
+twice. User scale/rotation and hover transforms remain independent paint styles.
 Layout observation excludes all paint transforms, including scroll offsets,
 so animation frames do not trigger layout or restart the projection. Keep
 identity with `keyed` when reordering rows. Newly mounted or hidden views begin
-at their settled layout; this is not shared-element or size morphing.
+at their settled layout unless they have an explicit shared-layout ID. Zero
+allocation dimensions skip division; their empty geometry remains finite.
+Reduced motion settles all projection channels immediately.
+
+`SharedLayoutScope::new(cx)` creates a component-owned namespace. Provide it
+around the region, then combine `.layout_id("card")` with `.layout_motion(...)`
+to continue from an earlier mount's projected layout rectangle:
+
+```rust,no_run
+use std::time::Duration;
+use zgui::compose::prelude::*;
+let view = component(|cx| {
+    let scope = SharedLayoutScope::new(cx);
+    let expanded = cx.state(false);
+    let toggle = expanded.clone();
+    provide(scope, column()
+        .child(button().child("Resize / remount").on_click(move || {
+            toggle.update(|value| *value = !*value);
+        }))
+        .child(switch(move || expanded.get(), |expanded, _| {
+            div().layout_id("card")
+                .layout_motion(Transition::tween(Duration::from_millis(240), Easing::EaseOut))
+                .size(if expanded { 240.0 } else { 100.0 }, 80.0)
+                .bg(rgb(0x718aff))
+        })))
+});
+```
+
+IDs are 1..=256 bytes and local to the scope and reactive runtime. A scope
+retains at most 128 IDs; `scope.forget(id)` releases an unmounted snapshot.
+The newest mount owns an ID while older exits may remain mounted. Generation
+leases keep old cleanup from clearing the replacement. Removing the provider
+owner clears snapshots and invalidates retained scope handles. No global
+registry, timer or additional frame task is involved. Shared layout transfers
+the projected layout rectangle; user rotation, color and content changes are
+controlled separately, and the application owns presence/crossfade lifetime.
 
 `DragMotion::new(cx, initial, MotionAxis::X, 0.0..=360.0)?` binds direct pointer
 input with `.bind(view)`. `.snap_points([0.0, 180.0, 360.0])?` selects the nearest
 point to a 150 ms velocity projection on release; `.spring(...)` tunes settling.
+Bound gestures use the parent's local axes, including scaled/rotated ancestors,
+so the dragged view's own animated translation does not feed back into input.
 The output signal is clamped to bounds while the underlying spring preserves
 velocity. Primary pointer capture keeps dragging outside the view; secondary
 release does not end it. Cancel/focus loss/disposal stop the gesture. Manual

@@ -30,7 +30,7 @@ pub use inspector::{
 #[path = "motion_bindings.rs"]
 mod bindings;
 pub(crate) use bindings::project_layout;
-pub use bindings::{DragMotion, MotionAxis, MotionStates, ScrollProgress};
+pub use bindings::{DragMotion, MotionAxis, MotionStates, ScrollProgress, SharedLayoutScope};
 pub use tracks::{
     AnimationGroup, Interpolate, Keyframe, Keyframes, MotionColor, MotionError, MotionPoint,
     Playback, Repeat, Timeline, Vec2,

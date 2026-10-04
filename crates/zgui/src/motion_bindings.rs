@@ -173,20 +173,29 @@ impl DragMotion {
             if event.phase == EventPhase::Capture {
                 return;
             }
-            let coordinate = |x, y| if drag.axis == MotionAxis::X { x } else { y };
+            let coordinate = |x, y| {
+                event
+                    .pointer_in_parent(x, y)
+                    .map(|(x, y)| if drag.axis == MotionAxis::X { x } else { y })
+            };
             match event.event {
                 InputEvent::PointerDown {
                     x,
                     y,
                     button: PointerButton::Primary,
                 } if !event.default_prevented() && !event.capture_requested() => {
-                    if drag.begin(coordinate(x, y), Instant::now()) {
+                    if coordinate(x, y).is_some_and(|pointer| drag.begin(pointer, Instant::now())) {
                         event.capture_pointer();
                         event.prevent_default();
                     }
                 }
                 InputEvent::PointerMove { x, y } if drag.dragging() => {
-                    drag.update(coordinate(x, y), Instant::now());
+                    if let Some(pointer) = coordinate(x, y) {
+                        drag.update(pointer, Instant::now());
+                    } else {
+                        drag.cancel();
+                        event.release_pointer();
+                    }
                     event.prevent_default();
                 }
                 InputEvent::PointerUp {
@@ -194,7 +203,11 @@ impl DragMotion {
                     y,
                     button: PointerButton::Primary,
                 } if drag.dragging() => {
-                    drag.release(coordinate(x, y), Instant::now());
+                    if let Some(pointer) = coordinate(x, y) {
+                        drag.release(pointer, Instant::now());
+                    } else {
+                        drag.cancel();
+                    }
                     event.release_pointer();
                     event.prevent_default();
                 }
@@ -291,61 +304,214 @@ impl<K: Clone + Eq + 'static> MotionStates<K> {
     }
 }
 
+/// Explicit component-owned namespace for up to 128 shared layout IDs.
+/// A replacement continues from the previous mount's projected layout rectangle;
+/// user scale/rotation remain independent paint styles, not shared-layout tracks.
+#[derive(Clone)]
+pub struct SharedLayoutScope(Rc<SharedLayouts>);
+struct SharedLayouts {
+    runtime: Runtime,
+    alive: Cell<bool>,
+    next: Cell<u64>,
+    entries: RefCell<std::collections::HashMap<String, SharedLayoutEntry>>,
+}
+struct SharedLayoutEntry {
+    generation: u64,
+    mounted: bool,
+    bounds: Option<crate::scene::Rect>,
+}
+struct SharedLayoutOwner(Rc<SharedLayouts>);
+impl Drop for SharedLayoutOwner {
+    fn drop(&mut self) {
+        self.0.alive.set(false);
+        self.0.entries.borrow_mut().clear();
+    }
+}
+impl SharedLayoutScope {
+    pub fn new(cx: &mut Context) -> Self {
+        let inner = Rc::new(SharedLayouts {
+            runtime: cx.runtime(),
+            alive: Cell::new(true),
+            next: Cell::new(0),
+            entries: RefCell::default(),
+        });
+        cx.retain(SharedLayoutOwner(inner.clone()));
+        Self(inner)
+    }
+    /// Release an unmounted ID's retained snapshot. Active IDs cannot be forgotten.
+    pub fn forget(&self, id: &str) -> bool {
+        let mut entries = self.0.entries.borrow_mut();
+        if entries.get(id).is_some_and(|entry| !entry.mounted) {
+            entries.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+    fn register(
+        &self,
+        cx: &mut Context,
+        id: String,
+    ) -> (SharedLayoutLease, Option<crate::scene::Rect>) {
+        assert!(self.0.alive.get(), "shared layout scope is disposed");
+        assert!(
+            self.0.runtime.same(&cx.runtime()),
+            "shared layout scope spans reactive runtimes"
+        );
+        let generation = self
+            .0
+            .next
+            .get()
+            .checked_add(1)
+            .expect("shared layout generation exhausted");
+        self.0.next.set(generation);
+        let previous = {
+            let mut entries = self.0.entries.borrow_mut();
+            assert!(
+                entries.contains_key(&id) || entries.len() < 128,
+                "shared layout scope exceeds 128 IDs; forget unmounted IDs"
+            );
+            let previous = entries.get(&id).and_then(|entry| entry.bounds);
+            entries.insert(
+                id.clone(),
+                SharedLayoutEntry {
+                    generation,
+                    mounted: true,
+                    bounds: previous,
+                },
+            );
+            previous
+        };
+        let lease = SharedLayoutLease {
+            scope: Rc::downgrade(&self.0),
+            id,
+            generation,
+        };
+        cx.retain(SharedLayoutLease {
+            scope: lease.scope.clone(),
+            id: lease.id.clone(),
+            generation,
+        });
+        (lease, previous)
+    }
+}
+struct SharedLayoutLease {
+    scope: Weak<SharedLayouts>,
+    id: String,
+    generation: u64,
+}
+impl SharedLayoutLease {
+    fn record(&self, bounds: crate::scene::Rect) {
+        if let Some(scope) = self.scope.upgrade().filter(|s| s.alive.get()) {
+            let mut entries = scope.entries.borrow_mut();
+            if let Some(entry) = entries
+                .get_mut(&self.id)
+                .filter(|e| e.generation == self.generation)
+            {
+                entry.bounds = Some(bounds);
+            }
+        }
+    }
+}
+impl Drop for SharedLayoutLease {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.upgrade() {
+            let mut entries = scope.entries.borrow_mut();
+            if let Some(entry) = entries
+                .get_mut(&self.id)
+                .filter(|e| e.generation == self.generation)
+            {
+                entry.mounted = false;
+            }
+        }
+    }
+}
+
 pub(crate) fn project_layout(
     ui: &mut crate::widgets::Ui,
     node: crate::scene::NodeId,
-    point: MotionPoint,
+    cx: &mut Context,
     transition: Transition,
-) -> Signal<Vec2> {
-    ui.mark_layout_projected(node);
+    id: Option<String>,
+) -> Signal<crate::affine::Affine> {
+    use crate::{affine::Affine, scene::Rect};
+    let position = MotionPoint::new(cx, Vec2::default());
+    let size = MotionPoint::new(cx, Vec2::default());
+    let (lease, mut seed) = if let Some(id) = id {
+        let scope = cx.service::<SharedLayoutScope>();
+        let (lease, seed) = scope.register(cx, id);
+        (Some(lease), seed)
+    } else {
+        (None, None)
+    };
     let bounds = ui.observe_layout_bounds(node);
-    let ancestor_bounds = ui
-        .projected_ancestor_bounds(node)
-        .map(|(id, _)| ui.observe_layout_bounds(id));
-    let signal = point.signal();
+    let output = ui.signal(Affine::IDENTITY);
+    let (p, s) = (position.clone(), size.clone());
+    let layout = bounds.clone();
     let runtime = ui.runtime.clone();
-    let weak = ui.downgrade();
     let mut previous = None;
     ui.bind(node, move || {
-        if let Some(ancestor) = &ancestor_bounds {
-            ancestor.get();
-        }
-        let Some(bounds) = bounds.get() else {
+        let Some(bounds) = layout.get() else {
             previous = None;
-            point.set(Vec2::default());
+            runtime.batch(|| {
+                p.x.stop();
+                p.y.stop();
+                s.x.stop();
+                s.y.stop();
+            });
             return;
         };
-        let Some(ui) = weak.upgrade() else { return };
-        if !ui.scene.borrow().contains(node) || !ui.scene.borrow().layout_visible(node) {
-            previous = None;
+        if previous == Some(bounds) {
             return;
         }
-        let ancestor = ui.projected_ancestor_bounds(node);
-        let old = previous.replace((bounds, ancestor));
-        if let Some((old, old_ancestor)) = old {
-            let current = point.signal().with_untracked(|v| *v);
-            // World layout displacement is already inherited from the nearest
-            // projected ancestor. Subtract it so nested nodes move only once.
-            let (ax, ay) = match (old_ancestor, ancestor) {
-                (Some((old_id, old)), Some((new_id, new))) if old_id == new_id => {
-                    (old.x as f64 - new.x as f64, old.y as f64 - new.y as f64)
-                }
-                _ => (0., 0.),
-            };
-            let dx = old.x as f64 - bounds.x as f64 - ax;
-            let dy = old.y as f64 - bounds.y as f64 - ay;
-            let delta = Vec2::new(
-                finite_scalar(current.x as f64 + dx),
-                finite_scalar(current.y as f64 + dy),
-            );
-            if dx != 0. || dy != 0. {
-                runtime.batch(|| {
-                    point.x.set_with_velocity(delta.x, point.x.velocity());
-                    point.y.set_with_velocity(delta.y, point.y.velocity());
-                    point.animate_to(Vec2::default(), transition);
-                });
+        let initialized = previous.replace(bounds).is_some();
+        runtime.batch(|| {
+            if !initialized {
+                let start = seed.take().unwrap_or(bounds);
+                p.set(Vec2::new(start.x, start.y));
+                s.set(Vec2::new(start.width, start.height));
             }
-        }
+            p.animate_to(Vec2::new(bounds.x, bounds.y), transition);
+            s.animate_to(Vec2::new(bounds.width, bounds.height), transition);
+        });
     });
-    signal
+    let weak = ui.downgrade();
+    let result = output.clone();
+    let (p, s) = (position.signal(), size.signal());
+    ui.bind(node, move || {
+        if weak.upgrade().is_none() {
+            return;
+        }
+        let Some(bounds) = bounds.get() else {
+            result.set(Affine::IDENTITY);
+            return;
+        };
+        let (p, s) = (p.get(), s.get());
+        let visual = Rect::new(p.x, p.y, s.x.max(0.), s.y.max(0.));
+        if let Some(lease) = &lease {
+            lease.record(visual);
+        }
+        let ratio = |current: f32, final_size: f32| {
+            if final_size > 0. {
+                finite_scalar(current as f64 / final_size as f64)
+            } else {
+                1.
+            }
+        };
+        let desired = Affine::translation(-bounds.x, -bounds.y)
+            .then(Affine::scale(
+                ratio(visual.width, bounds.width),
+                ratio(visual.height, bounds.height),
+            ))
+            .then(Affine::translation(visual.x, visual.y));
+        let local = Affine::translation(bounds.x, bounds.y)
+            .then(desired)
+            .then(Affine::translation(-bounds.x, -bounds.y));
+        result.set(if local.is_finite() {
+            local
+        } else {
+            Affine::IDENTITY
+        });
+    });
+    output
 }

@@ -172,8 +172,8 @@ pub(crate) fn mount_links(
         focus: Rc<Cell<bool>>,
         hover: Rc<Cell<bool>>,
     }
-    let bounds = ui.observe_bounds(paragraph);
-    let owner_bounds = ui.observe_bounds(owner);
+    let bounds = ui.observe_layout_bounds(paragraph);
+    let owner_bounds = ui.observe_layout_bounds(owner);
     let engine = ui.observe_text_geometry_revision();
     let weak = ui.downgrade();
     let mut mounted: Vec<Mounted> = Vec::new();
@@ -190,6 +190,9 @@ pub(crate) fn mount_links(
         if !ui.scene.borrow().contains(owner) {
             return;
         }
+        let (Some(bounds), Some(owner_bounds)) = (bounds, owner_bounds) else {
+            return;
+        };
         let key = (
             data.rich.clone(),
             bounds.width.to_bits(),

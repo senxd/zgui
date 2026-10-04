@@ -241,6 +241,84 @@ fn link_geometry_reuses_shape_until_text_width_or_backend_changes() {
 }
 
 #[test]
+fn affine_paint_keeps_rich_link_shaping_and_hit_regions_in_layout_coordinates() {
+    use std::{cell::Cell, rc::Rc};
+    use zgui::{
+        input::{InputEvent, PointerButton},
+        semantics::Role,
+        text_layout::FallbackTextLayout,
+    };
+    let mut ui = Ui::new(500., 500.);
+    let calls = Rc::new(Cell::new(0));
+    let count = calls.clone();
+    ui.scene
+        .borrow_mut()
+        .set_rich_text_shaper(move |rich, width| {
+            count.set(count.get() + 1);
+            Box::new(FallbackTextLayout::with_rich(rich, width))
+        });
+    let angle = ui.signal(0.);
+    let rotation = angle.clone();
+    let clicks = Rc::new(Cell::new(0));
+    let clicked = clicks.clone();
+    let view = ui.mount(
+        div()
+            .size(180., 140.)
+            .translate(260., 80.)
+            .scale(2., 1.)
+            .transform_origin(0., 0.)
+            .reactive_style(move || Styles::new().rotate(rotation.get()))
+            .child(
+                rich_text()
+                    .w(90.)
+                    .p(7.)
+                    .text_size(16.)
+                    .text_wrap(true)
+                    .child(text_span("plain "))
+                    .child(
+                        text_span("many link words")
+                            .on_click(move || clicked.set(clicked.get() + 1)),
+                    ),
+            ),
+    );
+    ui.prepare_frame();
+    let initial_calls = calls.get();
+    let link = ui
+        .semantics
+        .borrow()
+        .iter()
+        .find(|(_, s)| s.role == Role::Link)
+        .unwrap()
+        .0;
+    let fragment = *ui.scene.borrow().children(link).last().unwrap();
+    let raw = ui.scene.borrow().layout_bounds(fragment);
+    angle.set(std::f32::consts::FRAC_PI_2);
+    ui.prepare_frame();
+    assert_eq!(
+        calls.get(),
+        initial_calls,
+        "paint changes must not reshape links"
+    );
+    assert_eq!(ui.scene.borrow().layout_bounds(fragment), raw);
+    let (x, y) = ui
+        .scene
+        .borrow()
+        .local_to_world(fragment, raw.width / 2., raw.height / 2.);
+    ui.dispatch(InputEvent::PointerDown {
+        x,
+        y,
+        button: PointerButton::Primary,
+    });
+    ui.dispatch(InputEvent::PointerUp {
+        x,
+        y,
+        button: PointerButton::Primary,
+    });
+    assert_eq!(clicks.get(), 1);
+    view.unmount();
+}
+
+#[test]
 fn font_features_and_ordered_fallbacks_inherit_reset_and_normalize() {
     use zgui::text_layout::{FontFamily, FontFeatures};
     let mut ui = Ui::new(400., 200.);

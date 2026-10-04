@@ -65,6 +65,7 @@ impl Kawase {
                 &shader,
                 Some(&layout),
                 entry,
+                None,
                 std::slice::from_ref(&target),
             )
         };
@@ -317,6 +318,7 @@ impl GpuRenderer {
         pass(&kawase.up, &group, &textures[1], w, h);
         (
             VerticalBlur {
+                geometry: None,
                 bind: group,
                 scissors,
                 prepasses,

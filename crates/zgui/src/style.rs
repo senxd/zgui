@@ -73,6 +73,9 @@ pub struct Styles {
     pub(crate) blur: Option<f32>,
     pub(crate) edge_fade: Option<f32>,
     pub(crate) transform: Option<Transform>,
+    pub(crate) scale: Option<[f32; 2]>,
+    pub(crate) rotation: Option<f32>,
+    pub(crate) transform_origin: Option<[f32; 2]>,
     pub(crate) isolated: Option<bool>,
     pub(crate) padding_sides: u8,
     pub(crate) margin_sides: u8,
@@ -310,6 +313,15 @@ impl Styles {
         }
         if other.transform.is_some() {
             self.transform = other.transform;
+        }
+        if other.scale.is_some() {
+            self.scale = other.scale;
+        }
+        if other.rotation.is_some() {
+            self.rotation = other.rotation;
+        }
+        if other.transform_origin.is_some() {
+            self.transform_origin = other.transform_origin;
         }
         if other.isolated.is_some() {
             self.isolated = other.isolated;
@@ -1218,6 +1230,27 @@ pub trait Styled: Sized {
     fn shadow_none(mut self) -> Self {
         self.styles_mut().shadow = Some(None);
         self.styles_mut().shadows = Some(None);
+        self
+    }
+    /// Paint-scale the subtree; zero hides geometry and negatives reflect it.
+    fn scale(mut self, x: f32, y: f32) -> Self {
+        assert!(x.is_finite() && y.is_finite(), "scale must be finite");
+        self.styles_mut().scale = Some([x, y]);
+        self
+    }
+    /// Clockwise paint rotation in radians, with positive screen Y downward.
+    fn rotate(mut self, radians: f32) -> Self {
+        assert!(radians.is_finite(), "rotation must be finite");
+        self.styles_mut().rotation = Some(radians);
+        self
+    }
+    /// Normalized local fractions, default center; outside 0..=1 is allowed.
+    fn transform_origin(mut self, x: f32, y: f32) -> Self {
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "transform origin must be finite"
+        );
+        self.styles_mut().transform_origin = Some([x, y]);
         self
     }
     fn translate(mut self, x: f32, y: f32) -> Self {

@@ -58,18 +58,20 @@ pub(super) fn fingerprints(
             if let Some((prior, rect, effects)) = source.blur
                 && rect.intersects(area)
             {
+                source.geometry_hash.hash(&mut hash);
                 result.get(&prior).hash(&mut hash);
                 composite_key(rect, effects, source.blur_mask).hash(&mut hash);
             }
             let mut touched = false;
             for quad in &quads[source.start as usize..source.end as usize] {
-                let bounds = quad_paint_bounds(quad);
+                let bounds = source.transform.bounds(quad_paint_bounds(quad));
                 if bounds.intersects(area) {
                     hash.write(bytemuck::bytes_of(quad));
                     touched = true;
                 }
             }
             if touched {
+                source.geometry_hash.hash(&mut hash);
                 source.image.hash(&mut hash);
                 if let Some(id) = source.layer {
                     layers[&id].revision.hash(&mut hash);
@@ -175,7 +177,11 @@ impl GpuRenderer {
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("cached blur composite"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("blur_composite.wgsl").into()),
+                    source: wgpu::ShaderSource::Wgsl(
+                        (include_str!("paint_geometry.wgsl").replace("GEOMETRY_GROUP", "1")
+                            + include_str!("blur_composite.wgsl"))
+                        .into(),
+                    ),
                 });
             let layout = self
                 .device
@@ -219,6 +225,7 @@ impl GpuRenderer {
                 &shader,
                 Some(&layout),
                 "fs",
+                Some(&self.context.inner.geometry_layout),
                 &[Some(wgpu::ColorTargetState {
                     format: FORMAT,
                     blend: None,
@@ -226,6 +233,7 @@ impl GpuRenderer {
                 })],
             );
             BlurPipelines {
+                geometry_layout: Some(self.context.inner.geometry_layout.clone()),
                 shader,
                 layout,
                 horizontal: vertical.clone(),

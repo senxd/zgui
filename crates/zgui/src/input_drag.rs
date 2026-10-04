@@ -100,13 +100,18 @@ impl InputDispatcher {
         if !self.enabled(&scene.borrow(), source) {
             return;
         }
-        let origin = scene.borrow().bounds(source);
+        let Some(grab) = scene
+            .borrow()
+            .world_to_local(source, pressed_at.0, pressed_at.1)
+        else {
+            return;
+        };
         let drag = DragSession {
             source,
             payload,
             x,
             y,
-            grab: (pressed_at.0 - origin.x, pressed_at.1 - origin.y),
+            grab,
             destination: None,
             preview: None,
         };

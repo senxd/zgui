@@ -56,6 +56,7 @@ impl DitherUniforms {
 }
 fn control(label: &str, click: impl FnMut() + 'static) -> View {
     button()
+        .id(label)
         .px(12.)
         .py(8.)
         .rounded(6.)
@@ -129,6 +130,23 @@ fn playground() -> View {
             )
             .unwrap();
         let presence = Presence::new(cx, true);
+        let rotation = timeline
+            .track(
+                Duration::ZERO,
+                duration,
+                Keyframes::new([
+                    Keyframe::new(0., 0.),
+                    Keyframe::new(0.5, 0.08),
+                    Keyframe::new(1., 0.),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let angle = cx.state(0.);
+        let manual_angle = angle.clone();
+        let expanded = cx.state(false);
+        let expansion = expanded.clone();
+        let shared = SharedLayoutScope::new(cx);
         presence.progress.label("presence / opacity");
         let exit = MotionPoint::new(cx, Vec2::default());
         exit.x.label("exit / x");
@@ -137,60 +155,76 @@ fn playground() -> View {
         let mounted = presence.mounted();
         let presence_opacity = presence.progress.signal();
         let exit_pose = exit.signal();
-        let card = switch(
-            move || mounted.get(),
-            move |mounted, _| {
-                if !mounted {
-                    return div().hidden();
-                }
-                let (pose, opacity, presence_opacity, exit_pose) = (
-                    pose.clone(),
-                    opacity.clone(),
-                    presence_opacity.clone(),
-                    exit_pose.clone(),
-                );
-                let (dither, instance, blur) = (dither.clone(), instance.clone(), blur.clone());
-                overlay()
-                    .size(480., 180.)
-                    .child(
-                        image_signal("Persistent dither field", move || {
-                            let uniforms = DitherUniforms {
-                                strength: dither.get(),
-                                cell: 2.,
-                            };
-                            instance
-                                .borrow_mut()
-                                .render(
-                                    SIZE[0],
-                                    SIZE[1],
-                                    &uniforms,
-                                    [SIZE[0].div_ceil(8), SIZE[1].div_ceil(8)],
-                                    move || uniforms.pixels(),
-                                )
-                                .unwrap()
+        let card = provide(
+            shared,
+            switch(
+                move || (mounted.get(), expansion.get()),
+                move |(mounted, expanded), _| {
+                    if !mounted {
+                        return div().hidden();
+                    }
+                    let (pose, opacity, presence_opacity, exit_pose) = (
+                        pose.clone(),
+                        opacity.clone(),
+                        presence_opacity.clone(),
+                        exit_pose.clone(),
+                    );
+                    let (dither, instance, blur) = (dither.clone(), instance.clone(), blur.clone());
+                    let (rotation, angle) = (rotation.clone(), manual_angle.clone());
+                    overlay()
+                        .id("motion-card")
+                        .layout_id("dither-card")
+                        .layout_motion(Transition::spring(Spring::default()))
+                        .size(
+                            if expanded { 640. } else { 480. },
+                            if expanded { 240. } else { 180. },
+                        )
+                        .child(
+                            image_signal("Persistent dither field", move || {
+                                let uniforms = DitherUniforms {
+                                    strength: dither.get(),
+                                    cell: 2.,
+                                };
+                                instance
+                                    .borrow_mut()
+                                    .render(
+                                        SIZE[0],
+                                        SIZE[1],
+                                        &uniforms,
+                                        [SIZE[0].div_ceil(8), SIZE[1].div_ceil(8)],
+                                        move || uniforms.pixels(),
+                                    )
+                                    .unwrap()
+                            })
+                            .w_full()
+                            .h_full(),
+                        )
+                        .child(
+                            div()
+                                .size(300., 94.)
+                                .p(18.)
+                                .rounded(12.)
+                                .bg(rgba(0x10182473))
+                                .child(text("One transport, five properties").text_size(18.))
+                                .child(text("Translation / rotation / opacity / blur / dither"))
+                                .reactive_style(move || {
+                                    Styles::new().translate(24., 44.).blur(blur.get())
+                                }),
+                        )
+                        .reactive_style(move || {
+                            let (p, e) = (pose.get(), exit_pose.get());
+                            Styles::new()
+                                .translate(p.x + e.x, p.y + e.y)
+                                .rotate(rotation.get() + angle.get())
+                                .opacity(opacity.get() * presence_opacity.get())
                         })
-                        .size(480., 180.),
-                    )
-                    .child(
-                        div()
-                            .size(300., 94.)
-                            .p(18.)
-                            .rounded(12.)
-                            .bg(rgba(0x10182473))
-                            .child(text("One transport, four properties").text_size(18.))
-                            .child(text("Translation / opacity / blur / dither"))
-                            .reactive_style(move || {
-                                Styles::new().translate(24., 44.).blur(blur.get())
-                            }),
-                    )
-                    .reactive_style(move || {
-                        let (p, e) = (pose.get(), exit_pose.get());
-                        Styles::new()
-                            .translate(p.x + e.x, p.y + e.y)
-                            .opacity(opacity.get() * presence_opacity.get())
-                    })
-            },
+                },
+            ),
         );
+        let expand = control("Card / expanded panel", move || {
+            expanded.update(|value| *value = !*value);
+        });
+        let rotation_control = slider("Rotation (radians)", angle, -0.3..=0.3).size(300., 36.);
         let mut open = true;
         let toggle = control("Toggle grouped exit", move || {
             open = !open;
@@ -273,7 +307,10 @@ fn playground() -> View {
                 .bg(rgb(0x718aff))
                 .child(text("Drag / snap"))
                 .reactive_style(move || {
-                    Styles::new().translate(drag_position.get(), -3. * hover.get())
+                    let hover = hover.get();
+                    Styles::new()
+                        .translate(drag_position.get(), -3. * hover)
+                        .scale(1. + 0.06 * hover, 1. + 0.06 * hover)
                 })
                 .on_event(move |event| match event.event {
                     InputEvent::PointerEnter => {
@@ -342,26 +379,38 @@ fn playground() -> View {
                 report.set(lines);
             }
         });
-        column()
-            .p(24.)
-            .gap(14.)
+        scroll(cx.state(0.))
             .w_full()
             .h_full()
+            .scrollbar(true)
             .bg(rgb(0x141c2a))
-            .text_color(rgb(0xe8eef8))
-            .child(text("Motion playground").text_size(26.))
-            .child(transport)
-            .child(status)
-            .child(toggle)
-            .child(card)
-            .child(dragging)
             .child(
-                row()
-                    .gap(20.)
-                    .child(scrolling)
-                    .child(column().gap(10.).child(indicator).child(snapshot)),
+                column()
+                    .p(24.)
+                    .gap(14.)
+                    .w_full()
+                    .bg(rgb(0x141c2a))
+                    .text_color(rgb(0xe8eef8))
+                    .child(text("Motion playground").text_size(26.))
+                    .child(transport)
+                    .child(status)
+                    .child(
+                        row()
+                            .gap(12.)
+                            .child(toggle)
+                            .child(expand)
+                            .child(rotation_control),
+                    )
+                    .child(card)
+                    .child(dragging)
+                    .child(
+                        row()
+                            .gap(20.)
+                            .child(scrolling)
+                            .child(column().gap(10.).child(indicator).child(snapshot)),
+                    )
+                    .child(text_signal(move || report.get()).text_size(12.)),
             )
-            .child(text_signal(move || report.get()).text_size(12.))
     })
 }
 #[cfg(test)]
@@ -451,5 +500,44 @@ mod tests {
         assert_ne!(smooth, dithered);
         let center = ((SIZE[1] / 2 * SIZE[0] + SIZE[0] / 2) * 4) as usize;
         assert_eq!(&dithered[center..center + 4], &[64, 153, 255, 255]);
+    }
+    #[test]
+    fn shared_card_remount_and_transport_obey_reduced_motion_without_idle_frames() {
+        use zgui::{compose::TaskRunner, motion::MotionPolicy, task::LocalExecutor};
+        let mut ui = zgui::widgets::Ui::new(900., 900.);
+        let frames = zgui::frame::FrameClock::new();
+        let executor = Rc::new(RefCell::new(LocalExecutor::new()));
+        let policy = MotionPolicy {
+            active: ui.signal(true),
+            reduced: ui.signal(true),
+        };
+        let root = ui.mount(provide(
+            frames.clone(),
+            provide(
+                TaskRunner::from_executor(executor.clone()),
+                provide(policy, playground()),
+            ),
+        ));
+        ui.prepare_frame();
+        let original = root.find("motion-card").unwrap();
+        assert_eq!(ui.scene.borrow().layout_bounds(original).width, 480.);
+        let expand = root.find("Card / expanded panel").unwrap();
+        ui.input
+            .dispatch_to(&ui.scene, expand, InputEvent::Activate);
+        executor.borrow_mut().tick();
+        ui.prepare_frame();
+        let replacement = root.find("motion-card").unwrap();
+        assert_ne!(original, replacement);
+        assert_eq!(ui.scene.borrow().layout_bounds(replacement).width, 640.);
+        assert_eq!(ui.scene.borrow().bounds(replacement).width, 640.);
+        let restart = root.find("Restart").unwrap();
+        ui.input
+            .dispatch_to(&ui.scene, restart, InputEvent::Activate);
+        executor.borrow_mut().tick();
+        ui.prepare_frame();
+        assert!(!frames.wants_frame());
+        root.unmount();
+        executor.borrow_mut().tick();
+        assert!(!frames.wants_frame());
     }
 }

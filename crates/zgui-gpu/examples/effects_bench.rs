@@ -3,6 +3,7 @@
 //! ZGUI_BENCH_{FRAMES,WARMUP,ONLY,SIZES,SIGMAS,OUTPUT,IN_FLIGHT,TRACE} configure runs.
 use std::{collections::BTreeMap, time::Instant};
 use zgui::{
+    affine::Affine,
     image::{EffectChain, EffectStage, ImageData, ShaderInstance, ShaderUniforms},
     scene::*,
 };
@@ -125,8 +126,12 @@ impl Workload {
                 );
             }
         }
-        let blur = matches!(mode, "overlap" | "scroll" | "foreground" | "resize");
+        let blur = matches!(
+            mode,
+            "overlap" | "scroll" | "foreground" | "resize" | "transition"
+        );
         let mut panels = Vec::new();
+        let mut shaders = Vec::new();
         if blur {
             for n in 0..4 {
                 let panel = scene.append(
@@ -155,10 +160,20 @@ impl Workload {
                     Color(90, 120, 150, 24),
                     Rect::new(0., 0., w * 0.38, h * 0.48),
                 );
+                if mode == "transition" {
+                    let (sw, sh) = ((width / 5).max(1), (height / 4).max(1));
+                    let mut instance = ShaderInstance::new(DITHER);
+                    let effect = scene.append(
+                        panel,
+                        NodeKind::Image(image(&mut instance, sw, sh, 0.)),
+                        fixed(sw as f32, sh as f32),
+                    );
+                    scene.set_transform(effect, Transform { x: 12., y: 12. });
+                    shaders.push((effect, instance, sw, sh));
+                }
                 panels.push((panel, fill));
             }
         }
-        let mut shaders = Vec::new();
         if matches!(mode, "uniforms" | "dither" | "shader_resize") {
             let count = if mode == "dither" { 8 } else { 1 };
             let (sw, sh) = if count == 1 {
@@ -221,6 +236,35 @@ impl Workload {
     }
     fn update(&mut self, gpu: &mut GpuRenderer, mode: &str, frame: usize, width: u32, height: u32) {
         match mode {
+            "transition" => {
+                // Four overlapping frosted cards resize/rotate while their dither
+                // surfaces update at 20 Hz relative to 60 Hz UI frames.
+                let phase = frame as f32 / 60.;
+                for (n, (panel, _)) in self.panels.iter().enumerate() {
+                    let t = (phase * 2. + n as f32 * 0.4).sin();
+                    self.scene.set_paint_transform_origin(
+                        *panel,
+                        Affine::scale(0.85 + 0.15 * t, 0.9 + 0.1 * t)
+                            .then(Affine::rotation(t * 0.12)),
+                        [0.5, 0.5],
+                    );
+                }
+                self.scene.set_transform(
+                    self.content,
+                    Transform {
+                        x: 0.,
+                        y: -((frame % 60) as f32) * 2.,
+                    },
+                );
+                if frame.is_multiple_of(3) {
+                    for (n, (node, instance, w, h)) in self.shaders.iter_mut().enumerate() {
+                        self.scene.set_kind(
+                            *node,
+                            NodeKind::Image(image(instance, *w, *h, frame as f32 + n as f32 * 9.)),
+                        );
+                    }
+                }
+            }
             "overlap" => self.scene.set_effects(
                 self.content,
                 Effects {
@@ -334,6 +378,10 @@ fn add_stats(stats: GpuStats, totals: &mut BTreeMap<&str, u64>) {
             "layer_texture_allocations",
             stats.layer_texture_allocations as u64,
         ),
+        (
+            "paint_geometry_buffer_allocations",
+            stats.paint_geometry_buffer_allocations as u64,
+        ),
         ("draw_calls", stats.draw_calls as u64),
         ("render_passes", stats.render_passes as u64),
         ("damaged_pixels", stats.damaged_pixels),
@@ -363,11 +411,15 @@ fn main() {
             "shader_resize",
             "dither",
             "chain",
+            "transition",
         ] {
             if !config.includes(mode) {
                 continue;
             }
-            let blur = matches!(mode, "overlap" | "scroll" | "foreground" | "resize");
+            let blur = matches!(
+                mode,
+                "overlap" | "scroll" | "foreground" | "resize" | "transition"
+            );
             let radii: Vec<f32> = if blur {
                 sigmas.split(',').map(|s| s.parse().unwrap()).collect()
             } else {
@@ -522,7 +574,7 @@ fn run(
         "retained_bytes":{"blur_cache":caches.blur_cache_bytes,"blur_scratch":caches.blur_scratch_bytes,
             "effect_chain_including_final_image_texture":caches.effect_chain_bytes,
             "shader_resources_including_image_textures":caches.shader_resource_bytes,"images":caches.image_bytes,
-            "layers":caches.layer_bytes,"vertices":caches.vertex_buffer_bytes,"atlas":caches.atlas_bytes,
+            "layers":caches.layer_bytes,"vertices":caches.vertex_buffer_bytes,"paint_geometry":caches.paint_geometry_bytes,"atlas":caches.atlas_bytes,
             "scroll_cache":caches.scroll_cache_bytes},
         "target_texture_bytes":width as u64*height as u64*4,
         "memory_note":"shader_resources and effect_chain include final textures also counted in images; do not sum these fields",

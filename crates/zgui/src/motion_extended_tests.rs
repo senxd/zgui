@@ -1,7 +1,7 @@
 use super::tracks::MAX_KEYFRAMES;
 use super::*;
 use crate::{
-    compose::{View, ViewHandle, column, component, div, provide, scroll, switch},
+    compose::{View, ViewHandle, column, component, div, overlay, provide, scroll, switch},
     input::{InputEvent, PointerButton},
     scene::Color,
     style::{Styled, Styles},
@@ -544,6 +544,339 @@ fn measured_scroll_progress_reacts_to_extent_and_does_not_start_layout_motion() 
 }
 
 #[test]
+fn layout_projection_resizes_nested_scaled_nodes_and_retargets_the_displayed_box() {
+    let h = Harness::new(|cx| {
+        let size = cx.state(Vec2::new(100., 80.));
+        let read = size.clone();
+        (
+            div()
+                .id("parent")
+                .scale(2., 3.)
+                .layout_motion(tween(100))
+                .reactive_style(move || {
+                    let size = read.get();
+                    Styles::new().size(size.x, size.y)
+                })
+                .child(
+                    div()
+                        .id("child")
+                        .w_percent(50.)
+                        .h_percent(50.)
+                        .bg(Color(255, 255, 255, 255))
+                        .layout_motion(tween(100)),
+                ),
+            size,
+        )
+    });
+    h.ui.prepare_frame();
+    let parent = h.root.find("parent").unwrap();
+    let child = h.root.find("child").unwrap();
+    let initial = h.ui.scene.borrow().bounds(child);
+    h.data.set(Vec2::new(200., 120.));
+    h.ui.prepare_frame();
+    let first = h.ui.scene.borrow().bounds(child);
+    near(first.x, initial.x);
+    near(first.y, initial.y);
+    near(first.width, initial.width);
+    near(first.height, initial.height);
+    near(h.ui.scene.borrow().layout_bounds(child).width, 100.);
+    near(h.ui.scene.borrow().layout_bounds(parent).height, 120.);
+    h.ui.scene.borrow_mut().flush();
+    h.tick();
+    h.frame(1, 50);
+    h.ui.prepare_frame();
+    assert_eq!(h.ui.scene.borrow_mut().flush().layout_nodes, 0);
+    let middle = h.ui.scene.borrow().bounds(child);
+    assert!(middle.width > initial.width && middle.width < 200.);
+    h.data.set(Vec2::new(140., 100.));
+    h.ui.prepare_frame();
+    let interrupted = h.ui.scene.borrow().bounds(child);
+    near(interrupted.x, middle.x);
+    near(interrupted.y, middle.y);
+    near(interrupted.width, middle.width);
+    near(interrupted.height, middle.height);
+    h.tick();
+    h.frame(2, 200);
+    h.ui.prepare_frame();
+    near(h.ui.scene.borrow().bounds(child).width, 140.);
+    near(h.ui.scene.borrow().bounds(child).height, 150.);
+    assert!(!h.frames.wants_frame());
+}
+
+#[test]
+fn layout_projection_zero_sizes_and_reduced_motion_remain_finite_and_idle() {
+    let h = Harness::new(|cx| {
+        let size = cx.state(0.);
+        let read = size.clone();
+        (
+            div()
+                .id("box")
+                .h(40.)
+                .layout_motion(tween(100))
+                .reactive_style(move || Styles::new().w(read.get())),
+            size,
+        )
+    });
+    h.ui.prepare_frame();
+    let node = h.root.find("box").unwrap();
+    h.data.set(100.);
+    h.ui.prepare_frame();
+    assert!(h.ui.scene.borrow().projection_transform(node).is_finite());
+    near(h.ui.scene.borrow().bounds(node).width, 0.);
+    h.policy.reduced.set(true);
+    h.tick();
+    h.ui.prepare_frame();
+    near(h.ui.scene.borrow().bounds(node).width, 100.);
+    assert!(!h.frames.wants_frame());
+    h.data.set(0.);
+    h.ui.prepare_frame();
+    assert!(h.ui.scene.borrow().world_paint_transform(node).is_finite());
+    assert!(!h.frames.wants_frame());
+    h.root.unmount();
+    h.tick();
+    assert!(!h.frames.wants_frame());
+}
+
+#[test]
+fn rotated_resize_projects_in_allocation_axes_and_keeps_the_projected_pivot() {
+    let h = Harness::new(|cx| {
+        let width = cx.state(100.);
+        let read = width.clone();
+        (
+            div()
+                .id("box")
+                .h(40.)
+                .translate(200., 100.)
+                .rotate(std::f32::consts::FRAC_PI_2)
+                .layout_motion(tween(100))
+                .reactive_style(move || Styles::new().w(read.get())),
+            width,
+        )
+    });
+    h.ui.prepare_frame();
+    let node = h.root.find("box").unwrap();
+    let original = h.ui.scene.borrow().bounds(node);
+    h.data.set(200.);
+    h.ui.prepare_frame();
+    let first = h.ui.scene.borrow().bounds(node);
+    near(first.x, original.x);
+    near(first.y, original.y);
+    near(first.width, original.width);
+    near(first.height, original.height);
+    near(h.ui.scene.borrow().layout_bounds(node).width, 200.);
+    h.tick();
+    h.frame(1, 200);
+    h.ui.prepare_frame();
+    near(h.ui.scene.borrow().bounds(node).height, 200.);
+    assert!(!h.frames.wants_frame());
+}
+
+#[test]
+fn nested_projection_factors_intervening_user_rotation_and_nonuniform_scale() {
+    let h = Harness::new(|cx| {
+        let size = cx.state(Vec2::new(100., 80.));
+        let read = size.clone();
+        (
+            div()
+                .id("outer")
+                .translate(180., 140.)
+                .scale(1.2, 0.8)
+                .rotate(0.3)
+                .layout_motion(tween(100))
+                .reactive_style(move || {
+                    let s = read.get();
+                    Styles::new().size(s.x, s.y)
+                })
+                .child(
+                    div()
+                        .id("middle")
+                        .w_full()
+                        .h_full()
+                        .scale(1.3, 0.7)
+                        .rotate(-0.6)
+                        .child(
+                            div()
+                                .id("child")
+                                .w_percent(50.)
+                                .h_percent(50.)
+                                .rotate(0.7)
+                                .layout_motion(tween(100)),
+                        ),
+                ),
+            size,
+        )
+    });
+    h.ui.prepare_frame();
+    let node = h.root.find("child").unwrap();
+    let original = h.ui.scene.borrow().bounds(node);
+    h.data.set(Vec2::new(200., 120.));
+    h.ui.prepare_frame();
+    let first = h.ui.scene.borrow().bounds(node);
+    near(first.x, original.x);
+    near(first.y, original.y);
+    near(first.width, original.width);
+    near(first.height, original.height);
+    h.tick();
+    h.frame(1, 50);
+    h.ui.prepare_frame();
+    let middle = h.ui.scene.borrow().bounds(node);
+    h.data.set(Vec2::new(140., 100.));
+    h.ui.prepare_frame();
+    let interrupted = h.ui.scene.borrow().bounds(node);
+    near(interrupted.x, middle.x);
+    near(interrupted.y, middle.y);
+    near(interrupted.width, middle.width);
+    near(interrupted.height, middle.height);
+    h.tick();
+    h.frame(2, 200);
+    h.ui.prepare_frame();
+    assert!(h.ui.scene.borrow().world_paint_transform(node).is_finite());
+    assert!(!h.frames.wants_frame());
+    h.root.unmount();
+    h.tick();
+    assert!(!h.frames.wants_frame());
+}
+
+#[test]
+fn shared_layout_remount_continues_current_size_and_scope_disposal_cleans_snapshots() {
+    let h = Harness::new(|cx| {
+        let scope = SharedLayoutScope::new(cx);
+        let version = cx.state(0_u32);
+        let read = version.clone();
+        let view = provide(
+            scope.clone(),
+            switch(
+                move || read.get(),
+                |version, _| {
+                    div()
+                        .id("shared")
+                        .layout_id("card")
+                        .layout_motion(tween(100))
+                        .size(
+                            if version == 0 {
+                                80.
+                            } else if version == 1 {
+                                180.
+                            } else {
+                                120.
+                            },
+                            60.,
+                        )
+                },
+            ),
+        );
+        (view, (scope, version))
+    });
+    h.ui.prepare_frame();
+    let first = h.root.find("shared").unwrap();
+    h.data.1.set(1);
+    h.ui.prepare_frame();
+    let second = h.root.find("shared").unwrap();
+    assert_ne!(first, second);
+    near(h.ui.scene.borrow().layout_bounds(second).width, 180.);
+    near(h.ui.scene.borrow().bounds(second).width, 80.);
+    assert!(
+        !h.data.0.forget("card"),
+        "mounted entry must retain generation ownership"
+    );
+    h.tick();
+    h.frame(1, 50);
+    h.ui.prepare_frame();
+    let middle = h.ui.scene.borrow().bounds(second).width;
+    h.data.1.set(2);
+    h.ui.prepare_frame();
+    let third = h.root.find("shared").unwrap();
+    near(h.ui.scene.borrow().bounds(third).width, middle);
+    h.tick();
+    h.frame(2, 200);
+    h.ui.prepare_frame();
+    near(h.ui.scene.borrow().bounds(third).width, 120.);
+    h.root.unmount();
+    h.tick();
+    assert!(
+        !h.data.0.forget("card"),
+        "provider disposal clears all retained snapshots"
+    );
+    assert!(!h.frames.wants_frame());
+}
+
+#[test]
+fn shared_layout_namespaces_do_not_cross_and_old_exit_cleanup_keeps_replacement() {
+    let h = Harness::new(|cx| {
+        let scope = SharedLayoutScope::new(cx);
+        let left = cx.state(true);
+        let right = cx.state(false);
+        let a = left.clone();
+        let b = right.clone();
+        (
+            provide(
+                scope.clone(),
+                overlay().children([
+                    switch(
+                        move || a.get(),
+                        |shown, _| {
+                            if shown {
+                                div()
+                                    .id("old")
+                                    .size(80., 50.)
+                                    .layout_id("card")
+                                    .layout_motion(tween(100))
+                            } else {
+                                div().hidden()
+                            }
+                        },
+                    ),
+                    switch(
+                        move || b.get(),
+                        |shown, _| {
+                            if shown {
+                                div()
+                                    .id("new")
+                                    .size(180., 50.)
+                                    .layout_id("card")
+                                    .layout_motion(tween(100))
+                            } else {
+                                div().hidden()
+                            }
+                        },
+                    ),
+                ]),
+            ),
+            (scope, left, right),
+        )
+    });
+    h.ui.prepare_frame();
+    h.data.2.set(true);
+    h.ui.prepare_frame();
+    let replacement = h.root.find("new").unwrap();
+    near(h.ui.scene.borrow().bounds(replacement).width, 80.);
+    h.data.1.set(false);
+    h.ui.prepare_frame();
+    assert!(
+        !h.data.0.forget("card"),
+        "old generation must not mark replacement unmounted"
+    );
+    // A sibling scope with the same ID starts at its own settled layout.
+    let mut ui = h.ui.shared();
+    let separate = ui.mount(component(|cx| {
+        let scope = SharedLayoutScope::new(cx);
+        provide(
+            scope,
+            div()
+                .size(240., 50.)
+                .layout_id("card")
+                .layout_motion(tween(100)),
+        )
+    }));
+    ui.prepare_frame();
+    near(ui.scene.borrow().bounds(separate.node()).width, 240.);
+    separate.unmount();
+    h.root.unmount();
+    h.tick();
+    assert!(!h.frames.wants_frame());
+}
+
+#[test]
 fn opposing_parent_child_layout_changes_preserve_the_child_world_position() {
     let h = Harness::new(|cx| {
         let outer = cx.state(20.);
@@ -637,6 +970,90 @@ fn drag_release_keeps_fresh_velocity_and_capture_survives_secondary_release() {
     assert!(!drag.begin(0., Instant::now()));
     h.tick();
     assert!(!h.frames.wants_frame());
+}
+
+#[test]
+fn drag_motion_uses_parent_axes_and_cancels_when_parent_becomes_singular() {
+    let h = Harness::new(|cx| {
+        let drag = DragMotion::new(cx, 0., MotionAxis::X, 0.0..=100.0).unwrap();
+        let position = drag.signal();
+        (
+            div()
+                .id("parent")
+                .size(100., 100.)
+                .translate(100., 100.)
+                .scale(2., 2.)
+                .rotate(std::f32::consts::FRAC_PI_2)
+                .transform_origin(0., 0.)
+                .child(
+                    drag.bind(
+                        div()
+                            .id("drag")
+                            .size(20., 20.)
+                            .bg(Color(255, 255, 255, 255))
+                            .reactive_style(move || Styles::new().translate(position.get(), 0.)),
+                    ),
+                ),
+            drag,
+        )
+    });
+    h.ui.prepare_frame();
+    let node = h.root.find("drag").unwrap();
+    let parent = h.root.find("parent").unwrap();
+    let (x, y) = h.ui.scene.borrow().local_to_world(node, 10., 10.);
+    let mut ui = h.ui.shared();
+    ui.dispatch(InputEvent::PointerDown {
+        x,
+        y,
+        button: PointerButton::Primary,
+    });
+    assert!(h.data.dragging());
+    ui.dispatch(InputEvent::PointerMove { x, y: y + 20. });
+    near(h.data.get(), 10.);
+    ui.scene
+        .borrow_mut()
+        .set_paint_transform(parent, crate::affine::Affine::scale(0., 0.));
+    ui.dispatch(InputEvent::PointerMove { x, y: y + 40. });
+    assert!(!h.data.dragging());
+    assert_eq!(ui.input.captured(), None);
+}
+
+#[test]
+fn rotated_slider_uses_rail_local_pointer_coordinates_without_resizing_layout() {
+    let h = Harness::new(|cx| {
+        let value = cx.state(0.);
+        (
+            crate::compose::slider("Rotated", value.clone(), 0.0..=100.0)
+                .id("slider")
+                .size(120., 30.)
+                .translate(200., 80.)
+                .scale(2., 1.)
+                .rotate(std::f32::consts::FRAC_PI_2)
+                .transform_origin(0., 0.),
+            value,
+        )
+    });
+    h.ui.prepare_frame();
+    let node = h.root.find("slider").unwrap();
+    let rail = h.ui.scene.borrow().children(node)[0];
+    let width = h.ui.scene.borrow().layout_bounds(rail).width;
+    let (x, y) = h.ui.scene.borrow().local_to_world(rail, width * 0.75, 2.);
+    let mut ui = h.ui.shared();
+    ui.dispatch(InputEvent::PointerDown {
+        x,
+        y,
+        button: PointerButton::Primary,
+    });
+    near(h.data.get(), 75.);
+    near(ui.scene.borrow().layout_bounds(node).width, 120.);
+    let (x, y) = ui.scene.borrow().local_to_world(rail, width * 0.25, 2.);
+    ui.dispatch(InputEvent::PointerMove { x, y });
+    near(h.data.get(), 25.);
+    ui.dispatch(InputEvent::PointerUp {
+        x,
+        y,
+        button: PointerButton::Primary,
+    });
 }
 
 #[test]

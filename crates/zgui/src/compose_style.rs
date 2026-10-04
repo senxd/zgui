@@ -64,7 +64,13 @@ pub(crate) fn mount_style(
 }
 
 /// Resolved styles, typography, intrinsic size and content layout target.
-type AppliedInputs = (Styles, Typography, Option<(f32, f32)>, Option<NodeId>);
+type AppliedInputs = (
+    Styles,
+    Typography,
+    Option<(f32, f32)>,
+    Option<NodeId>,
+    crate::affine::Affine,
+);
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mount_style_with_intrinsic(
     ui: &mut Ui,
@@ -78,7 +84,7 @@ pub(crate) fn mount_style_with_intrinsic(
     intrinsic: Option<Signal<(f32, f32)>>,
     layout_target: Option<Signal<Option<NodeId>>>,
     object_fit: Option<Signal<crate::style::ObjectFit>>,
-    projection: Option<Signal<crate::motion::Vec2>>,
+    projection: Option<Signal<crate::affine::Affine>>,
 ) -> Signal<Typography> {
     let typography = ui.signal(inherited.with_untracked(Clone::clone));
     let output = typography.clone();
@@ -155,6 +161,9 @@ pub(crate) fn mount_style_with_intrinsic(
     let original_style = ui.scene.borrow().style(node);
     let original_effects = ui.scene.borrow().effects(node);
     let original_transform = ui.scene.borrow().transform(node);
+    let original_paint = ui.scene.borrow().paint_transform(node);
+    let original_origin = ui.scene.borrow().paint_transform_origin(node);
+    let projection_bounds = projection.as_ref().map(|_| ui.observe_layout_bounds(node));
     let original_isolated = ui.scene.borrow().is_isolated(node);
     let original_kind = ui.scene.borrow().kind(node).clone();
     let mut previous_disabled = None;
@@ -178,14 +187,7 @@ pub(crate) fn mount_style_with_intrinsic(
         }
         if let Some(output) = &object_fit { output.set(resolved.object_fit.unwrap_or_default()); }
         // Only observe inherited typography when a field is actually inherited.
-        if let Some(offset) = &projection {
-            let offset = offset.get();
-            let base = resolved.transform.unwrap_or(original_transform);
-            resolved.transform = Some(crate::scene::Transform {
-                x: (base.x as f64 + offset.x as f64).clamp(-(f32::MAX as f64), f32::MAX as f64) as f32,
-                y: (base.y as f64 + offset.y as f64).clamp(-(f32::MAX as f64), f32::MAX as f64) as f32,
-            });
-        }
+        let projection = projection.as_ref().map_or(crate::affine::Affine::IDENTITY, |value| value.get());
         let parent = if resolved.text_overflow.is_none() || resolved.line_clamp.is_none() || resolved.text_color.is_none() || resolved.text_size.is_none() || resolved.text_wrap.is_none() || resolved.font_family.is_none() || resolved.font_features.is_none() || resolved.text_align.is_none() || resolved.font_fallbacks.is_none() || resolved.font_weight.is_none() || resolved.italic.is_none() || resolved.line_height.is_none() || resolved.letter_spacing.is_none() {
             inherited.get()
         } else {
@@ -197,7 +199,26 @@ pub(crate) fn mount_style_with_intrinsic(
         // effect keeps its subscriptions.
         let intrinsic_size = intrinsic.as_ref().map(|size| size.get());
         let content_layout = layout_target.as_ref().and_then(|target| target.get());
-        let inputs = (resolved, current, intrinsic_size, content_layout);
+        let projection = if let Some(bounds) = &projection_bounds {
+            let observed = bounds.get();
+            let inherited_inverse = ui.ancestor_layout_compensation(node);
+            let (paint, origin) = paint_transform(&resolved, original_paint, original_origin);
+            let legacy = resolved.transform.unwrap_or(original_transform);
+            let mut scene = ui.scene.borrow_mut();
+            if !scene.contains(node) { return; }
+            let bounds = observed.unwrap_or_else(|| scene.layout_bounds(node));
+            let pivot = projection.point(bounds.width * origin[0], bounds.height * origin[1]);
+            let compensation = crate::affine::Affine::translation(bounds.x, bounds.y).then(inherited_inverse)
+                .then(crate::affine::Affine::translation(-bounds.x, -bounds.y));
+            let desired = projection.then(paint.around(pivot.0, pivot.1))
+                .then(crate::affine::Affine::translation(legacy.x, legacy.y)).then(compensation);
+            scene.set_paint_transform_origin(node, paint, origin);
+            scene.set_transform(node, legacy);
+            if projection == crate::affine::Affine::IDENTITY && inherited_inverse == crate::affine::Affine::IDENTITY {
+                crate::affine::Affine::IDENTITY
+            } else { scene.projection_for_paint(node, desired) }
+        } else { projection };
+        let inputs = (resolved, current, intrinsic_size, content_layout, projection);
         if applied.as_ref() == Some(&inputs) {
             return;
         }
@@ -208,10 +229,10 @@ pub(crate) fn mount_style_with_intrinsic(
             && previous.2 == inputs.2
             && previous.3 == inputs.3
         {
-            let before = (previous.0.opacity, previous.0.blur, previous.0.edge_fade, previous.0.transform);
+            let before = (previous.0.opacity, previous.0.blur, previous.0.edge_fade, previous.0.transform, previous.0.scale, previous.0.rotation, previous.0.transform_origin);
             let next = &inputs.0;
-            (previous.0.opacity, previous.0.blur, previous.0.edge_fade, previous.0.transform) =
-                (next.opacity, next.blur, next.edge_fade, next.transform);
+            (previous.0.opacity, previous.0.blur, previous.0.edge_fade, previous.0.transform, previous.0.scale, previous.0.rotation, previous.0.transform_origin) =
+                (next.opacity, next.blur, next.edge_fade, next.transform, next.scale, next.rotation, next.transform_origin);
             if previous.0 == *next {
                 let mut effects = original_effects;
                 if let Some(value) = next.opacity { effects.opacity = value; }
@@ -220,11 +241,17 @@ pub(crate) fn mount_style_with_intrinsic(
                 let mut scene = ui.scene.borrow_mut();
                 scene.set_effects(node, effects);
                 scene.set_transform(node, next.transform.unwrap_or(original_transform));
+                let (paint, origin) = paint_transform(next, original_paint, original_origin);
+                scene.set_paint_transform_origin(node, paint, origin);
+                scene.set_projection_transform(node, inputs.4);
+                previous.4 = inputs.4;
+                drop(scene);
+                ui.publish_paint_transform(node);
                 return;
             }
-            (previous.0.opacity, previous.0.blur, previous.0.edge_fade, previous.0.transform) = before;
+            (previous.0.opacity, previous.0.blur, previous.0.edge_fade, previous.0.transform, previous.0.scale, previous.0.rotation, previous.0.transform_origin) = before;
         }
-        let (resolved, current, _, _) = &*applied.insert(inputs);
+        let (resolved, current, _, _, projection) = &*applied.insert(inputs);
         let mut style = original_style.clone();
         if let Some(resolved_options) = &resolved.layout_options {
             if let Some(original) = &style.layout_options {
@@ -287,6 +314,9 @@ pub(crate) fn mount_style_with_intrinsic(
         scene.set_cursor(node, resolved.cursor);
         scene.set_effects(node, effects);
         scene.set_transform(node, resolved.transform.unwrap_or(original_transform));
+        let (paint, origin) = paint_transform(resolved, original_paint, original_origin);
+        scene.set_paint_transform_origin(node, paint, origin);
+        scene.set_projection_transform(node, *projection);
         scene.set_isolated(node, resolved.isolated.unwrap_or(original_isolated));
         let kind = match &original_kind {
             NodeKind::Container(layout) | NodeKind::Panel { layout, .. } => {
@@ -316,8 +346,32 @@ pub(crate) fn mount_style_with_intrinsic(
         };
         if matches!(kind, NodeKind::Text { .. }) { scene.set_font(node, current.font.clone()); }
         scene.set_kind(node, kind);
+        drop(scene);
+        ui.publish_paint_transform(node);
     });
     typography
+}
+
+fn paint_transform(
+    styles: &Styles,
+    original: crate::affine::Affine,
+    original_origin: [f32; 2],
+) -> (crate::affine::Affine, [f32; 2]) {
+    let changed = styles.scale.is_some() || styles.rotation.is_some();
+    let matrix = if changed {
+        let [x, y] = styles.scale.unwrap_or([1., 1.]);
+        crate::affine::Affine::scale(x, y).then(crate::affine::Affine::rotation(
+            styles.rotation.unwrap_or(0.),
+        ))
+    } else {
+        original
+    };
+    (
+        matrix,
+        styles
+            .transform_origin
+            .unwrap_or(if changed { [0.5, 0.5] } else { original_origin }),
+    )
 }
 
 #[cfg(test)]
@@ -344,6 +398,42 @@ mod tests {
             wrap: false,
             font: Default::default(),
         })
+    }
+    #[test]
+    fn reactive_affine_styles_preserve_sparse_precedence_and_skip_layout() {
+        use crate::{compose::div, style::Styled};
+        let mut ui = Ui::new(400., 300.);
+        let factor = ui.signal(1.);
+        let angle = ui.signal(0.);
+        let (f, a) = (factor.clone(), angle.clone());
+        let view = ui.mount(
+            div()
+                .size(100., 40.)
+                .translate(12., 8.)
+                .scale(1., 3.)
+                .transform_origin(0., 0.5)
+                .reactive_style(move || Styles::new().scale(f.get(), 3.).rotate(a.get())),
+        );
+        ui.prepare_frame();
+        ui.scene.borrow_mut().flush();
+        let node = view.node();
+        ui.runtime.batch(|| {
+            factor.set(2.);
+            angle.set(std::f32::consts::FRAC_PI_2);
+        });
+        ui.prepare_frame();
+        assert_eq!(ui.scene.borrow_mut().flush().layout_nodes, 0);
+        let scene = ui.scene.borrow();
+        assert_eq!(scene.layout_bounds(node).width, 100.);
+        assert_eq!(
+            scene.transform(node),
+            crate::scene::Transform { x: 12., y: 8. }
+        );
+        assert_eq!(scene.paint_transform_origin(node), [0., 0.5]);
+        let (x, y) = scene.local_to_world(node, 0., 20.);
+        assert!((x - 12.).abs() < 0.001 && (y - 28.).abs() < 0.001);
+        let (x, y) = scene.local_to_world(node, 10., 20.);
+        assert!((x - 12.).abs() < 0.001 && (y - 48.).abs() < 0.001);
     }
     #[test]
     fn interaction_variants_restore_and_disabled_wins_without_layout() {

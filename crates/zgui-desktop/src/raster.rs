@@ -25,6 +25,26 @@ fn styled_bytes(key: &StyledGlyphKey, images: &StyledGlyphImages) -> usize {
             .sum::<usize>()
 }
 
+const AFFINE_MATTE_BUDGET: usize = 64 * 1024 * 1024;
+struct AffineMatte {
+    revision: u64,
+    ink: Rect,
+    edge_fade: f32,
+    width: usize,
+    height: usize,
+    pixels: Vec<[u8; 4]>, // Premultiplied RGBA, linear interpolation before unpremultiply.
+}
+struct FilteredBackdrop {
+    x: usize,
+    y: usize,
+    width: usize,
+    pixels: Vec<u32>,
+}
+impl FilteredBackdrop {
+    fn pixel(&self, x: usize, y: usize) -> u32 {
+        self.pixels[(y - self.y) * self.width + x - self.x]
+    }
+}
 /// Persistent CPU backing store with cached glyph masks and damage-only rasterization.
 /// Glyph cache is bounded; this backend intentionally favors a small portable implementation.
 pub struct Raster {
@@ -42,6 +62,9 @@ pub struct Raster {
     background: u32,
     origin: (f32, f32),
     mask: Option<zgui::scene::FadeMask>,
+    affine_mattes: HashMap<zgui::scene::NodeId, std::rc::Rc<AffineMatte>>,
+    affine_scene: u64,
+    affine_rasterizations: u64,
 }
 impl Raster {
     /// Register an additional validated font and invalidate retained glyph shapes.
@@ -52,6 +75,7 @@ impl Raster {
             .register_font(font);
         self.styled_glyphs.clear();
         self.rich_glyphs.clear();
+        self.affine_mattes.clear();
     }
 
     pub fn new(width: usize, height: usize) -> Self {
@@ -74,7 +98,14 @@ impl Raster {
             background: 0x10141c,
             origin: (0., 0.),
             mask: None,
+            affine_mattes: HashMap::new(),
+            affine_scene: 0,
+            affine_rasterizations: 0,
         }
+    }
+    /// Number of local primitive rasterizations; unchanged affine/opacity frames reuse pixels.
+    pub fn affine_rasterizations(&self) -> u64 {
+        self.affine_rasterizations
     }
     pub fn resize(&mut self, width: usize, height: usize) {
         self.width = width;
@@ -82,6 +113,11 @@ impl Raster {
         self.pixels.resize(width * height, 0x10141c);
     }
     pub fn render(&mut self, scene: &Scene, damage: &[Rect]) {
+        if self.affine_scene != scene.identity() {
+            self.affine_mattes.clear();
+            self.affine_scene = scene.identity();
+        }
+        self.affine_mattes.retain(|node, _| scene.contains(*node));
         self.canvases.retain(scene);
         self.svgs.retain(scene);
         // No pixel copies here: scrolled regions repaint in full.
@@ -127,6 +163,13 @@ impl Raster {
                 };
                 if item.isolated {
                     self.isolated(scene, item, clip);
+                    continue;
+                }
+                if item.transform != zgui::affine::Affine::IDENTITY
+                    || !item.clip_regions.is_empty()
+                    || item.fade_transform != zgui::affine::Affine::IDENTITY
+                {
+                    self.transformed(scene, item, clip);
                     continue;
                 }
                 let Some(visible) = intersect(
@@ -234,7 +277,177 @@ impl Raster {
             }
         }
     }
+    /// Reference fallback rasterizes only the affected primitive, then samples
+    /// it through the inverse matrix. The destination backdrop stays in world
+    /// space, so a transformed frosted panel still samples preceding siblings.
+    fn transformed(&mut self, scene: &Scene, item: &zgui::scene::PaintItem<'_>, clip: Rect) {
+        use zgui::affine::Affine;
+        let Some(inverse) = item.transform.inverse() else {
+            return;
+        };
+        let ink = match item.kind {
+            NodeKind::Quad(style) | NodeKind::Panel { quad: style, .. } => {
+                style.paint_bounds(item.bounds)
+            }
+            NodeKind::Image(image) => image.paint_bounds(item.bounds),
+            NodeKind::Svg(svg) => svg.paint_bounds(item.bounds),
+            _ => item.bounds,
+        };
+        let x = ink.x.floor();
+        let y = ink.y.floor();
+        let width = ((ink.x + ink.width).ceil() - x).max(1.) as usize;
+        let height = ((ink.y + ink.height).ceil() - y).max(1.) as usize;
+        if width
+            .checked_mul(height)
+            .is_none_or(|n| n > 16 * 1024 * 1024)
+        {
+            return;
+        }
+        let matte = if matches!(item.kind, NodeKind::Container(_)) {
+            None
+        } else {
+            let matte = self
+                .affine_mattes
+                .get(&item.id)
+                .filter(|matte| {
+                    matte.revision == scene.paint_revision(item.id)
+                        && matte.ink == ink
+                        && matte.edge_fade == item.effects.edge_fade
+                })
+                .cloned();
+            let matte = if let Some(matte) = matte {
+                matte
+            } else {
+                let make = |background| Self {
+                    pixels: vec![background; width * height],
+                    width,
+                    height,
+                    font: self.font.clone(),
+                    styled_fonts: self.styled_fonts.clone(),
+                    styled_glyphs: HashMap::new(),
+                    rich_glyphs: Vec::new(),
+                    canvases: Default::default(),
+                    svgs: Default::default(),
+                    glyphs: HashMap::new(),
+                    scratch: Vec::new(),
+                    background,
+                    origin: (x, y),
+                    mask: None,
+                    affine_mattes: HashMap::new(),
+                    affine_scene: 0,
+                    affine_rasterizations: 0,
+                };
+                let mut black = make(0);
+                let mut white = make(0xffffff);
+                let mut primitive = item.clone();
+                primitive.bounds.x -= x;
+                primitive.bounds.y -= y;
+                primitive.transform = Affine::IDENTITY;
+                primitive.clip_regions = std::rc::Rc::from([]);
+                primitive.fade_transform = Affine::IDENTITY;
+                primitive.mask = None;
+                primitive.clip = None;
+                primitive.effects.opacity = 1.;
+                primitive.effects.blur_radius = 0.;
+                let full = [Rect::new(0., 0., width as f32, height as f32)];
+                black.render_flat(scene, vec![primitive.clone()], &full);
+                white.render_flat(scene, vec![primitive], &full);
+                let pixels = black
+                    .pixels
+                    .iter()
+                    .zip(&white.pixels)
+                    .map(|(&b, &w)| {
+                        let alpha = 255 - ((w & 255) as i32 - (b & 255) as i32).clamp(0, 255);
+                        [(b >> 16) as u8, (b >> 8) as u8, b as u8, alpha as u8]
+                    })
+                    .collect();
+                let matte = std::rc::Rc::new(AffineMatte {
+                    revision: scene.paint_revision(item.id),
+                    ink,
+                    edge_fade: item.effects.edge_fade,
+                    width,
+                    height,
+                    pixels,
+                });
+                self.affine_mattes.remove(&item.id);
+                let retained = self
+                    .affine_mattes
+                    .values()
+                    .map(|matte| matte.pixels.len() * 4)
+                    .sum::<usize>();
+                if self.affine_mattes.len() >= 128
+                    || retained + width * height * 4 > AFFINE_MATTE_BUDGET
+                {
+                    self.affine_mattes.clear();
+                }
+                self.affine_mattes.insert(item.id, matte.clone());
+                self.affine_rasterizations = self.affine_rasterizations.saturating_add(1);
+                matte
+            };
+            Some(matte)
+        };
+        let Some(visible) = intersect(item.transform.bounds(ink), clip) else {
+            return;
+        };
+        let (x0, y0, x1, y1) = self.region(visible);
+        // Keep a copy only for backdrop sampling; the filter is applied to the
+        // exact transformed allocation rather than its enclosing AABB.
+        let backdrop = (item.effects.blur_radius > 0.).then(|| {
+            self.filtered_backdrop(visible, item.effects.blur_radius.ceil().min(64.) as usize)
+        });
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let (wx, wy) = (px as f32 + 0.5, py as f32 + 0.5);
+                if item
+                    .clip_regions
+                    .iter()
+                    .any(|region| !region.contains(wx, wy))
+                {
+                    continue;
+                }
+                let (lx, ly) = inverse.point(wx, wy);
+                let (mx, my) = item.fade_transform.point(wx, wy);
+                let _ = mx;
+                let opacity = item.effects.opacity * mask_alpha(my, item.mask);
+                let inside = lx >= item.bounds.x
+                    && ly >= item.bounds.y
+                    && lx < item.bounds.x + item.bounds.width
+                    && ly < item.bounds.y + item.bounds.height;
+                if inside && let Some(backdrop) = &backdrop {
+                    let color = backdrop.pixel(px, py);
+                    blend(
+                        &mut self.pixels[py * self.width + px],
+                        Color((color >> 16) as u8, (color >> 8) as u8, color as u8, 255),
+                        opacity * edge_alpha(ly, item.bounds, item.effects.edge_fade),
+                    );
+                }
+                let Some(matte) = &matte else {
+                    continue;
+                };
+                let sample = sample_matte(matte, lx - x - 0.5, ly - y - 0.5);
+                if sample[3] <= 0. {
+                    continue;
+                }
+                let channel =
+                    |index: usize| (sample[index] * 255. / sample[3]).round().clamp(0., 255.) as u8;
+                blend(
+                    &mut self.pixels[py * self.width + px],
+                    Color(
+                        channel(0),
+                        channel(1),
+                        channel(2),
+                        sample[3].round().clamp(0., 255.) as u8,
+                    ),
+                    opacity,
+                );
+            }
+        }
+        self.mask = item.mask;
+    }
     fn isolated(&mut self, scene: &Scene, item: &zgui::scene::PaintItem<'_>, clip: Rect) {
+        let Some(inverse) = item.transform.inverse() else {
+            return;
+        };
         let bounds = scene.layer_bounds(item.id);
         let x = bounds.x.floor();
         let y = bounds.y.floor();
@@ -263,6 +476,9 @@ impl Raster {
             background,
             origin: (x, y),
             mask: None,
+            affine_mattes: HashMap::new(),
+            affine_scene: 0,
+            affine_rasterizations: 0,
         };
         let mut black = make(0);
         let mut white = make(0xffffff);
@@ -272,6 +488,19 @@ impl Raster {
             .map(|mut i| {
                 i.bounds.x -= x;
                 i.bounds.y -= y;
+                let to_world = zgui::affine::Affine::translation(x, y);
+                let to_target = zgui::affine::Affine::translation(-x, -y);
+                i.transform = to_world.then(i.transform).then(to_target);
+                i.clip_regions = i
+                    .clip_regions
+                    .iter()
+                    .map(|region| zgui::scene::PaintClip {
+                        inverse: to_world.then(region.inverse),
+                        ..*region
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                i.fade_transform = to_world.then(i.fade_transform).then(to_target);
                 i.clip = i
                     .clip
                     .map(|r| Rect::new(r.x - x, r.y - y, r.width, r.height));
@@ -293,20 +522,38 @@ impl Raster {
         let Some(visible) = intersect(output, clip) else {
             return;
         };
-        if item.effects.blur_radius > 0. {
-            self.blur(
-                visible,
-                item.effects.blur_radius.ceil().min(64.) as usize,
-                item.bounds,
-                item.effects,
-            )
-        }
+        let backdrop = (item.effects.blur_radius > 0.).then(|| {
+            self.filtered_backdrop(visible, item.effects.blur_radius.ceil().min(64.) as usize)
+        });
         let (x0, y0, x1, y1) = self.region(visible);
         for py in y0..y1 {
-            let opacity = item.effects.opacity
-                * edge_alpha(py as f32, item.bounds, item.effects.edge_fade)
-                * mask_alpha(py as f32, self.mask);
             for px in x0..x1 {
+                let (wx, wy) = (px as f32 + 0.5, py as f32 + 0.5);
+                if item
+                    .clip_regions
+                    .iter()
+                    .any(|region| !region.contains(wx, wy))
+                {
+                    continue;
+                }
+                let (_, fy) = item.fade_transform.point(wx, wy);
+                let (lx, ly) = inverse.point(wx, wy);
+                let opacity = item.effects.opacity
+                    * edge_alpha(ly, item.bounds, item.effects.edge_fade)
+                    * mask_alpha(fy, self.mask);
+                if let Some(backdrop) = &backdrop
+                    && lx >= item.bounds.x
+                    && ly >= item.bounds.y
+                    && lx < item.bounds.x + item.bounds.width
+                    && ly < item.bounds.y + item.bounds.height
+                {
+                    let color = backdrop.pixel(px, py);
+                    blend(
+                        &mut self.pixels[py * self.width + px],
+                        Color((color >> 16) as u8, (color >> 8) as u8, color as u8, 255),
+                        opacity,
+                    );
+                }
                 let sx = (px as f32 - output.x) as usize;
                 let sy = (py as f32 - output.y) as usize;
                 let b = black.pixels[sy * width + sx];
@@ -750,6 +997,39 @@ impl Raster {
         }
     }
     // Separable sliding-window box filter: O(area), independent of blur radius.
+    fn filtered_backdrop(&mut self, bounds: Rect, radius: usize) -> FilteredBackdrop {
+        let (x0, y0, x1, y1) = self.region(bounds);
+        let width = x1 - x0;
+        let mut pixels = Vec::with_capacity(width * (y1 - y0));
+        for y in y0..y1 {
+            pixels.extend_from_slice(&self.pixels[y * self.width + x0..y * self.width + x1]);
+        }
+        let mask = self.mask.take();
+        self.blur(
+            bounds,
+            radius,
+            bounds,
+            Effects {
+                blur_radius: radius as f32,
+                ..Default::default()
+            },
+        );
+        self.mask = mask;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                std::mem::swap(
+                    &mut pixels[(y - y0) * width + x - x0],
+                    &mut self.pixels[y * self.width + x],
+                );
+            }
+        }
+        FilteredBackdrop {
+            x: x0,
+            y: y0,
+            width,
+            pixels,
+        }
+    }
     fn blur(&mut self, bounds: Rect, radius: usize, fade_bounds: Rect, effects: Effects) {
         if radius == 0 {
             return;
@@ -829,6 +1109,34 @@ impl Raster {
         Ok(())
     }
 }
+fn sample_matte(matte: &AffineMatte, x: f32, y: f32) -> [f32; 4] {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < -1.
+        || y < -1.
+        || x > matte.width as f32
+        || y > matte.height as f32
+    {
+        return [0.; 4];
+    }
+    let (left, top) = (x.floor() as isize, y.floor() as isize);
+    let (fx, fy) = (x - x.floor(), y - y.floor());
+    let mut result = [0.; 4];
+    for (dx, wx) in [(0, 1. - fx), (1, fx)] {
+        for (dy, wy) in [(0, 1. - fy), (1, fy)] {
+            let (sx, sy) = (left + dx, top + dy);
+            if sx < 0 || sy < 0 || sx >= matte.width as isize || sy >= matte.height as isize {
+                continue;
+            }
+            let pixel = matte.pixels[sy as usize * matte.width + sx as usize];
+            for channel in 0..4 {
+                result[channel] += pixel[channel] as f32 * wx * wy;
+            }
+        }
+    }
+    result
+}
+
 fn add(s: &mut [u64; 3], p: u32) {
     s[0] += ((p >> 16) & 255) as u64;
     s[1] += ((p >> 8) & 255) as u64;
@@ -893,6 +1201,140 @@ fn mask_alpha(y: f32, mask: Option<zgui::scene::FadeMask>) -> f32 {
 mod tests {
     use super::*;
     use zgui::scene::{Effects, Layout, NodeKind, Style, Transform};
+    #[test]
+    fn affine_mattes_reuse_pixels_until_content_changes_and_prune_removed_nodes() {
+        use zgui::affine::Affine;
+        let mut scene = Scene::new(100., 100.);
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(20.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.set_transform(node, Transform { x: 40., y: 40. });
+        scene.set_paint_transform(node, Affine::rotation(0.2));
+        let mut raster = Raster::new(100, 100);
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        assert_eq!(raster.affine_rasterizations(), 1);
+        for angle in [0.3, 0.4, 0.5] {
+            scene.set_paint_transform(node, Affine::rotation(angle));
+            scene.set_effects(
+                node,
+                Effects {
+                    opacity: 0.5,
+                    ..Default::default()
+                },
+            );
+            let damage = scene.flush().damage;
+            raster.render(&scene, &damage);
+        }
+        assert_eq!(raster.affine_rasterizations(), 1);
+        scene.set_kind(node, NodeKind::Rect(Color(0, 255, 0, 255)));
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        assert_eq!(raster.affine_rasterizations(), 2);
+        assert_eq!(raster.affine_mattes.len(), 1);
+        scene.remove(node);
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        assert!(raster.affine_mattes.is_empty());
+    }
+    #[test]
+    fn transformed_blur_samples_world_backdrop_and_does_not_touch_aabb_corners() {
+        use zgui::affine::Affine;
+        let mut scene = Scene::new(40., 40.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(255, 255, 255, 255)),
+            Style {
+                width: Some(20.),
+                height: Some(40.),
+                ..Default::default()
+            },
+        );
+        let frost = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(20.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.set_paint_transform(frost, Affine::rotation(std::f32::consts::FRAC_PI_4));
+        scene.set_transform(frost, Transform { x: 20., y: 10. });
+        scene.set_effects(
+            frost,
+            Effects {
+                blur_radius: 3.,
+                ..Default::default()
+            },
+        );
+        let mut raster = Raster::new(40, 40);
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        assert_eq!(raster.pixels[11 * 40 + 7], 0xffffff);
+        let filtered = raster.pixels[22 * 40 + 19];
+        assert_ne!(filtered, 0xffffff);
+        assert_ne!(filtered, raster.background);
+        scene.set_isolated(frost, true);
+        scene.set_paint_transform(
+            frost,
+            Affine {
+                a: 1.,
+                b: 1.,
+                c: 1.,
+                d: 1.,
+                tx: 0.,
+                ty: 0.,
+            },
+        );
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        assert_eq!(raster.pixels[22 * 40 + 19], 0xffffff);
+    }
+    #[test]
+    fn affine_subtree_pixels_match_inverse_hit_geometry_and_exact_clips() {
+        use zgui::affine::Affine;
+        let mut scene = Scene::new(100., 100.);
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(20.),
+                height: Some(20.),
+                clip: true,
+                ..Default::default()
+            },
+        );
+        scene.append(
+            parent,
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(20.),
+                height: Some(40.),
+                ..Default::default()
+            },
+        );
+        scene.set_paint_transform(parent, Affine::rotation(std::f32::consts::FRAC_PI_4));
+        scene.set_transform(parent, Transform { x: 50., y: 20. });
+        let mut raster = Raster::new(100, 100);
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        assert_eq!(raster.pixels[34 * 100 + 50], 0xff0000);
+        assert_eq!(raster.pixels[21 * 100 + 37], raster.background);
+        assert_eq!(raster.pixels[58 * 100 + 50], raster.background);
+        scene.set_isolated(parent, true);
+        let damage = scene.flush().damage;
+        raster.render(&scene, &damage);
+        assert_eq!(raster.pixels[34 * 100 + 50], 0xff0000);
+        assert_eq!(raster.pixels[21 * 100 + 37], raster.background);
+    }
     #[test]
     fn panel_background_border_and_children_have_correct_paint_order() {
         use zgui::scene::{Insets, QuadStyle};

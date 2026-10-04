@@ -1,4 +1,5 @@
 //! Retained scene graph. Mutations invalidate only their layout/paint/compositor dependencies.
+use crate::affine::Affine;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -320,6 +321,9 @@ struct Node {
     style: Style,
     bounds: Rect,
     transform: Transform,
+    paint_transform: Affine,
+    paint_origin: [f32; 2],
+    projection_transform: Affine,
     effects: Effects,
     dirty: u8,
     queued: bool,
@@ -344,6 +348,7 @@ struct Node {
     arrange_dirty: bool,
     isolated: bool,
     layer_revision: u64,
+    paint_revision: u64,
     /// Scroll content: a translation is reported as a `ScrollMove` the
     /// renderer may apply by copying pixels (see `set_scroll_copy`).
     scroll_copy: bool,
@@ -455,12 +460,32 @@ fn exposed(clip: Rect, dx: f32, dy: f32) -> Vec<Rect> {
 }
 /// A `fade_edges` ancestor's clip and its (top, bottom) bands.
 pub type FadeMask = (Rect, [f32; 2]);
+/// Exact clipping in an ancestor's pre-transform layout coordinate system.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaintClip {
+    pub bounds: Rect,
+    pub inverse: Affine,
+    pub axes: [bool; 2],
+}
+impl PaintClip {
+    pub fn contains(self, x: f32, y: f32) -> bool {
+        let (x, y) = self.inverse.point(x, y);
+        (!self.axes[0] || (x >= self.bounds.x && x < self.bounds.x + self.bounds.width))
+            && (!self.axes[1] || (y >= self.bounds.y && y < self.bounds.y + self.bounds.height))
+    }
+}
 #[derive(Clone)]
 pub struct PaintItem<'a> {
     /// An explicit isolated subtree represented by its cached layer image.
     pub isolated: bool,
     pub id: NodeId,
     pub bounds: Rect,
+    /// Maps the primitive allocation to the renderer's target coordinates.
+    /// Pure translations are baked into `bounds` and retain the identity fast path.
+    pub transform: Affine,
+    pub clip_regions: std::rc::Rc<[PaintClip]>,
+    /// Maps target coordinates back into `mask` coordinates.
+    pub fade_transform: Affine,
     pub kind: &'a NodeKind,
     pub font: &'a crate::text_layout::FontStyle,
     pub text_options: crate::text_layout::TextOptions,
@@ -547,6 +572,9 @@ impl Scene {
                     },
                     bounds: Rect::default(),
                     transform: Transform::default(),
+                    paint_transform: Affine::IDENTITY,
+                    paint_origin: [0., 0.],
+                    projection_transform: Affine::IDENTITY,
                     effects: Effects::default(),
                     dirty: LAYOUT | PAINT,
                     queued: true,
@@ -560,6 +588,7 @@ impl Scene {
                     isolated: false,
                     scroll_copy: false,
                     layer_revision: 0,
+                    paint_revision: 0,
                 }),
             }],
             free: Vec::new(),
@@ -619,7 +648,7 @@ impl Scene {
         self.slots[id.index as usize].node.as_mut().unwrap()
     }
     pub fn bounds(&self, id: NodeId) -> Rect {
-        self.world(id).0
+        self.world_paint_transform(id).bounds(self.node(id).bounds)
     }
     /// Settled layout allocation, excluding every paint translation.
     pub fn layout_bounds(&self, id: NodeId) -> Rect {
@@ -690,44 +719,162 @@ impl Scene {
     pub fn transform(&self, id: NodeId) -> Transform {
         self.node(id).transform
     }
+    pub fn paint_transform(&self, id: NodeId) -> Affine {
+        self.node(id).paint_transform
+    }
+    pub fn paint_transform_origin(&self, id: NodeId) -> [f32; 2] {
+        self.node(id).paint_origin
+    }
+    pub fn projection_transform(&self, id: NodeId) -> Affine {
+        self.node(id).projection_transform
+    }
+    /// Style affine and translation in node-local coordinates, around the
+    /// projected normalized pivot; excludes the projection matrix itself.
+    pub fn local_user_transform(&self, id: NodeId) -> Affine {
+        let node = self.node(id);
+        let (x, y) = node.projection_transform.point(
+            node.bounds.width * node.paint_origin[0],
+            node.bounds.height * node.paint_origin[1],
+        );
+        node.paint_transform
+            .around(x, y)
+            .then(Affine::translation(node.transform.x, node.transform.y))
+    }
+    pub fn local_paint_transform(&self, id: NodeId) -> Affine {
+        self.node(id)
+            .projection_transform
+            .then(self.local_user_transform(id))
+    }
+    /// Resolve a projection from the desired complete node-local paint matrix,
+    /// retaining the node's style affine and normalized pivot. A singular style
+    /// matrix has no unique solution and uses identity projection.
+    pub fn projection_for_paint(&self, id: NodeId, desired: Affine) -> Affine {
+        let node = self.node(id);
+        let (x, y) = desired.point(
+            node.bounds.width * node.paint_origin[0],
+            node.bounds.height * node.paint_origin[1],
+        );
+        let user = node.paint_transform.around(
+            x - node.transform.x - node.paint_transform.tx,
+            y - node.transform.y - node.paint_transform.ty,
+        );
+        let Some(inverse) = user.inverse() else {
+            return Affine::IDENTITY;
+        };
+        let projection = desired
+            .then(Affine::translation(-node.transform.x, -node.transform.y))
+            .then(inverse);
+        if projection.is_finite() {
+            projection
+        } else {
+            Affine::IDENTITY
+        }
+    }
+    fn node_matrix(&self, id: NodeId) -> Affine {
+        let node = self.node(id);
+        if node.paint_transform.is_translation() && node.projection_transform.is_translation() {
+            return Affine::translation(
+                node.paint_transform.tx + node.projection_transform.tx + node.transform.x,
+                node.paint_transform.ty + node.projection_transform.ty + node.transform.y,
+            );
+        }
+        self.local_paint_transform(id)
+            .around(node.bounds.x, node.bounds.y)
+    }
+    /// Maps absolute, unpainted layout coordinates into world coordinates.
+    pub fn world_paint_transform(&self, id: NodeId) -> Affine {
+        let mut matrix = self.node_matrix(id);
+        for ancestor in self.ancestors(id) {
+            matrix = matrix.then(self.node_matrix(ancestor));
+        }
+        matrix
+    }
+    pub fn paint_matrix(&self, id: NodeId) -> Affine {
+        self.world_paint_transform(id)
+    }
+    /// User affine hierarchy without projection linear terms, retaining the
+    /// actual projected pivots. Used to factor nested layout projection without
+    /// introducing jumps at rotated or scaled intermediate containers.
+    pub fn world_user_transform(&self, id: NodeId) -> Affine {
+        let mut path: Vec<_> = std::iter::once(id).chain(self.ancestors(id)).collect();
+        path.reverse();
+        let mut full = Affine::IDENTITY;
+        let mut user = Affine::IDENTITY;
+        for current in path {
+            let node = self.node(current);
+            full = self.node_matrix(current).then(full);
+            let (x, y) = full.point(
+                node.bounds.x + node.bounds.width * node.paint_origin[0],
+                node.bounds.y + node.bounds.height * node.paint_origin[1],
+            );
+            let Some(inverse) = user.inverse() else {
+                return Affine::IDENTITY;
+            };
+            let (x, y) = inverse.point(x, y);
+            let (tx, ty) = (
+                node.paint_transform.tx + node.transform.x,
+                node.paint_transform.ty + node.transform.y,
+            );
+            user = Affine {
+                tx: 0.,
+                ty: 0.,
+                ..node.paint_transform
+            }
+            .around(x - tx, y - ty)
+            .then(Affine::translation(tx, ty))
+            .then(user);
+        }
+        user
+    }
+    /// Projection only, excluding style translation, scale and rotation.
+    pub fn world_projection_transform(&self, id: NodeId) -> Affine {
+        let mut matrix = Affine::IDENTITY;
+        for current in std::iter::once(id).chain(self.ancestors(id)) {
+            let node = self.node(current);
+            matrix = matrix.then(
+                node.projection_transform
+                    .around(node.bounds.x, node.bounds.y),
+            );
+        }
+        matrix
+    }
+    pub fn local_to_world(&self, id: NodeId, x: f32, y: f32) -> (f32, f32) {
+        let bounds = self.node(id).bounds;
+        self.world_paint_transform(id)
+            .point(x + bounds.x, y + bounds.y)
+    }
+    pub fn world_to_local(&self, id: NodeId, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (x, y) = self.world_paint_transform(id).inverse()?.point(x, y);
+        let bounds = self.node(id).bounds;
+        Some((x - bounds.x, y - bounds.y))
+    }
     /// Ancestors from the immediate parent to the root.
     pub fn ancestors(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         std::iter::successors(self.parent(id), |id| self.parent(*id))
     }
     /// Front-to-back hit targets, including containers; call after flushing layout.
     pub fn hit_test_all(&self, x: f32, y: f32) -> Vec<NodeId> {
-        let contains = |r: Rect| x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height;
-        let mut hits: Vec<_> = self
-            .paint_items()
-            .filter(|item| {
-                item.effects.opacity > 0.0
-                    && match item.kind {
-                        NodeKind::Image(image) => image
-                            .paint_transform(item.bounds)
-                            .inverse()
-                            .is_some_and(|inverse| {
-                                let (x, y) = inverse.point(x, y);
-                                x >= item.bounds.x
-                                    && y >= item.bounds.y
-                                    && x < item.bounds.x + item.bounds.width
-                                    && y < item.bounds.y + item.bounds.height
-                            }),
-                        NodeKind::Svg(svg) => svg
-                            .paint_transform(item.bounds)
-                            .inverse()
-                            .is_some_and(|inverse| {
-                                let (x, y) = inverse.point(x, y);
-                                x >= item.bounds.x
-                                    && y >= item.bounds.y
-                                    && x < item.bounds.x + item.bounds.width
-                                    && y < item.bounds.y + item.bounds.height
-                            }),
-                        _ => contains(item.bounds),
-                    }
-                    && item.clip.is_none_or(contains)
-            })
-            .map(|item| item.id)
-            .collect();
+        let mut hits = Vec::new();
+        for item in self.paint_items() {
+            if item.effects.opacity <= 0.
+                || item.clip.is_some_and(|clip| !contains_point(clip, x, y))
+                || item.clip_regions.iter().any(|clip| !clip.contains(x, y))
+            {
+                continue;
+            }
+            let primitive = match item.kind {
+                NodeKind::Image(image) => image.paint_transform(item.bounds),
+                NodeKind::Svg(svg) => svg.paint_transform(item.bounds),
+                _ => Affine::IDENTITY,
+            }
+            .then(item.transform);
+            if primitive.inverse().is_some_and(|inverse| {
+                let (x, y) = inverse.point(x, y);
+                contains_point(item.bounds, x, y)
+            }) {
+                hits.push(item.id);
+            }
+        }
         hits.reverse();
         hits
     }
@@ -1073,6 +1220,9 @@ impl Scene {
             style,
             bounds: Rect::default(),
             transform: Transform::default(),
+            paint_transform: Affine::IDENTITY,
+            paint_origin: [0., 0.],
+            projection_transform: Affine::IDENTITY,
             effects: Effects::default(),
             dirty: LAYOUT | PAINT,
             queued: true,
@@ -1086,6 +1236,7 @@ impl Scene {
             isolated: false,
             scroll_copy: false,
             layer_revision: 0,
+            paint_revision: 0,
         };
         let id = if let Some(index) = self.free.pop() {
             self.slots[index as usize].node = Some(node);
@@ -1245,6 +1396,64 @@ impl Scene {
         self.damage_subtree(id);
         self.invalidate(id, COMPOSITE);
     }
+    /// Set a subtree transform in node-local coordinates. Non-finite matrices
+    /// normalize to identity; singular matrices deliberately paint no area.
+    pub fn set_paint_transform(&mut self, id: NodeId, matrix: Affine) {
+        self.set_paint_transform_origin(id, matrix, [0., 0.]);
+    }
+    /// A normalized pivot follows the allocation when layout changes.
+    pub fn set_paint_transform_origin(&mut self, id: NodeId, matrix: Affine, origin: [f32; 2]) {
+        let origin = origin.map(|value| if value.is_finite() { value } else { 0.5 });
+        if self.node(id).paint_origin != origin {
+            self.damage_subtree(id);
+            self.node_mut(id).paint_origin = origin;
+            self.invalidate_affine(id);
+            self.damage_subtree(id);
+        }
+        self.set_affine(id, matrix, false);
+    }
+    pub fn set_projection_transform(&mut self, id: NodeId, matrix: Affine) {
+        self.set_affine(id, matrix, true);
+    }
+    fn set_affine(&mut self, id: NodeId, matrix: Affine, projection: bool) {
+        let matrix = if matrix.is_finite() {
+            matrix
+        } else {
+            Affine::IDENTITY
+        };
+        let old = if projection {
+            self.node(id).projection_transform
+        } else {
+            self.node(id).paint_transform
+        };
+        if matrix == old {
+            return;
+        }
+        self.damage_subtree(id);
+        if projection {
+            self.node_mut(id).projection_transform = matrix;
+        } else {
+            self.node_mut(id).paint_transform = matrix;
+        }
+        self.invalidate_affine(id);
+        self.damage_subtree(id);
+    }
+    fn invalidate_affine(&mut self, id: NodeId) {
+        self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        // Explicit isolated layers currently cache in world space, including
+        // descendants whose axis-aligned coverage can stay unchanged on a flip.
+        if self.isolation_count > 0 {
+            let isolated: Vec<_> = self
+                .isolated_nodes()
+                .filter(|node| self.is_within(*node, id))
+                .collect();
+            for node in isolated {
+                self.node_mut(node).layer_revision = self.node(node).layer_revision.wrapping_add(1);
+            }
+        }
+        self.raster_revision = self.raster_revision.wrapping_add(1);
+        self.invalidate(id, COMPOSITE);
+    }
     /// Apply finite render effects. NaN opacity uses the opaque default;
     /// infinite opacity clamps to its endpoint. Non-finite filter radii disable
     /// their filter, and negative radii clamp to zero.
@@ -1288,6 +1497,7 @@ impl Scene {
     }
     fn invalidate(&mut self, id: NodeId, flags: u8) {
         if flags & (LAYOUT | PAINT) != 0 {
+            self.node_mut(id).paint_revision = self.node(id).paint_revision.wrapping_add(1);
             self.raster_revision = self.raster_revision.wrapping_add(1);
         }
         if self.isolation_count > 0 || self.scroll_copy_count > 0 {
@@ -1385,43 +1595,23 @@ impl Scene {
         }
     }
     fn world(&self, id: NodeId) -> (Rect, Effects, Option<Rect>) {
-        let node = self.node(id);
-        let mut transform = node.transform;
-        let mut effects = node.effects;
-        if !own_visible(&node.style) {
-            effects.opacity = 0.;
-        }
-        let mut parent = node.parent;
-        while let Some(id) = parent {
-            let ancestor = self.node(id);
-            transform.x += ancestor.transform.x;
-            transform.y += ancestor.transform.y;
-            effects.opacity *= if own_visible(&ancestor.style) {
-                ancestor.effects.opacity
-            } else {
-                0.
-            };
-            parent = ancestor.parent;
-        }
-        let bounds = node.bounds.translated(transform);
+        let mut path: Vec<_> = std::iter::once(id).chain(self.ancestors(id)).collect();
+        path.reverse();
+        let mut matrix = Affine::IDENTITY;
+        let mut effects = self.node(id).effects;
         let mut clip = Some(self.viewport);
-        let mut current = Some(id);
-        while let Some(id) = current {
-            let ancestor = self.node(id);
-            if clip_axes(&ancestor.style) != (false, false) {
-                let mut offset = ancestor.transform;
-                let mut parent = ancestor.parent;
-                while let Some(parent_id) = parent {
-                    let p = self.node(parent_id);
-                    offset.x += p.transform.x;
-                    offset.y += p.transform.y;
-                    parent = p.parent;
-                }
-                clip = clipped_bounds(clip, ancestor.bounds.translated(offset), &ancestor.style);
+        for current in path {
+            let ancestor = self.node(current);
+            matrix = self.node_matrix(current).then(matrix);
+            if !own_visible(&ancestor.style) {
+                effects.opacity = 0.;
             }
-            current = ancestor.parent;
+            if current != id {
+                effects.opacity *= ancestor.effects.opacity;
+            }
+            clip = clipped_affine_bounds(clip, ancestor.bounds, matrix, &ancestor.style);
         }
-        (bounds, effects, clip)
+        (matrix.bounds(self.node(id).bounds), effects, clip)
     }
     fn damage_subtree(&mut self, id: NodeId) {
         if !self.shown(id) {
@@ -1431,11 +1621,19 @@ impl Scene {
         // instead of walking back up from every descendant.
         let (transform, clip) = match self.node(id).parent {
             Some(parent) => self.world_context(parent),
-            None => (Transform::default(), Some(self.viewport)),
+            None => (Affine::IDENTITY, Some(self.viewport)),
         };
-        self.damage_subtree_in(id, transform, clip);
+        let isolated =
+            self.isolation_count > 0 && self.ancestors(id).any(|node| self.node(node).isolated);
+        self.damage_subtree_in(id, transform, clip, isolated);
     }
-    fn damage_subtree_in(&mut self, id: NodeId, parent: Transform, parent_clip: Option<Rect>) {
+    fn damage_subtree_in(
+        &mut self,
+        id: NodeId,
+        parent: Affine,
+        parent_clip: Option<Rect>,
+        isolated: bool,
+    ) {
         let node = self.node(id);
         // Not laid out since it was appended, so never painted: nothing to
         // repaint yet (a mounting row styles each node before its first
@@ -1444,35 +1642,32 @@ impl Scene {
         if !own_visible(&node.style) || unplaced {
             return;
         }
-        let transform = Transform {
-            x: parent.x + node.transform.x,
-            y: parent.y + node.transform.y,
-        };
-        let bounds = node.bounds.translated(transform);
-        let clip = if clip_axes(&node.style) != (false, false) {
-            clipped_bounds(parent_clip, bounds, &node.style)
-        } else {
-            parent_clip
-        };
-        self.damage_painted(id, bounds, node.effects.blur_radius, clip);
+        let transform = self.node_matrix(id).then(parent);
+        let bounds = transform.bounds(node.bounds);
+        let clip = clipped_affine_bounds(parent_clip, node.bounds, transform, &node.style);
+        // Transform ink before clipping: rotated shadows and glyph overhang can
+        // exceed the transformed allocation's axis-aligned box.
+        let isolated = isolated || self.node(id).isolated;
+        let ink = self.own_ink(id).map(|ink| {
+            let ink = transform.bounds(ink);
+            if isolated { ink.expand(1.) } else { ink }
+        });
+        if let Some(ink) = ink.and_then(|ink| clip.map_or(Some(ink), |clip| ink.intersection(clip)))
+        {
+            self.add_damage(ink);
+        }
+        if self.node(id).effects.blur_radius > 0. {
+            self.add_damage(bounds);
+        }
         for index in 0..self.node(id).children.len() {
             let child = self.node(id).children[index];
-            self.damage_subtree_in(child, transform, clip);
+            self.damage_subtree_in(child, transform, clip, isolated);
         }
     }
     /// World translation of `id` including its own, and the clip its children
     /// paint within.
-    fn world_context(&self, id: NodeId) -> (Transform, Option<Rect>) {
-        let (_, _, clip) = self.world(id);
-        let mut transform = Transform::default();
-        let mut current = Some(id);
-        while let Some(id) = current {
-            let node = self.node(id);
-            transform.x += node.transform.x;
-            transform.y += node.transform.y;
-            current = node.parent;
-        }
-        (transform, clip)
+    fn world_context(&self, id: NodeId) -> (Affine, Option<Rect>) {
+        (self.world_paint_transform(id), self.world(id).2)
     }
     /// See `Node::ink`. Computed on demand and cached until invalidated.
     fn ink(&self, id: NodeId) -> Option<Rect> {
@@ -1493,7 +1688,7 @@ impl Scene {
         }
         let ink = ink
             .and_then(|ink| clipped_bounds(Some(ink), node.bounds, &node.style))
-            .map(|ink| ink.translated(node.transform));
+            .map(|ink| self.node_matrix(id).bounds(ink));
         node.ink.set(ink);
         node.ink_valid.set(true);
         ink
@@ -1632,20 +1827,23 @@ impl Scene {
         self.damage_painted(id, bounds, effects.blur_radius, clip);
     }
     fn damage_painted(&mut self, id: NodeId, bounds: Rect, blur_radius: f32, clip: Option<Rect>) {
-        if !matches!(self.node(id).kind, NodeKind::Container(_)) || blur_radius > 0.0 {
-            let bounds = match &self.node(id).kind {
-                NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } => quad.paint_bounds(bounds),
-                NodeKind::Image(image) => image.paint_bounds(bounds),
-                NodeKind::Svg(svg) => svg.paint_bounds(bounds),
-                NodeKind::Text { .. } | NodeKind::RichText { .. } if blur_radius <= 0.0 => {
-                    self.text_ink(id, bounds)
-                }
-                _ => bounds,
-            };
-            // A backdrop filter samples only inside its bounds.
-            if let Some(bounds) = clip.and_then(|clip| bounds.intersection(clip)) {
-                self.add_damage(bounds);
-            }
+        let isolated = self.isolation_count > 0
+            && std::iter::once(id)
+                .chain(self.ancestors(id))
+                .any(|node| self.node(node).isolated);
+        let ink = self.own_ink(id).map(|ink| {
+            let ink = self.world_paint_transform(id).bounds(ink);
+            if isolated { ink.expand(1.) } else { ink }
+        });
+        let ink = if blur_radius > 0. {
+            Some(ink.map_or(bounds, |ink| ink.union(bounds)))
+        } else {
+            ink
+        };
+        if let Some(bounds) =
+            ink.and_then(|ink| clip.map_or(Some(ink), |clip| ink.intersection(clip)))
+        {
+            self.add_damage(bounds);
         }
     }
     fn measure(&mut self, id: NodeId, constraints: Constraints) -> (f32, f32) {
@@ -2331,7 +2529,7 @@ impl Scene {
                 let mut current = Some(id);
                 let mut found = false;
                 while let Some(node) = current {
-                    found |= self.node(node).isolated;
+                    found |= self.node(node).isolated || !self.node_matrix(node).is_translation();
                     current = self.node(node).parent;
                 }
                 found
@@ -2452,6 +2650,11 @@ impl Scene {
     pub fn layer_revision(&self, id: NodeId) -> u64 {
         self.node(id).layer_revision
     }
+    /// This node's raster content/layout revision, excluding paint transforms,
+    /// opacity and ancestor changes. Useful for retaining local primitive pixels.
+    pub fn paint_revision(&self, id: NodeId) -> u64 {
+        self.node(id).paint_revision
+    }
     pub fn isolated_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.slots.iter().enumerate().filter_map(|(index, slot)| {
             slot.node
@@ -2477,6 +2680,11 @@ impl Scene {
                 image.paint_bounds(item.bounds)
             } else {
                 item.bounds
+            };
+            let r = if item.isolated {
+                r
+            } else {
+                item.transform.bounds(r)
             };
             let r = item.clip.map_or(Some(r), |clip| r.intersection(clip));
             if let Some(r) = r {
@@ -2540,42 +2748,59 @@ impl Scene {
                 .reduce(Rect::union)
                 .unwrap_or_default()
         });
-        let touches = |ink: Option<Rect>, transform: Transform| -> bool {
+        let touches = |ink: Option<Rect>, transform: Affine| -> bool {
             let (Some(damage), Some(reach)) = (damage, reach) else {
                 return true;
             };
             let Some(ink) = ink else {
                 return false;
             };
-            let ink = ink.translated(transform);
+            let ink = transform.bounds(ink);
+            // Cached isolated images filter one pixel beyond raster coverage.
+            // Expand after world composition so an ancestor's scale cannot
+            // magnify this conservative sampling halo.
+            let ink = if self.isolation_count > 0 {
+                ink.expand(1.)
+            } else {
+                ink
+            };
             ink.intersects(reach) && damage.iter().any(|d| d.intersects(ink))
         };
         let start = root.unwrap_or(self.root);
         if !self.layout_visible(start) {
             return Vec::new();
         }
-        let mut transform = Transform::default();
-        let mut parent = self.node(start).parent;
-        while let Some(id) = parent {
-            let n = self.node(id);
-            transform.x += n.transform.x;
-            transform.y += n.transform.y;
-            parent = n.parent;
-        }
+        let transform = self.node(start).parent.map_or(Affine::IDENTITY, |parent| {
+            self.world_paint_transform(parent)
+        });
         let clip = if root.is_some() {
             None
         } else {
             Some(self.viewport)
         };
-        let mut stack = vec![(start, transform, 1., clip, None::<(Rect, [f32; 2])>)];
+        let mut stack = vec![(
+            start,
+            transform,
+            1.,
+            clip,
+            None::<FadeMask>,
+            std::rc::Rc::<[PaintClip]>::from([]),
+            Affine::IDENTITY,
+        )];
         let mut result = Vec::new();
-        while let Some((id, parent_transform, parent_opacity, parent_clip, mask)) = stack.pop() {
+        while let Some((
+            id,
+            parent_transform,
+            parent_opacity,
+            parent_clip,
+            mask,
+            regions,
+            fade_transform,
+        )) = stack.pop()
+        {
             let node = self.node(id);
-            let transform = Transform {
-                x: parent_transform.x + node.transform.x,
-                y: parent_transform.y + node.transform.y,
-            };
-            let bounds = node.bounds.translated(transform);
+            let matrix = self.node_matrix(id).then(parent_transform);
+            let (bounds, transform) = primitive_coordinates(node.bounds, matrix);
             let is_root = root == Some(id);
             let isolated = node.isolated && !is_root;
             let mut effects = if is_root {
@@ -2589,21 +2814,36 @@ impl Scene {
             if effects.opacity <= 0.0 || !own_visible(&node.style) {
                 continue;
             }
-            let clip = clipped_bounds(parent_clip, bounds, &node.style);
-            let child_mask = fade_mask(mask, clip, &node.style);
+            let clip = clipped_affine_bounds(parent_clip, node.bounds, matrix, &node.style);
+            let regions = transformed_clips(regions, node.bounds, matrix, &node.style);
+            let (child_mask, child_fade_transform) =
+                transformed_fade(mask, fade_transform, clip, node.bounds, matrix, &node.style);
             if !isolated {
                 stack.extend(
                     node.children
                         .iter()
                         .rev()
-                        .filter(|child| touches(self.ink(**child), transform))
-                        .map(|child| (*child, transform, effects.opacity, clip, child_mask)),
+                        .filter(|child| touches(self.ink(**child), matrix))
+                        .map(|child| {
+                            (
+                                *child,
+                                matrix,
+                                effects.opacity,
+                                clip,
+                                child_mask,
+                                regions.clone(),
+                                child_fade_transform,
+                            )
+                        }),
                 );
             }
             result.push(PaintItem {
                 isolated,
                 id,
                 bounds,
+                transform,
+                clip_regions: regions,
+                fade_transform,
                 kind: &node.kind,
                 font: &node.font,
                 text_options: node.style.text_options,
@@ -2617,7 +2857,15 @@ impl Scene {
     pub fn paint_items(&self) -> impl Iterator<Item = PaintItem<'_>> {
         PaintIter {
             scene: self,
-            stack: vec![(self.root, Transform::default(), 1.0, self.viewport, None)],
+            stack: vec![(
+                self.root,
+                Affine::IDENTITY,
+                1.0,
+                self.viewport,
+                None,
+                std::rc::Rc::from([]),
+                Affine::IDENTITY,
+            )],
         }
     }
 }
@@ -2653,37 +2901,61 @@ fn clipped_bounds(parent: Option<Rect>, bounds: Rect, style: &Style) -> Option<R
     );
     Some(base.intersection(mask).unwrap_or_default())
 }
+type PaintState = (
+    NodeId,
+    Affine,
+    f32,
+    Rect,
+    Option<FadeMask>,
+    std::rc::Rc<[PaintClip]>,
+    Affine,
+);
 struct PaintIter<'a> {
     scene: &'a Scene,
-    stack: Vec<(NodeId, Transform, f32, Rect, Option<FadeMask>)>,
+    stack: Vec<PaintState>,
 }
 impl<'a> Iterator for PaintIter<'a> {
     type Item = PaintItem<'a>;
     fn next(&mut self) -> Option<Self::Item> {
-        let (id, parent_transform, parent_opacity, parent_clip, mask) = self.stack.pop()?;
+        let (id, parent_transform, parent_opacity, parent_clip, mask, regions, fade_transform) =
+            self.stack.pop()?;
         let node = self.scene.node(id);
-        let transform = Transform {
-            x: parent_transform.x + node.transform.x,
-            y: parent_transform.y + node.transform.y,
-        };
-        let bounds = node.bounds.translated(transform);
+        let matrix = self.scene.node_matrix(id).then(parent_transform);
+        let (bounds, transform) = primitive_coordinates(node.bounds, matrix);
         let mut effects = node.effects;
         if !own_visible(&node.style) {
             effects.opacity = 0.;
         }
         effects.opacity *= parent_opacity;
-        let clip = clipped_bounds(Some(parent_clip), bounds, &node.style).unwrap_or(parent_clip);
-        let child_mask = fade_mask(mask, Some(clip), &node.style);
-        self.stack.extend(
-            node.children
-                .iter()
-                .rev()
-                .map(|child| (*child, transform, effects.opacity, clip, child_mask)),
+        let clip = clipped_affine_bounds(Some(parent_clip), node.bounds, matrix, &node.style)
+            .unwrap_or(parent_clip);
+        let regions = transformed_clips(regions, node.bounds, matrix, &node.style);
+        let (child_mask, child_fade_transform) = transformed_fade(
+            mask,
+            fade_transform,
+            Some(clip),
+            node.bounds,
+            matrix,
+            &node.style,
         );
+        self.stack.extend(node.children.iter().rev().map(|child| {
+            (
+                *child,
+                matrix,
+                effects.opacity,
+                clip,
+                child_mask,
+                regions.clone(),
+                child_fade_transform,
+            )
+        }));
         Some(PaintItem {
             isolated: false,
             id,
             bounds,
+            transform,
+            clip_regions: regions,
+            fade_transform,
             kind: &node.kind,
             font: &node.font,
             text_options: node.style.text_options,
@@ -2693,10 +2965,455 @@ impl<'a> Iterator for PaintIter<'a> {
         })
     }
 }
+fn contains_point(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
+}
+fn primitive_coordinates(bounds: Rect, matrix: Affine) -> (Rect, Affine) {
+    if matrix.is_translation() {
+        (
+            bounds.translated(Transform {
+                x: matrix.tx,
+                y: matrix.ty,
+            }),
+            Affine::IDENTITY,
+        )
+    } else {
+        (bounds, matrix)
+    }
+}
+fn transformed_clips(
+    inherited: std::rc::Rc<[PaintClip]>,
+    bounds: Rect,
+    matrix: Affine,
+    style: &Style,
+) -> std::rc::Rc<[PaintClip]> {
+    let axes = clip_axes(style);
+    if axes == (false, false) || matrix.is_translation() {
+        return inherited;
+    }
+    let mut regions = inherited.to_vec();
+    if let Some(inverse) = matrix.inverse() {
+        regions.push(PaintClip {
+            bounds,
+            inverse,
+            axes: [axes.0, axes.1],
+        });
+    } else {
+        regions.push(PaintClip {
+            bounds: Rect::default(),
+            inverse: Affine::IDENTITY,
+            axes: [true, true],
+        });
+    }
+    regions.into()
+}
+fn clipped_affine_bounds(
+    parent: Option<Rect>,
+    bounds: Rect,
+    matrix: Affine,
+    style: &Style,
+) -> Option<Rect> {
+    let axes = clip_axes(style);
+    if !matrix.is_translation() && axes != (true, true) {
+        return parent;
+    }
+    clipped_bounds(parent, matrix.bounds(bounds), style)
+}
+fn transformed_fade(
+    inherited: Option<FadeMask>,
+    inverse: Affine,
+    clip: Option<Rect>,
+    bounds: Rect,
+    matrix: Affine,
+    style: &Style,
+) -> (Option<FadeMask>, Affine) {
+    if style.fade_edges.iter().any(|band| *band > 0.) && !matrix.is_translation() {
+        (
+            Some((bounds, style.fade_edges.map(|band| band.max(0.)))),
+            matrix.inverse().unwrap_or(Affine::IDENTITY),
+        )
+    } else if style.fade_edges.iter().any(|band| *band > 0.) {
+        (fade_mask(inherited, clip, style), Affine::IDENTITY)
+    } else {
+        (inherited, inverse)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subtree_affine_composes_with_translation_and_inverse_input() {
+        let mut scene = Scene::new(300., 300.);
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(40.),
+                height: Some(40.),
+                ..Default::default()
+            },
+        );
+        let child = scene.append(
+            parent,
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(10.),
+                height: Some(8.),
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        scene.set_paint_transform(parent, Affine::scale(2., 3.));
+        scene.set_transform(parent, Transform { x: 50., y: 40. });
+        let report = scene.flush();
+        assert_eq!(report.layout_nodes, 0);
+        assert_eq!(scene.bounds(child), Rect::new(50., 40., 20., 24.));
+        let local = scene.world_to_local(child, 58., 52.).unwrap();
+        // Inverting a 3x scale rounds 1/3 in f32; compare the mathematical
+        // round trip with the same tolerance as the affine inverse tests.
+        assert!((local.0 - 4.).abs() < 0.0001 && (local.1 - 4.).abs() < 0.0001);
+        assert_eq!(scene.hit_test(58., 52.), Some(child));
+        assert!(!scene.hit_test_all(73., 52.).contains(&child));
+        let item = scene.paint_items().find(|item| item.id == child).unwrap();
+        assert_eq!(item.bounds, scene.layout_bounds(child));
+        assert_eq!(item.transform.bounds(item.bounds), scene.bounds(child));
+    }
+    #[test]
+    fn affine_origin_tracks_resizing_and_singular_nodes_do_not_hit() {
+        let mut scene = Scene::new(300., 300.);
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(40.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        scene.set_paint_transform_origin(node, Affine::scale(2., 2.), [0.5, 0.5]);
+        scene.flush();
+        assert_eq!(scene.bounds(node), Rect::new(-20., -10., 80., 40.));
+        let mut style = scene.style(node);
+        style.width = Some(80.);
+        scene.set_style(node, style);
+        scene.flush();
+        assert_eq!(scene.bounds(node), Rect::new(-40., -10., 160., 40.));
+        scene.set_paint_transform(node, Affine::scale(0., 1.));
+        scene.flush();
+        assert!(!scene.hit_test_all(0., 5.).contains(&node));
+        scene.set_paint_transform(node, Affine::scale(f32::NAN, 1.));
+        scene.flush();
+        assert_eq!(scene.paint_transform(node), Affine::IDENTITY);
+    }
+    #[test]
+    fn projection_preserves_user_scale_pivot_when_allocation_resizes() {
+        let mut scene = Scene::new(300., 100.);
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(100.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        scene.set_paint_transform_origin(node, Affine::scale(2., 1.), [0.5, 0.5]);
+        scene.flush();
+        assert_eq!(scene.bounds(node).x, -50.);
+        let mut style = scene.style(node);
+        style.width = Some(200.);
+        scene.set_style(node, style);
+        scene.prepare_layout();
+        scene.set_projection_transform(node, Affine::scale(0.5, 1.));
+        scene.flush();
+        assert_eq!(scene.bounds(node).x, -50.);
+        assert_eq!(scene.bounds(node).width, 200.);
+    }
+    #[test]
+    fn projection_solver_roundtrips_rotation_translation_and_normalized_pivot() {
+        let mut scene = Scene::new(300., 300.);
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(80.),
+                height: Some(40.),
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        scene.set_paint_transform_origin(
+            node,
+            Affine::rotation(0.7).then(Affine::translation(3., -2.)),
+            [0.25, 0.75],
+        );
+        scene.set_transform(node, Transform { x: 7., y: 5. });
+        let expected = Affine::scale(0.6, 1.4).then(Affine::translation(8., -9.));
+        scene.set_projection_transform(node, expected);
+        let desired = scene.local_paint_transform(node);
+        scene.set_projection_transform(node, Affine::IDENTITY);
+        let actual = scene.projection_for_paint(node, desired);
+        for (actual, expected) in [
+            (actual.a, expected.a),
+            (actual.b, expected.b),
+            (actual.c, expected.c),
+            (actual.d, expected.d),
+            (actual.tx, expected.tx),
+            (actual.ty, expected.ty),
+        ] {
+            assert!(
+                (actual - expected).abs() < 0.0001,
+                "actual={actual} expected={expected}"
+            );
+        }
+    }
+    #[test]
+    fn nonuniform_projection_preserves_rotated_primitive_axes() {
+        let mut scene = Scene::new(300., 300.);
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(100.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        scene.set_paint_transform_origin(
+            node,
+            Affine::rotation(std::f32::consts::FRAC_PI_2),
+            [0.5, 0.5],
+        );
+        scene.flush();
+        let before = scene.bounds(node);
+        let mut style = scene.style(node);
+        style.width = Some(200.);
+        scene.set_style(node, style);
+        scene.prepare_layout();
+        scene.set_projection_transform(node, Affine::scale(0.5, 1.));
+        scene.flush();
+        let after = scene.bounds(node);
+        for (before, after) in [
+            (before.x, after.x),
+            (before.y, after.y),
+            (before.width, after.width),
+            (before.height, after.height),
+        ] {
+            assert!(
+                (before - after).abs() < 0.0001,
+                "before={before} after={after}"
+            );
+        }
+    }
+    #[test]
+    fn rotated_clip_rejects_aabb_corners_and_keeps_unclipped_axis_overflow() {
+        let mut scene = Scene::new(300., 300.);
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(20.),
+                height: Some(20.),
+                clip: true,
+                ..Default::default()
+            },
+        );
+        let child = scene.append(
+            parent,
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(20.),
+                height: Some(60.),
+                flex_shrink: 0.,
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        scene.set_paint_transform(parent, Affine::rotation(std::f32::consts::FRAC_PI_4));
+        scene.set_transform(parent, Transform { x: 100., y: 50. });
+        scene.flush();
+        assert!(!scene.hit_test_all(87., 51.).contains(&child));
+        assert!(scene.hit_test_all(100., 64.).contains(&child));
+        let mut style = scene.style(parent);
+        style.layout_options = Some(Arc::new(crate::layout::LayoutOptions {
+            clip_x: Some(true),
+            clip_y: Some(false),
+            ..Default::default()
+        }));
+        scene.set_style(parent, style);
+        scene.flush();
+        let (x, y) = scene.local_to_world(parent, 10., 40.);
+        assert!(scene.hit_test_all(x, y).contains(&child));
+        let item = scene
+            .layer_items(None)
+            .into_iter()
+            .find(|item| item.id == child)
+            .unwrap();
+        assert!(item.clip.unwrap().height > scene.bounds(parent).height);
+        assert_eq!(item.clip_regions.len(), 1);
+    }
+    #[test]
+    fn isolated_sampling_halo_is_damaged_and_survives_wrapper_culling() {
+        let mut scene = Scene::new(200., 200.);
+        let wrapper = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(80.),
+                height: Some(80.),
+                ..Default::default()
+            },
+        );
+        let node = scene.append(
+            wrapper,
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(20.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.set_isolated(node, true);
+        scene.set_transform(wrapper, Transform { x: 70.8, y: 70.8 });
+        scene.set_paint_transform(node, Affine::rotation(0.3));
+        scene.flush();
+        let bounds = scene.bounds(node);
+        let halo = Rect::new(bounds.x - 0.75, bounds.y + bounds.height * 0.5, 0.25, 0.25);
+        assert!(
+            scene
+                .layer_items_within(None, Some(&[halo]))
+                .iter()
+                .any(|item| item.id == node)
+        );
+        scene.set_paint_transform(node, Affine::rotation(0.4));
+        let report = scene.flush();
+        assert!(report.damage.iter().any(|damage| damage.intersects(halo)));
+    }
+    #[test]
+    fn user_world_hierarchy_matches_full_world_when_projection_is_identity() {
+        let mut scene = Scene::new(300., 300.);
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(100.),
+                height: Some(100.),
+                ..Default::default()
+            },
+        );
+        let child = scene.append(
+            parent,
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(20.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.flush();
+        scene.set_paint_transform_origin(parent, Affine::scale(2., 0.5), [0.5, 0.5]);
+        scene.set_transform(parent, Transform { x: 70., y: 80. });
+        scene.set_paint_transform_origin(
+            child,
+            Affine::rotation(0.7).then(Affine::translation(3., -2.)),
+            [0.25, 0.75],
+        );
+        let full = scene.world_paint_transform(child);
+        let user = scene.world_user_transform(child);
+        for point in [(0., 0.), (10., 5.), (20., 20.)] {
+            let actual = user.point(point.0, point.1);
+            let expected = full.point(point.0, point.1);
+            assert!(
+                (actual.0 - expected.0).abs() < 0.0001 && (actual.1 - expected.1).abs() < 0.0001
+            );
+        }
+    }
+    #[test]
+    fn transformed_fade_uses_local_y_and_isolated_flip_invalidates_cached_pixels() {
+        let mut scene = Scene::new(200., 200.);
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(40.),
+                height: Some(40.),
+                clip: true,
+                fade_edges: [8., 4.],
+                ..Default::default()
+            },
+        );
+        let child = scene.append(
+            parent,
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(10.),
+                height: Some(10.),
+                ..Default::default()
+            },
+        );
+        scene.set_isolated(child, true);
+        scene.set_transform(parent, Transform { x: 100., y: 100. });
+        scene.flush();
+        let revision = scene.layer_revision(child);
+        scene.set_paint_transform_origin(
+            parent,
+            Affine::rotation(std::f32::consts::FRAC_PI_2),
+            [0.5, 0.5],
+        );
+        let report = scene.flush();
+        assert_eq!(report.layout_nodes, 0);
+        assert_eq!(report.paint_nodes, 0);
+        assert!(scene.layer_revision(child) > revision);
+        let item = scene.paint_items().find(|item| item.id == child).unwrap();
+        let (x, y) = scene.local_to_world(parent, 10., 3.);
+        let (_, local_y) = item.fade_transform.point(x, y);
+        assert!((local_y - (scene.layout_bounds(parent).y + 3.)).abs() < 0.0001);
+        assert_eq!(item.mask.unwrap().1, [8., 4.]);
+    }
+    #[test]
+    fn affine_damage_covers_old_new_ink_and_scroll_copy_falls_back() {
+        let mut scene = Scene::new(300., 300.);
+        let parent = scene.append(
+            scene.root(),
+            NodeKind::Container(Layout::Overlay),
+            Style {
+                width: Some(80.),
+                height: Some(80.),
+                clip: true,
+                ..Default::default()
+            },
+        );
+        let child = scene.append(
+            parent,
+            NodeKind::Rect(Color(255, 0, 0, 255)),
+            Style {
+                width: Some(20.),
+                height: Some(20.),
+                ..Default::default()
+            },
+        );
+        scene.set_transform(parent, Transform { x: 60., y: 60. });
+        scene.flush();
+        scene.set_paint_transform(parent, Affine::rotation(std::f32::consts::FRAC_PI_2));
+        let report = scene.flush();
+        for point in [(65., 65.), (45., 65.)] {
+            assert!(
+                report
+                    .damage
+                    .iter()
+                    .any(|damage| contains_point(*damage, point.0, point.1))
+            );
+        }
+        scene.set_scroll_copy(child, true);
+        scene.set_transform(child, Transform { x: 0., y: -3. });
+        let report = scene.flush();
+        assert!(scene.scroll_moves().is_empty());
+        assert!(!report.damage.is_empty());
+    }
     #[test]
     fn damage_keeps_thin_strips_disjoint_without_inflating_the_viewport() {
         let mut regions = Vec::new();

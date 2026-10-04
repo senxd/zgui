@@ -72,6 +72,9 @@ impl Affine {
             .iter()
             .all(|n| n.is_finite())
     }
+    pub fn is_translation(self) -> bool {
+        self.a == 1. && self.b == 0. && self.c == 0. && self.d == 1.
+    }
     pub fn point(self, x: f32, y: f32) -> (f32, f32) {
         (
             self.a * x + self.c * y + self.tx,
@@ -102,6 +105,27 @@ impl Affine {
     /// Axis-aligned coverage of all four transformed corners. Unrepresentable
     /// geometry is empty rather than introducing NaN into damage tracking.
     pub fn bounds(self, bounds: Rect) -> Rect {
+        if self.is_translation() && bounds.width >= 0. && bounds.height >= 0. {
+            let bounds = Rect::new(
+                bounds.x + self.tx,
+                bounds.y + self.ty,
+                bounds.width,
+                bounds.height,
+            );
+            return if [
+                bounds.x,
+                bounds.y,
+                bounds.x + bounds.width,
+                bounds.y + bounds.height,
+            ]
+            .iter()
+            .all(|value| value.is_finite())
+            {
+                bounds
+            } else {
+                Rect::default()
+            };
+        }
         let corners = [
             (bounds.x, bounds.y),
             (bounds.x + bounds.width, bounds.y),

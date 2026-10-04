@@ -14,6 +14,7 @@ mod effect_chain;
 mod gaussian;
 #[cfg(target_os = "macos")]
 mod native_surface;
+mod paint_geometry;
 mod procedural;
 pub mod profiling;
 mod surface;
@@ -95,6 +96,7 @@ pub struct GpuStats {
     pub svg_rasterizations: usize,
     pub geometry_rebuilds: usize,
     pub vertex_buffer_allocations: usize,
+    pub paint_geometry_buffer_allocations: usize,
     pub damaged_pixels: u64,
     pub layer_repaints: usize,
     pub layer_cache_hits: usize,
@@ -126,6 +128,7 @@ pub struct DebugCacheStats {
     pub canvas_raster_bytes: usize,
     pub svg_raster_bytes: usize,
     pub vertex_buffer_bytes: usize,
+    pub paint_geometry_bytes: usize,
     pub layer_textures: usize,
     pub layer_bytes: usize,
     /// One older fractional-scroll origin; capped at 64 MiB.
@@ -316,7 +319,12 @@ fn opaque_interior(quads: &mut Vec<Quad>, start: u32, scale: f32, clip: Rect, da
 /// `split`: software and integrated GPUs benefit from lighter shaders for
 /// backgrounds; discrete GPUs favor fewer draws through the full shader.
 fn push_draw(draws: &mut Vec<Draw>, quads: &[Quad], draw: Draw, split: bool, scale: f32) {
-    if !split || draw.blur.is_some() || draw.layer.is_some() || draw.end <= draw.start {
+    if draw.geometry_offset != 0
+        || !split
+        || draw.blur.is_some()
+        || draw.layer.is_some()
+        || draw.end <= draw.start
+    {
         draws.push(draw);
         return;
     }
@@ -360,6 +368,13 @@ fn copy_repair(
 ) -> Option<ScrollRepair> {
     let clip = scroll.clip;
     let items = scene.layer_items_within(None, Some(&[clip]));
+    if items.iter().any(|item| {
+        item.transform != zgui::affine::Affine::IDENTITY
+            || !item.clip_regions.is_empty()
+            || item.fade_transform != zgui::affine::Affine::IDENTITY
+    }) {
+        return None;
+    }
     let content = |item: &zgui::scene::PaintItem<'_>| scene.is_within(item.id, scroll.node);
     let first = items.iter().position(content)?;
     let last = items.iter().rposition(content).expect("found above");
@@ -447,6 +462,11 @@ fn scroll_item_bounds(
     if item.effects.opacity <= 0. {
         return None;
     }
+    let bounds = if item.isolated {
+        bounds
+    } else {
+        item.transform.bounds(bounds)
+    };
     bounds.intersection(item.clip?)?.intersection(clip)
 }
 /// Positioned glyphs of laid-out runs; rich text takes each glyph's colour
@@ -594,7 +614,8 @@ fn occluded_from(
                 *h as f32 / scale,
             );
             for draw in draws.iter().rev() {
-                if draw.image.is_some()
+                if draw.geometry_offset != 0
+                    || draw.image.is_some()
                     || draw.layer.is_some()
                     || draw.blur.is_some()
                     || !covers(draw.bounds, pixels)
@@ -683,6 +704,10 @@ struct LayerCache {
 }
 #[derive(Clone)]
 struct Draw {
+    transform: zgui::affine::Affine,
+    geometry_offset: u32,
+    geometry_hash: u64,
+    geometry: Option<wgpu::BindGroup>,
     /// How its quads are drawn; set by `push_draw`.
     shading: Shading,
     blur: Option<(NodeId, Rect, zgui::scene::Effects)>,
@@ -698,6 +723,7 @@ struct Draw {
 /// A frame's damage, encoded at presentation so it can be drawn into the
 /// next retained target and the drawable in one pass (see `present_single_pass`).
 struct Deferred {
+    geometry: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     draws: Vec<Draw>,
     regions: Vec<(Rect, (u32, u32, u32, u32))>,
@@ -717,6 +743,7 @@ struct Deferred {
 /// horizontal pass's scratch textures (see `GpuRenderer::blur`).
 #[derive(Clone)]
 struct VerticalBlur {
+    geometry: Option<(wgpu::BindGroup, u32)>,
     bind: wgpu::BindGroup,
     scissors: Vec<(u32, u32, u32, u32)>,
     prepasses: usize,
@@ -727,6 +754,7 @@ struct VerticalBlur {
 /// its original pixels; the vertical draws write the target, or the target
 /// and a drawable of `both`'s format at presentation.
 struct BlurPipelines {
+    geometry_layout: Option<wgpu::BindGroupLayout>,
     shader: wgpu::ShaderModule,
     /// Shared by every vertical pipeline so one bind group serves each.
     layout: wgpu::BindGroupLayout,
@@ -797,6 +825,7 @@ impl BlurPipelines {
             &shader,
             Some(&layout),
             "fs_split",
+            None,
             &[target.clone(), target.clone()],
         );
         let vertical = Self::pipeline(
@@ -804,9 +833,11 @@ impl BlurPipelines {
             &shader,
             Some(&layout),
             "fs",
+            None,
             std::slice::from_ref(&target),
         );
         Self {
+            geometry_layout: None,
             shader,
             layout,
             horizontal,
@@ -836,6 +867,7 @@ impl BlurPipelines {
                 &self.shader,
                 Some(&self.layout),
                 "fs_horizontal",
+                None,
                 &target,
             ),
             Self::pipeline(
@@ -843,6 +875,7 @@ impl BlurPipelines {
                 &self.shader,
                 Some(&self.layout),
                 "fs_original",
+                None,
                 &target,
             ),
         ));
@@ -852,12 +885,16 @@ impl BlurPipelines {
         shader: &wgpu::ShaderModule,
         layout: Option<&wgpu::BindGroupLayout>,
         entry: &str,
+        geometry_layout: Option<&wgpu::BindGroupLayout>,
         targets: &[Option<wgpu::ColorTargetState>],
     ) -> wgpu::RenderPipeline {
         let layout = layout.map(|layout| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("vertical blur"),
-                bind_group_layouts: &[Some(layout)],
+                bind_group_layouts: &([Some(layout)]
+                    .into_iter()
+                    .chain(geometry_layout.map(Some))
+                    .collect::<Vec<_>>()),
                 immediate_size: 0,
             })
         });
@@ -902,6 +939,7 @@ impl BlurPipelines {
                 &self.shader,
                 Some(&self.layout),
                 "fs_both",
+                self.geometry_layout.as_ref(),
                 &[target(FORMAT), target(format)],
             );
             self.both = Some((format, pipeline));
@@ -937,6 +975,8 @@ struct SinglePass {
 }
 /// A run of draws encoded as one instanced call.
 struct Batch {
+    geometry_offset: u32,
+    geometry: Option<wgpu::BindGroup>,
     rect: Rect,
     source: (Option<u64>, Option<NodeId>),
     shading: Shading,
@@ -982,6 +1022,7 @@ pub struct GpuContext {
     inner: Rc<GpuContextInner>,
 }
 struct GpuContextInner {
+    geometry_layout: wgpu::BindGroupLayout,
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -1042,7 +1083,7 @@ impl GpuContext {
             ..Default::default()
         }))
         .map_err(|e| GpuError(e.to_string()))?;
-        let (texture_layout, viewport_layout, quad_shader, quad_layout) =
+        let (texture_layout, viewport_layout, geometry_layout, quad_shader, quad_layout) =
             create_quad_pipelines(&device);
         let quads = QuadPipelines {
             device: device.clone(),
@@ -1066,6 +1107,7 @@ impl GpuContext {
                 quads,
                 texture_layout,
                 viewport_layout,
+                geometry_layout,
                 quad_shader,
                 quad_layout,
                 mapped_uploads,
@@ -1089,6 +1131,7 @@ impl GpuError {
     }
 }
 pub struct GpuRenderer {
+    geometry: paint_geometry::FrameGeometry,
     profiler: RefCell<Option<profiling::Profiler>>,
     context: GpuContext,
     scene_identity: Option<u64>,
@@ -1370,7 +1413,9 @@ impl GpuRenderer {
         });
         let profiler = std::env::var_os("ZGUI_GPU_PROFILE")
             .and_then(|_| profiling::Profiler::new(&device, &queue));
+        let geometry = paint_geometry::FrameGeometry::new(&device, &context.inner.geometry_layout);
         Ok(Self {
+            geometry,
             context: context.clone(),
             profiler: RefCell::new(profiler),
             scene_identity: None,
@@ -1497,6 +1542,7 @@ impl GpuRenderer {
             canvas_raster_bytes: self.canvases.bytes(),
             svg_raster_bytes: self.svgs.bytes(),
             vertex_buffer_bytes: self.vertex_capacity,
+            paint_geometry_bytes: self.geometry.bytes(),
             layer_textures: self.layers.len(),
             layer_bytes: self.layers.values().map(|l| l.bytes).sum(),
             scroll_cache_bytes: self.scroll_history.as_ref().map_or(0, |h| {
@@ -1851,6 +1897,7 @@ impl GpuRenderer {
         stats.svg_rasterizations += layer_stats.svg_rasterizations;
         stats.geometry_rebuilds += layer_stats.geometry_rebuilds;
         stats.vertex_buffer_allocations += layer_stats.vertex_buffer_allocations;
+        stats.paint_geometry_buffer_allocations += layer_stats.paint_geometry_buffer_allocations;
         Ok(stats)
     }
     /// Drop cached shapes, canvases, SVGs and textures of nodes that are gone.
@@ -2006,17 +2053,36 @@ impl GpuRenderer {
         let local: Vec<_> = items
             .into_iter()
             .map(|mut item| {
-                item.bounds.x -= bounds.x;
-                item.bounds.y -= bounds.y;
+                let affine = item.transform != zgui::affine::Affine::IDENTITY
+                    || !item.clip_regions.is_empty()
+                    || item.fade_transform != zgui::affine::Affine::IDENTITY;
+                if affine {
+                    let shift = zgui::affine::Affine::translation(-bounds.x, -bounds.y);
+                    let unshift = zgui::affine::Affine::translation(bounds.x, bounds.y);
+                    item.transform = item.transform.then(shift);
+                    item.fade_transform = unshift.then(item.fade_transform);
+                    item.clip_regions = item
+                        .clip_regions
+                        .iter()
+                        .map(|clip| {
+                            let mut clip = *clip;
+                            clip.inverse = unshift.then(clip.inverse);
+                            clip
+                        })
+                        .collect();
+                } else {
+                    item.bounds.x -= bounds.x;
+                    item.bounds.y -= bounds.y;
+                    item.mask = item.mask.map(|(r, bands)| {
+                        (
+                            Rect::new(r.x - bounds.x, r.y - bounds.y, r.width, r.height),
+                            bands,
+                        )
+                    });
+                }
                 item.clip = item
                     .clip
                     .map(|r| Rect::new(r.x - bounds.x, r.y - bounds.y, r.width, r.height));
-                item.mask = item.mask.map(|(r, bands)| {
-                    (
-                        Rect::new(r.x - bounds.x, r.y - bounds.y, r.width, r.height),
-                        bands,
-                    )
-                });
                 item
             })
             .collect();
@@ -2055,6 +2121,7 @@ impl GpuRenderer {
         stats.svg_rasterizations += result.svg_rasterizations;
         stats.geometry_rebuilds += result.geometry_rebuilds;
         stats.vertex_buffer_allocations += result.vertex_buffer_allocations;
+        stats.paint_geometry_buffer_allocations += result.paint_geometry_buffer_allocations;
         stats.layer_repaints += 1;
         stats.damaged_pixels += result.damaged_pixels;
         self.layers.insert(
@@ -2158,7 +2225,8 @@ impl GpuRenderer {
                         return None;
                     }
                     let output = item
-                        .bounds
+                        .transform
+                        .bounds(item.bounds)
                         .intersection(item.clip.unwrap_or(viewport))?
                         .intersection(viewport)?;
                     Some((output, item.effects.blur_radius))
@@ -2200,13 +2268,63 @@ impl GpuRenderer {
             mask: NO_MASK,
         });
         let mut draws = Vec::new();
-        for item in items {
+        self.geometry.begin();
+        for mut item in items {
             // Retained hidden subtrees must not allocate textures, shape text,
             // or trigger filters until their effective opacity is visible.
             if item.effects.opacity <= 0. {
                 continue;
             }
-            let node_clip = if !item.isolated
+            // Bake direct primitive placement into its allocation so siblings
+            // can share the container's affine binding and remain one batch.
+            // Filters and world-rasterized isolated layers need the original map.
+            if !item.isolated
+                && item.effects.blur_radius <= 0.
+                && item.transform != zgui::affine::Affine::IDENTITY
+            {
+                let linear = zgui::affine::Affine {
+                    tx: 0.,
+                    ty: 0.,
+                    ..item.transform
+                };
+                if let Some(inverse) = linear.inverse() {
+                    let (x, y) = inverse.point(item.transform.tx, item.transform.ty);
+                    let shifted = Rect::new(
+                        item.bounds.x + x,
+                        item.bounds.y + y,
+                        item.bounds.width,
+                        item.bounds.height,
+                    );
+                    // Ill-conditioned maps can amplify rounding into visible
+                    // movement. Keep their original representation instead.
+                    let equivalent = [
+                        (0., 0.),
+                        (item.bounds.width, 0.),
+                        (0., item.bounds.height),
+                        (item.bounds.width, item.bounds.height),
+                    ]
+                    .into_iter()
+                    .all(|(dx, dy)| {
+                        let a = item.transform.point(item.bounds.x + dx, item.bounds.y + dy);
+                        let b = linear.point(shifted.x + dx, shifted.y + dy);
+                        b.0.is_finite()
+                            && b.1.is_finite()
+                            && (a.0 - b.0).abs() * self.scale < 0.01
+                            && (a.1 - b.1).abs() * self.scale < 0.01
+                    });
+                    if equivalent {
+                        item.bounds = shifted;
+                        item.transform = linear;
+                    }
+                }
+            }
+            let world_bounds = item.transform.bounds(item.bounds);
+            if item.transform.inverse().is_none() {
+                continue;
+            }
+            let (geometry_offset, geometry_hash) = self.geometry.item(&item, self.scale)?;
+            let node_clip = if geometry_offset == 0
+                && !item.isolated
                 && matches!(item.kind, NodeKind::Text { .. } | NodeKind::RichText { .. })
             {
                 item.clip
@@ -2230,16 +2348,20 @@ impl GpuRenderer {
                             b.width,
                             b.height,
                         )
-                    } else if let NodeKind::Quad(style) | NodeKind::Panel { quad: style, .. } =
-                        item.kind
-                    {
-                        style.paint_bounds(item.bounds)
-                    } else if let NodeKind::Svg(svg) = item.kind {
-                        svg.paint_bounds(item.bounds)
-                    } else if let NodeKind::Image(image) = item.kind {
-                        image.paint_bounds(item.bounds)
                     } else {
-                        item.bounds
+                        item.transform.bounds(
+                            if let NodeKind::Quad(style) | NodeKind::Panel { quad: style, .. } =
+                                item.kind
+                            {
+                                style.paint_bounds(item.bounds)
+                            } else if let NodeKind::Svg(svg) = item.kind {
+                                svg.paint_bounds(item.bounds)
+                            } else if let NodeKind::Image(image) = item.kind {
+                                image.paint_bounds(item.bounds)
+                            } else {
+                                item.bounds
+                            },
+                        )
                     })
             }) {
                 continue;
@@ -2271,6 +2393,10 @@ impl GpuRenderer {
                     }),
                 });
                 draws.push(Draw {
+                    transform: zgui::affine::Affine::IDENTITY,
+                    geometry_offset,
+                    geometry_hash,
+                    geometry: None,
                     shading: Shading::Full,
                     blur_mask: item.mask,
                     start,
@@ -2281,7 +2407,7 @@ impl GpuRenderer {
                     layer: Some(item.id),
                     blur: (item.effects.blur_radius > 0.).then_some((
                         item.id,
-                        item.bounds,
+                        world_bounds,
                         item.effects,
                     )),
                 });
@@ -2847,12 +2973,17 @@ impl GpuRenderer {
             // draw under the viewport, so a change of clip never splits a
             // batch: neighbouring text, icons and rows become one draw. Quads
             // it would cut, transformed quads and filters keep the scissor.
-            if self.split_shading && self.opaque_interiors && item.effects.blur_radius <= 0. {
+            if geometry_offset == 0
+                && self.split_shading
+                && self.opaque_interiors
+                && item.effects.blur_radius <= 0.
+            {
                 opaque_interior(&mut quads, start, self.scale, clip, &damage);
             }
             let mut draw_clip = clip;
             let limit = snap_out(clip, self.scale);
-            if item.effects.blur_radius <= 0.
+            if geometry_offset == 0
+                && item.effects.blur_radius <= 0.
                 && quads[start as usize..]
                     .iter()
                     .all(|quad| quad.options[2] < 0.5 && !crosses(quad, limit))
@@ -2869,18 +3000,22 @@ impl GpuRenderer {
             }
             if quads.len() as u32 > start || item.effects.blur_radius > 0. {
                 let draw = Draw {
+                    transform: item.transform,
+                    geometry_offset,
+                    geometry_hash,
+                    geometry: None,
                     shading: Shading::Full,
                     blur_mask: item.mask,
                     layer: None,
                     blur: (item.effects.blur_radius > 0.).then_some((
                         item.id,
-                        bounds,
+                        world_bounds,
                         item.effects,
                     )),
                     start,
                     end: quads.len() as u32,
                     clip: draw_clip,
-                    bounds: quad_bounds(&quads[start as usize..]),
+                    bounds: item.transform.bounds(quad_bounds(&quads[start as usize..])),
                     image: if let Some(image) = canvas_image {
                         Some(image)
                     } else if let NodeKind::Image(image) = item.kind {
@@ -2900,6 +3035,15 @@ impl GpuRenderer {
             .procedural_encoder
             .take()
             .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
+        stats.paint_geometry_buffer_allocations += self.geometry.upload(
+            &self.device,
+            &self.context.inner.geometry_layout,
+            self.belt.get_mut(),
+            &mut encoder,
+        );
+        for draw in &mut draws {
+            draw.geometry = Some(self.geometry.bind.clone());
+        }
         // Glyphs rasterized while building this frame land before any pass
         // samples them. Counted as glyph uploads, not scene render passes.
         let upload_stamp = self.profile_start(&mut encoder, "uploads");
@@ -2981,9 +3125,10 @@ impl GpuRenderer {
                     wgpu::BufferSize::new(bytes.len() as u64).expect("background quad"),
                 )
                 .copy_from_slice(bytes);
-            self.belt.get_mut().finish();
             vertices
         };
+        // Geometry uses encoded belt copies even when glyph vertices are mapped.
+        self.belt.get_mut().finish();
         // A clean filter elsewhere in the retained target needs no replay and
         // must not force every unrelated quad into its own render pass.
         let has_damaged_blur = has_blur
@@ -3064,6 +3209,7 @@ impl GpuRenderer {
                     draws: draws.split_off(from),
                     regions,
                     viewport: self.viewport_bind.clone(),
+                    geometry: self.geometry.bind.clone(),
                     blur: vertical.take(),
                     clear: segment == 0,
                     disjoint: !has_blur,
@@ -3099,12 +3245,14 @@ impl GpuRenderer {
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_bind_group(0, &self.bind, &[]);
                 pass.set_bind_group(1, self.viewport_bind.as_ref(), &[]);
+                pass.set_bind_group(2, &self.geometry.bind, &[0]);
                 let quads = &self.context.inner.quads;
                 for (index, (region, (x, y, w, h))) in regions.iter().enumerate() {
                     pass.set_scissor_rect(*x, *y, *w, *h);
                     let first = first[index];
                     if segment == 0 && first == 0 {
                         pass.set_pipeline(quads.clear(self.split_shading));
+                        pass.set_bind_group(2, &self.geometry.bind, &[0]);
                         pass.set_bind_group(0, &self.bind, &[]);
                         pass.draw(0..6, 0..1);
                         stats.draw_calls += 1;
@@ -3325,6 +3473,7 @@ impl GpuRenderer {
         pass.set_vertex_buffer(0, frame.vertices.slice(..));
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_bind_group(1, frame.viewport.as_ref(), &[]);
+        pass.set_bind_group(2, &frame.geometry, &[0]);
         let clear = pipelines.clear(self.split_shading);
         let quads = pipelines.get(Shading::Full);
         let pick = |shading| pipelines.get(shading);
@@ -3341,6 +3490,7 @@ impl GpuRenderer {
             // One pipeline switch per phase instead of two per region; many
             // small animations each damage a region of their own.
             pass.set_pipeline(clear);
+            pass.set_bind_group(2, &frame.geometry, &[0]);
             for (index, (_, (x, y, w, h))) in frame.regions.iter().enumerate() {
                 if first(index) == 0 {
                     pass.set_scissor_rect(*x, *y, *w, *h);
@@ -3358,6 +3508,7 @@ impl GpuRenderer {
             pass.set_scissor_rect(*x, *y, *w, *h);
             if first(index) == 0 {
                 pass.set_pipeline(clear);
+                pass.set_bind_group(2, &frame.geometry, &[0]);
                 pass.set_bind_group(0, &self.bind, &[]);
                 pass.draw(0..6, 0..1);
                 stats.draw_calls += 1;
@@ -3522,8 +3673,7 @@ impl GpuRenderer {
     }
     /// Encode `draws` clipped to `region`. Consecutive draws sharing a
     /// texture and clip become one instanced call; their quads are contiguous,
-    /// so paint order holds. A draw entirely outside the region may be folded
-    /// into a batch: the scissor discards its quads.
+    /// so paint order and each draw's affine binding hold.
     fn encode_draws<'p>(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -3558,7 +3708,11 @@ impl GpuRenderer {
             let source = (draw.image, draw.layer);
             match &mut batch {
                 Some(open)
-                    if open.rect == rect && open.source == source && open.shading == shading =>
+                    if open.rect == rect
+                        && open.end == start
+                        && open.source == source
+                        && open.shading == shading
+                        && open.geometry_offset == draw.geometry_offset =>
                 {
                     open.end = draw.end;
                 }
@@ -3567,6 +3721,8 @@ impl GpuRenderer {
                         self.encode_batch(pass, pipelines, &mut current, done, stats);
                     }
                     batch = Some(Batch {
+                        geometry_offset: draw.geometry_offset,
+                        geometry: draw.geometry.clone(),
                         rect,
                         source,
                         shading,
@@ -3609,6 +3765,7 @@ impl GpuRenderer {
             ),
             &[],
         );
+        pass.set_bind_group(2, batch.geometry.as_ref(), &[batch.geometry_offset]);
         pass.draw(0..6, batch.start..batch.end);
         stats.draw_calls += 1;
         stats.instances += (batch.end - batch.start) as usize;
@@ -3659,6 +3816,10 @@ impl GpuRenderer {
             filter.prepasses = 0;
             filter.predraws = 0;
             filter.allocations = 0;
+            filter.geometry = draw
+                .geometry
+                .clone()
+                .map(|bind| (bind, draw.geometry_offset));
             self.blur_cache.insert(id, cached);
             return Some(filter);
         }
@@ -3677,6 +3838,10 @@ impl GpuRenderer {
                 effects,
                 mask,
             );
+            filter.geometry = draw
+                .geometry
+                .clone()
+                .map(|bind| (bind, draw.geometry_offset));
             self.cache_blur(id, fingerprint, filter.clone(), textures, composite);
             return Some(filter);
         }
@@ -3855,6 +4020,10 @@ impl GpuRenderer {
         let bind =
             self.blur_composite_bind(&textures[0], &textures[1], bounds, (ax, ay), effects, mask);
         let filter = VerticalBlur {
+            geometry: draw
+                .geometry
+                .clone()
+                .map(|bind| (bind, draw.geometry_offset)),
             bind,
             predraws: 2 + usize::from(!split),
             allocations,
@@ -3873,6 +4042,9 @@ impl GpuRenderer {
     ) {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &blur.bind, &[]);
+        if let Some((bind, offset)) = &blur.geometry {
+            pass.set_bind_group(1, bind, &[*offset]);
+        }
         for &(x, y, width, height) in &blur.scissors {
             pass.set_scissor_rect(x, y, width, height);
             pass.draw(0..3, 0..1);
@@ -4843,12 +5015,17 @@ fn create_quad_pipelines(
 ) -> (
     wgpu::BindGroupLayout,
     wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
     wgpu::ShaderModule,
     wgpu::PipelineLayout,
 ) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("quads"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("draw.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(
+            (include_str!("paint_geometry.wgsl").replace("GEOMETRY_GROUP", "2")
+                + include_str!("draw.wgsl"))
+            .into(),
+        ),
     });
     let group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("quads"),
@@ -4884,12 +5061,23 @@ fn create_quad_pipelines(
             count: None,
         }],
     });
+    let geometry_layout = paint_geometry::layout(device);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("quads"),
-        bind_group_layouts: &[Some(&group_layout), Some(&viewport_layout)],
+        bind_group_layouts: &[
+            Some(&group_layout),
+            Some(&viewport_layout),
+            Some(&geometry_layout),
+        ],
         immediate_size: 0,
     });
-    (group_layout, viewport_layout, shader, layout)
+    (
+        group_layout,
+        viewport_layout,
+        geometry_layout,
+        shader,
+        layout,
+    )
 }
 
 impl surface::SurfaceSource for GpuRenderer {
