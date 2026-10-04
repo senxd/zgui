@@ -30,3 +30,52 @@ cargo run --release -p zgui-gpu --features benchmark --example effects_bench
 The runner appends JSONL records. Use a fresh output path for each baseline. `ZGUI_BENCH_FRAMES`, `ZGUI_BENCH_WARMUP`, `ZGUI_BENCH_ONLY` (substring filter), `ZGUI_BENCH_SIZES` (e.g. `1280x720,1920x1080`), `ZGUI_BENCH_SIGMAS` (e.g. `6,24`), `ZGUI_BENCH_HZ`, `ZGUI_BENCH_IN_FLIGHT`, and `ZGUI_BENCH_TRACE` configure sampling and an optional Perfetto CPU trace. Default in-flight count is one; waits and profiling belong to the benchmark, not production scheduling. No image readback is included in timed frames.
 
 The JSON records contain CPU stage distributions, per-label GPU distributions, filtered output pixels, allocation counters, and retained memory. GPU `total` is the interval between the first and last timestamp, including gaps between passes. Each per-label value sums that label's spans within a frame. Shader-resource and effect-chain memory include final textures also counted in image memory; do not sum those overlapping fields. This is one unpaced run on a shared desktop, so inspect tails and rerun on target hardware before choosing budgets.
+
+## Animated subtree workload — 2026-10-04
+
+[Raw results](transition-amd-vulkan-20261004.jsonl) measure four overlapping frosted
+panels scaling and rotating over a scrolling background, with four retained dither
+surfaces updated once per three UI steps. Logical phase advances at 60 steps/sec;
+the benchmark itself runs unpaced. Same AMD integrated Radeon/Vulkan backend,
+release build, 1280×720, 30 warmup and 120 measured frames, one frame in flight.
+This uses the production renderer offscreen; native presentation is excluded.
+
+Completed-frame values include update, flush, encode/submit and explicit GPU wait:
+
+| Backend | Sigma | Median ms | p95 ms | p99 ms | CPU encode/submit median ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Gaussian | 6 | 3.768 | 8.196 | 10.197 | 0.852 |
+| DualKawase | 6 | 4.027 | 8.489 | 9.852 | 1.528 |
+| Gaussian | 24 | 8.693 | 13.378 | 15.023 | 1.113 |
+| DualKawase | 24 | 6.116 | 11.471 | 17.916 | 2.255 |
+
+At sigma 24, Kawase reduced the completed-frame median by about 30% in this
+single run. Its p99 was higher. At sigma 6 Gaussian had the lower completed-frame
+median. The extra Kawase passes increase CPU encoding cost; keep the backend
+explicitly swappable and use measured quality/performance on target hardware.
+
+All four cases allocated zero shader-resource bundles, geometry buffers, vertex
+buffers and layer textures after warmup. Each dispatched 160 shader updates over
+120 frames (four surfaces every third step). Blur crops grew twice per case;
+resizing filter footprints therefore still occasionally allocates textures.
+Retained paint geometry was 4,160 bytes, images 737,280 bytes, blur cache
+8,257,536 bytes, and vertices 65,536 bytes. Gaussian scratch was 1,032,192 bytes;
+Kawase scratch was 681,408 bytes at sigma 6 and 687,708 bytes at sigma 24.
+
+GPU timestamps and stage distributions are preserved in the raw records.
+The availability/count checks passed, but GPU total timestamp tails exceed
+completed CPU-frame bounds in this run; do not interpret those totals as pure
+GPU work or derive new GPU speedup claims from them without checking their
+clock/span behavior. The comparison above uses the explicit completed-frame wait.
+
+Reproduce with a fresh output path:
+
+```powershell
+$env:ZGUI_BENCH_ONLY = 'transition'
+$env:ZGUI_BENCH_FRAMES = '120'
+$env:ZGUI_BENCH_WARMUP = '30'
+$env:ZGUI_BENCH_SIZES = '1280x720'
+$env:ZGUI_BENCH_SIGMAS = '6,24'
+$env:ZGUI_BENCH_OUTPUT = 'transition-results.jsonl'
+cargo run --release -p zgui-gpu --features benchmark --example effects_bench
+```
