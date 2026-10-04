@@ -13,7 +13,7 @@ use zgui::{
 const MAX_ENTRIES: usize = 1024;
 /// Rasters no node shows any more, kept (least recently used first out) for
 /// rows that scroll back into view.
-const UNUSED_BUDGET: usize = 256 * 1024;
+const UNUSED_BUDGET: usize = 1024 * 1024;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
     source_id: u64,
@@ -39,8 +39,12 @@ pub struct SvgCache {
     bytes: usize,
     clock: u64,
     rasterizations: u64,
+    animating: bool,
 }
 impl SvgCache {
+    pub(crate) fn set_animating(&mut self, animating: bool) {
+        self.animating = animating;
+    }
     pub fn retain(&mut self, scene: &Scene) {
         let entries = &mut self.entries;
         self.nodes.retain(|node, shown| {
@@ -102,7 +106,8 @@ impl SvgCache {
             [width as f32, height as f32, 0., 0.],
         )
     }
-    /// Untransformed icons are rasterized directly onto the device pixel grid.
+    /// Keep resting icons exact on the device grid. During animation, bounded
+    /// quarter-pixel phases avoid a new raster for every float position.
     pub(crate) fn get_at(
         &mut self,
         node: NodeId,
@@ -110,8 +115,15 @@ impl SvgCache {
         bounds: Rect,
         scale: f32,
     ) -> Result<(Arc<ImageData>, Rect), GpuError> {
-        let x = bounds.x * scale;
-        let y = bounds.y * scale;
+        let phase = |position: f32| {
+            if self.animating {
+                (position * scale * 4.).round() / 4.
+            } else {
+                position * scale
+            }
+        };
+        let x = phase(bounds.x);
+        let y = phase(bounds.y);
         let geometry = [
             bounds.width * scale,
             bounds.height * scale,
@@ -234,6 +246,31 @@ impl SvgCache {
 mod tests {
     use super::*;
     #[test]
+    fn animated_translation_has_bounded_rasters_at_each_dpi() {
+        let mut scene = Scene::new(100., 100.);
+        let source = Arc::new(SvgData::new(&b"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><circle cx='8' cy='8' r='6'/></svg>"[..]).unwrap());
+        let node = scene.append(
+            scene.root(),
+            NodeKind::Svg(source.clone()),
+            Default::default(),
+        );
+        for scale in [1., 1.5, 2.] {
+            let mut cache = SvgCache::default();
+            cache.set_animating(true);
+            for frame in 0..1000 {
+                let bounds = Rect::new(frame as f32 * 0.0137, frame as f32 * 0.0091, 16., 16.);
+                let (_, raster) = cache.get_at(node, &source, bounds, scale).unwrap();
+                assert!((raster.x * scale - bounds.x * scale).abs() <= 1.125);
+                assert!(raster.x + raster.width >= bounds.x + bounds.width - 0.125 / scale);
+            }
+            assert!(
+                cache.rasterizations() <= 16,
+                "translation produced {} rasters at {scale} DPI",
+                cache.rasterizations()
+            );
+        }
+    }
+    #[test]
     fn unchanged_svg_reuses_transformed_handle_without_rasterization() {
         let mut scene = Scene::new(100., 100.);
         let source=Arc::new(SvgData::new(&b"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10' fill='red'/></svg>"[..]).unwrap());
@@ -353,7 +390,7 @@ mod tests {
         scene.remove(again);
         cache.retain(&scene);
         let big = mount(&mut scene, &source);
-        cache.get(big, &source, 400., 400., 1.).unwrap();
+        cache.get(big, &source, 600., 600., 1.).unwrap();
         scene.remove(big);
         cache.retain(&scene);
         assert_eq!(

@@ -165,6 +165,41 @@ pub fn canvas(style: &QuadStyle, width: f32, height: f32) -> Result<Canvas, GpuE
     }
     Ok(canvas)
 }
+
+/// Solid panel edges and corners are independent of the stretchable center.
+/// Preserve their device-pixel rasters while width/height animate. Gradients,
+/// dashed borders and undersized boxes keep the full-size raster path.
+pub(crate) fn stretch_grid(
+    style: &QuadStyle,
+    width: f32,
+    height: f32,
+    scale: f32,
+) -> Option<[f32; 4]> {
+    let detail = style.decoration.as_deref()?;
+    if detail.border_style != BorderStyle::Solid
+        || !matches!(
+            &detail.background,
+            None | Some(Background::Brush(Brush::Solid(_)))
+        )
+    {
+        return None;
+    }
+    let c = detail.corners.unwrap_or(Corners::all(style.radius));
+    let b = detail
+        .border_widths
+        .unwrap_or(Insets::all(style.border_width));
+    let pad = |radius: f32, border: f32| ((radius.max(border).max(0.) * scale).ceil() + 1.) / scale;
+    let cuts = [
+        pad(c.top_left.max(c.bottom_left), b.left),
+        pad(c.top_left.max(c.top_right), b.top),
+        pad(c.top_right.max(c.bottom_right), b.right),
+        pad(c.bottom_left.max(c.bottom_right), b.bottom),
+    ];
+    (cuts.iter().all(|v| v.is_finite())
+        && width >= cuts[0] + cuts[2] + 1. / scale
+        && height >= cuts[1] + cuts[3] + 1. / scale)
+        .then_some(cuts)
+}
 /// Corner radius used by analytic outer shadows, with the same per-corner policy.
 pub fn shadow_corners(style: &QuadStyle, width: f32, height: f32, spread: f32) -> [f32; 4] {
     let c = style

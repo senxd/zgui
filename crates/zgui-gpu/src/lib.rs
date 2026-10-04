@@ -1690,6 +1690,11 @@ impl GpuRenderer {
                 .measure_detached(&mut fonts.borrow_mut(), rich, width)
         });
     }
+    /// Bound icon subpixel rasters while display-paced motion is active. Clear
+    /// before the settling frame to recover exact resting device-grid pixels.
+    pub fn set_svg_motion(&mut self, active: bool) {
+        self.svgs.set_animating(active);
+    }
     pub fn set_scale_factor(&mut self, scale: f32) {
         let scale = if scale.is_finite() {
             scale.max(0.1)
@@ -2615,23 +2620,60 @@ impl GpuRenderer {
                     } else if style.decoration.is_some() && bounds.width > 0. && bounds.height > 0.
                     {
                         let before = self.canvases.rasterizations();
-                        let (width, height, scale) = (bounds.width, bounds.height, self.scale);
+                        let scale = self.scale;
+                        let grid =
+                            decoration::stretch_grid(style, bounds.width, bounds.height, scale);
+                        let (width, height) = grid.map_or((bounds.width, bounds.height), |c| {
+                            (c[0] + c[2] + 1. / scale, c[1] + c[3] + 1. / scale)
+                        });
                         let id = self.canvas_texture(item.id, &mut stats, |cache| {
                             cache.get_decoration(item.id, style, width, height, scale)
                         })?;
                         stats.canvas_rasterizations +=
                             (self.canvases.rasterizations() - before) as usize;
                         canvas_image = Some(id);
-                        quads.push(Quad {
-                            rect: fade,
-                            uv: [0., 0., 1., 1.],
-                            color: [1., 1., 1., item.effects.opacity],
-                            fade,
-                            options: [item.effects.edge_fade, 2., 0., 0.],
-                            shape: [0.; 4],
-                            border: [0.; 4],
-                            mask: NO_MASK,
-                        });
+                        let (xs, ys, us, vs) = if let Some(c) = grid {
+                            (
+                                [
+                                    bounds.x,
+                                    bounds.x + c[0],
+                                    bounds.x + bounds.width - c[2],
+                                    bounds.x + bounds.width,
+                                ],
+                                [
+                                    bounds.y,
+                                    bounds.y + c[1],
+                                    bounds.y + bounds.height - c[3],
+                                    bounds.y + bounds.height,
+                                ],
+                                [0., c[0] / width, 1. - c[2] / width, 1.],
+                                [0., c[1] / height, 1. - c[3] / height, 1.],
+                            )
+                        } else {
+                            (
+                                [bounds.x, bounds.x, bounds.x, bounds.x + bounds.width],
+                                [bounds.y, bounds.y, bounds.y, bounds.y + bounds.height],
+                                [0., 0., 0., 1.],
+                                [0., 0., 0., 1.],
+                            )
+                        };
+                        for y in 0..3 {
+                            for x in 0..3 {
+                                if xs[x + 1] <= xs[x] || ys[y + 1] <= ys[y] {
+                                    continue;
+                                }
+                                quads.push(Quad {
+                                    rect: [xs[x], ys[y], xs[x + 1] - xs[x], ys[y + 1] - ys[y]],
+                                    uv: [us[x], vs[y], us[x + 1] - us[x], vs[y + 1] - vs[y]],
+                                    color: [1., 1., 1., item.effects.opacity],
+                                    fade,
+                                    options: [item.effects.edge_fade, 2., 0., 0.],
+                                    shape: [0.; 4],
+                                    border: [0.; 4],
+                                    mask: NO_MASK,
+                                });
+                            }
+                        }
                     } else {
                         quads.push(Quad {
                             rect: fade,
@@ -5387,6 +5429,69 @@ pub mod svg;
 
 #[cfg(test)]
 mod native_surface_shader_tests {
+    #[test]
+    fn resizing_solid_decorations_reuses_corners_and_edges() {
+        use super::*;
+        use zgui::scene::{Layout, QuadStyle, Style};
+        let mut gpu = GpuRenderer::new(240, 160).unwrap();
+        for scale in [1., 1.5, 2.] {
+            gpu.set_scale_factor(scale);
+            let mut scene = Scene::new(240. / scale, 160. / scale);
+            scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+            let paint = QuadStyle {
+                fill: Color(30, 40, 50, 255),
+                border_color: Color(220, 210, 200, 255),
+                decoration: Some(Arc::new(zgui::decoration::Decoration {
+                    corners: Some(zgui::decoration::Corners {
+                        top_left: 8.,
+                        top_right: 4.,
+                        bottom_right: 6.,
+                        bottom_left: 2.,
+                    }),
+                    border_widths: Some(zgui::scene::Insets {
+                        top: 1.,
+                        right: 2.,
+                        bottom: 3.,
+                        left: 1.,
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let node = scene.append(
+                scene.root(),
+                NodeKind::Quad(paint),
+                Style {
+                    absolute: true,
+                    width: Some(40.),
+                    height: Some(40.),
+                    ..Default::default()
+                },
+            );
+            for frame in 0..20 {
+                scene.set_style(
+                    node,
+                    Style {
+                        absolute: true,
+                        width: Some(40. + frame as f32),
+                        height: Some(40. + frame as f32),
+                        ..Default::default()
+                    },
+                );
+                let damage = scene.flush().damage;
+                let stats = gpu.render(&scene, &damage).unwrap();
+                if frame > 0 {
+                    assert_eq!(stats.canvas_rasterizations, 0);
+                    assert_eq!(stats.image_uploads, 0);
+                }
+                let pixels = gpu.readback().unwrap();
+                let at = |x: usize, y: usize| &pixels[(y * 240 + x) * 4..(y * 240 + x) * 4 + 3];
+                assert_eq!(at(20, 20), [30, 40, 50]);
+                assert_eq!(at(15, 0), [220, 210, 200]);
+                assert_eq!(at(0, 15), [220, 210, 200]);
+            }
+        }
+    }
     #[test]
     fn scrolling_reclaims_orphan_decoration_uploads_and_keeps_current_draws() {
         use super::*;

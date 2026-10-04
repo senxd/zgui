@@ -4,7 +4,7 @@
 use crate::{
     compose::{Context, TaskRunner, TaskToken},
     frame::{Frame, FrameClock, NextFrame},
-    reactive::{Effect, Runtime, Signal},
+    reactive::{Runtime, Signal},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -196,10 +196,8 @@ pub(crate) struct Scheduler {
     frames: FrameClock,
     runner: Option<TaskRunner>,
     tracks: RefCell<Vec<Rc<Track>>>,
-    revision: Signal<u64>,
     wake: RefCell<Option<Waker>>,
     task: RefCell<Option<TaskToken>>,
-    policy_effect: RefCell<Option<Effect>>,
     registered: RefCell<Vec<Weak<Track>>>,
     next_id: Cell<u64>,
     profiling: Cell<usize>,
@@ -224,14 +222,12 @@ impl Scheduler {
                     |id| id.checked_add(1),
                 )
                 .expect("motion scheduler id overflow"),
-            revision: runtime.signal(0),
             runtime,
             frames,
             runner,
             tracks: RefCell::default(),
             wake: RefCell::default(),
             task: RefCell::default(),
-            policy_effect: RefCell::default(),
             registered: RefCell::default(),
             next_id: Cell::new(1),
             profiling: Cell::new(0),
@@ -239,32 +235,6 @@ impl Scheduler {
             sample_cost: Cell::new(Duration::ZERO),
             sampled: Cell::new(0),
         });
-        let weak = Rc::downgrade(&this);
-        let effect = this.runtime.effect(move || {
-            let Some(this) = weak.upgrade() else {
-                return;
-            };
-            this.revision.get();
-            // This runs only on retarget/policy changes, never on value writes.
-            // Detach the borrow before finishing: effects may retarget values.
-            let tracks = this.tracks.borrow().clone();
-            this.runtime.batch(|| {
-                for track in tracks {
-                    if let Some(policy) = &track.policy {
-                        let active = policy.active.get();
-                        let reduced = policy.reduced.get();
-                        if !active {
-                            track.accrue_active_time();
-                        }
-                        if reduced && track.run.borrow().is_some() {
-                            track.finish(Completion::Finished);
-                        }
-                    }
-                }
-            });
-            this.notify();
-        });
-        *this.policy_effect.borrow_mut() = Some(effect);
         this
     }
     fn notify(&self) {
@@ -274,8 +244,6 @@ impl Scheduler {
         }
     }
     fn changed(&self) {
-        let revision = self.revision.with_untracked(|v| *v).wrapping_add(1);
-        self.revision.set(revision);
         self.notify();
     }
     fn enqueue(self: &Rc<Self>, track: &Rc<Track>) {
@@ -467,6 +435,29 @@ impl MotionValue {
             registered.push(Rc::downgrade(&track));
         }
         drop(registered);
+        if let Some(policy) = track.policy.clone() {
+            let weak_track = Rc::downgrade(&track);
+            let weak_scheduler = Rc::downgrade(&scheduler);
+            // Policy is immutable per track. Observe it once, without rescanning
+            // the entire active set on every start, interruption or disposal.
+            cx.retain(runtime.effect(move || {
+                let active = policy.active.get();
+                let reduced = policy.reduced.get();
+                if let (Some(track), Some(scheduler)) =
+                    (weak_track.upgrade(), weak_scheduler.upgrade())
+                {
+                    scheduler.runtime.batch(|| {
+                        if !active {
+                            track.accrue_active_time();
+                        }
+                        if reduced && track.run.borrow().is_some() {
+                            track.finish(Completion::Finished);
+                        }
+                    });
+                    scheduler.notify();
+                }
+            }));
+        }
         cx.retain(Owner {
             track: track.clone(),
             scheduler: scheduler.clone(),

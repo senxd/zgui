@@ -1006,6 +1006,7 @@ impl Host {
                 window.request_redraw();
             } else {
                 if let Some(renderer) = &mut self.renderer {
+                    renderer.set_svg_motion(self.frames.wants_frame());
                     let stats = renderer.render(&scene, damage)?;
                     let previous = self.context.motion_diagnostics.snapshot();
                     self.context
