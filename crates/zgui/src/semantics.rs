@@ -21,6 +21,9 @@ pub enum Role {
     Dialog,
     Menu,
     MenuItem,
+    MenuItemCheckbox,
+    MenuItemRadio,
+    Separator,
     Image,
 }
 /// The single scrolling axis supported by a semantic scroll view.
@@ -43,6 +46,9 @@ pub struct SemanticNode {
     /// Committed-text UTF-8 byte offsets, preserving anchor/focus direction.
     pub text_selection: Option<(usize, usize)>,
     pub checked: Option<bool>,
+    pub checked_mixed: bool,
+    pub key_shortcuts: Option<String>,
+    pub labelled_by: Option<NodeId>,
     pub disabled: bool,
     /// Readable and selectable, but not editable through user input.
     pub read_only: bool,
@@ -71,6 +77,9 @@ impl SemanticNode {
             value: None,
             text_selection: None,
             checked: None,
+            checked_mixed: false,
+            key_shortcuts: None,
+            labelled_by: None,
             disabled: false,
             read_only: false,
             modal: false,

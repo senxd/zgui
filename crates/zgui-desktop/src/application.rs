@@ -1208,7 +1208,7 @@ impl Host {
                     .input
                     .focus(&self.context.ui.scene, Some(node));
             }
-            accesskit::Action::Click => {
+            accesskit::Action::Click | accesskit::Action::Expand => {
                 self.context.ui.input.dispatch_to(
                     &self.context.ui.scene,
                     node,
@@ -1644,6 +1644,12 @@ impl Host {
                 self.cursor = (p.x, p.y);
                 self.pointer_inside = true;
                 self.dispatch(InputEvent::PointerMove { x: p.x, y: p.y })?;
+                // Windows drains its native message queue before about_to_wait.
+                // Paint hover damage here so a busy CEF/input queue cannot hold
+                // the highlight until that drain finishes. Unchanged moves have
+                // no damage and do not submit or present a GPU frame.
+                #[cfg(target_os = "windows")]
+                self.draw()?;
             }
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_inside = false;
@@ -2473,6 +2479,7 @@ fn map_key(key: &WKey) -> Option<Key> {
             NamedKey::PageUp => Key::PageUp,
             NamedKey::PageDown => Key::PageDown,
             NamedKey::Insert => Key::Insert,
+            NamedKey::ContextMenu => Key::ContextMenu,
             NamedKey::F1 => Key::Function(1),
             NamedKey::F2 => Key::Function(2),
             NamedKey::F3 => Key::Function(3),
@@ -2839,6 +2846,48 @@ mod tests {
                 assert_eq!(native_provider.native_window().unwrap().id(), first_id);
                 host.create_window(event_loop).unwrap();
                 assert_eq!(host.window.as_ref().unwrap().id(), first_id);
+                #[cfg(target_os = "windows")]
+                {
+                    use zgui::compose::prelude::*;
+                    host.context.ui.mount(
+                        div()
+                            .absolute()
+                            .left(400.)
+                            .top(100.)
+                            .size(80., 40.)
+                            .bg(rgb(0x000000))
+                            .hover(|s| s.bg(rgb(0xffffff))),
+                    );
+                    host.draw().unwrap();
+                    let before = host.context.motion_diagnostics.snapshot().frame;
+                    let scale = host.scale_factor;
+                    let event = || WindowEvent::CursorMoved {
+                        device_id: winit::event::DeviceId::dummy(),
+                        position: LogicalPosition::new(420., 120.).to_physical(scale),
+                    };
+                    let pointer = event();
+                    host.window_event(pointer).unwrap();
+                    let painted = host.context.motion_diagnostics.snapshot().frame;
+                    assert!(
+                        painted > before,
+                        "hover must paint before the next idle callback"
+                    );
+                    let size = host.window.as_ref().unwrap().inner_size();
+                    let pixels = host.renderer.as_mut().unwrap().readback().unwrap();
+                    let (x, y) = (
+                        (420. * host.scale_factor) as usize,
+                        (120. * host.scale_factor) as usize,
+                    );
+                    let pixel = (y * size.width as usize + x) * 4;
+                    assert_eq!(&pixels[pixel..pixel + 3], &[255, 255, 255]);
+                    let pointer = event();
+                    host.window_event(pointer).unwrap();
+                    assert_eq!(
+                        host.context.motion_diagnostics.snapshot().frame,
+                        painted,
+                        "unchanged pointer movement must not submit another frame"
+                    );
+                }
                 host.window_event(WindowEvent::Focused(true)).unwrap();
                 host.dispatch(InputEvent::PointerDown {
                     x: 10.,

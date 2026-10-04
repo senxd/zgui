@@ -240,12 +240,20 @@ impl AccessibilityTree {
             if let Some(v) = text_value {
                 n.set_value(v);
             }
-            if let Some(v) = semantic.checked {
+            if semantic.checked_mixed {
+                n.set_toggled(accesskit::Toggled::Mixed);
+            } else if let Some(v) = semantic.checked {
                 n.set_toggled(if v {
                     accesskit::Toggled::True
                 } else {
                     accesskit::Toggled::False
                 });
+            }
+            if let Some(shortcut) = &semantic.key_shortcuts {
+                n.set_keyboard_shortcut(shortcut.clone());
+            }
+            if let Some(label) = semantic.labelled_by.and_then(|id| self.ids.get(&id)) {
+                n.push_labelled_by(*label);
             }
 
             if disabled {
@@ -265,7 +273,7 @@ impl AccessibilityTree {
             }
             if matches!(
                 semantic.role,
-                Role::Button | Role::Link | Role::CheckBox | Role::MenuItem
+                Role::Button | Role::Link | Role::CheckBox | Role::MenuItem | Role::MenuItemCheckbox | Role::MenuItemRadio
             ) {
                 n.add_action(Action::Click);
             }
@@ -282,6 +290,8 @@ impl AccessibilityTree {
                     | Role::Link
                     | Role::CheckBox
                     | Role::MenuItem
+                    | Role::MenuItemCheckbox
+                    | Role::MenuItemRadio
                     | Role::TextInput
                     | Role::MultilineTextInput
                     | Role::Slider
@@ -494,7 +504,7 @@ fn semantic_role(semantic: &zgui::semantics::SemanticNode) -> accesskit::Role {
 fn role(r: Role) -> accesskit::Role {
     match r {
         Role::Window => accesskit::Role::Window,
-        Role::Group => accesskit::Role::GenericContainer,
+        Role::Group => accesskit::Role::Group,
         Role::Label => accesskit::Role::Label,
         Role::Button => accesskit::Role::Button,
         Role::Link => accesskit::Role::Link,
@@ -509,6 +519,9 @@ fn role(r: Role) -> accesskit::Role {
         Role::Dialog => accesskit::Role::Dialog,
         Role::Menu => accesskit::Role::Menu,
         Role::MenuItem => accesskit::Role::MenuItem,
+        Role::MenuItemCheckbox => accesskit::Role::MenuItemCheckBox,
+        Role::MenuItemRadio => accesskit::Role::MenuItemRadio,
+        Role::Separator => accesskit::Role::Splitter,
         Role::Image => accesskit::Role::Image,
     }
 }

@@ -52,6 +52,7 @@ pub enum Key {
     PageUp,
     PageDown,
     Insert,
+    ContextMenu,
     /// Function key number (native host supplies 1–35).
     Function(u8),
     Character(String),
