@@ -56,37 +56,6 @@ fn gaussian_shadow(point:vec2<f32>,rect:vec4<f32>,corners:vec4<f32>,sigma:f32)->
  }
  return clamp(sum*step/(sigma*2.5066282746),0.,1.);
 }
-// Gaussian coverage, rather than a Gaussian-shaped distance falloff: the edge
-// of a blurred opaque shape has 50% coverage and corners integrate both axes.
-fn normal_cdf(x:f32)->f32 {
- let t=1./(1.+0.2316419*abs(x));
- let tail=0.3989422804*exp(-0.5*x*x)*t*(0.319381530+t*(-0.356563782+t*(1.781477937+t*(-1.821255978+t*1.330274429))));
- return select(tail,1.-tail,x>=0.);
-}
-fn gaussian_shadow(point:vec2<f32>,rect:vec4<f32>,corners:vec4<f32>,sigma:f32)->f32 {
- let p=point-rect.xy;
- if max(max(corners.x,corners.y),max(corners.z,corners.w))<=0. {
-   return (normal_cdf((rect.z-p.x)/sigma)-normal_cdf(-p.x/sigma))*(normal_cdf((rect.w-p.y)/sigma)-normal_cdf(-p.y/sigma));
- }
- // Integrate the horizontal Gaussian analytically, and the vertical Gaussian
- // with midpoint quadrature. The finite 4-sigma window drops <0.007% coverage.
- let lo=max(0.,p.y-4.*sigma);let hi=min(rect.w,p.y+4.*sigma);
- if hi<=lo {return 0.;}
- let step=(hi-lo)/24.;var sum=0.;
- for(var i=0;i<24;i++) {
-   let y=lo+(f32(i)+0.5)*step;
-   var left=0.;var right=rect.z;
-   let rl=select(corners.x,corners.w,y>rect.w*0.5);
-   let rr=select(corners.y,corners.z,y>rect.w*0.5);
-   let edge=min(y,rect.w-y);
-   if edge<rl {left=rl-sqrt(max(0.,rl*rl-(rl-edge)*(rl-edge)));}
-   if edge<rr {right-=rr-sqrt(max(0.,rr*rr-(rr-edge)*(rr-edge)));}
-   let horizontal=normal_cdf((right-p.x)/sigma)-normal_cdf((left-p.x)/sigma);
-   let vertical=(y-p.y)/sigma;
-   sum+=horizontal*exp(-0.5*vertical*vertical);
- }
- return clamp(sum*step/(sigma*2.5066282746),0.,1.);
-}
 fn shade(v:Out)->vec4<f32> {
  var color=v.color;
  if v.options.z<0.5 && (v.shape.w>0.5 || v.shape.z>0.) {
