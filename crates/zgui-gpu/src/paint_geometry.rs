@@ -19,6 +19,7 @@ struct Clip {
     inverse: [[f32; 4]; 2],
     bounds: [f32; 4],
     axes: [u32; 4],
+    corners: [f32; 4],
 }
 fn rows(m: Affine) -> [[f32; 4]; 2] {
     [[m.a, m.c, m.tx, 0.], [m.b, m.d, m.ty, 0.]]
@@ -81,7 +82,12 @@ impl FrameGeometry {
             "paint uniforms",
             wgpu::BufferUsages::UNIFORM,
         );
-        let clips = buffer(device, 64, "paint clips", wgpu::BufferUsages::STORAGE);
+        let clips = buffer(
+            device,
+            std::mem::size_of::<Clip>(),
+            "paint clips",
+            wgpu::BufferUsages::STORAGE,
+        );
         let bind = group(device, layout, &uniforms, &clips);
         Self {
             uniforms,
@@ -89,7 +95,7 @@ impl FrameGeometry {
             bind,
             stride,
             uniform_capacity: stride,
-            clip_capacity: 64,
+            clip_capacity: std::mem::size_of::<Clip>(),
             parameters: Vec::new(),
             regions: Vec::new(),
             identity_uploaded: false,
@@ -128,6 +134,7 @@ impl FrameGeometry {
                 inverse: rows(region.inverse),
                 bounds: rect(region.bounds),
                 axes: [u32::from(region.axes[0]), u32::from(region.axes[1]), 0, 0],
+                corners: region.corners,
             });
         }
         if matches!(item.kind, NodeKind::Text { .. } | NodeKind::RichText { .. }) {
@@ -135,6 +142,7 @@ impl FrameGeometry {
                 inverse: rows(item.transform.inverse().unwrap_or_default()),
                 bounds: rect(item.bounds),
                 axes: [1, 1, 0, 0],
+                corners: [0.; 4],
             });
         }
         if self.parameters.len() + self.stride > VERTEX_BUDGET

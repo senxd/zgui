@@ -339,16 +339,17 @@ impl Scene {
                     })
             })
     }
-    pub(super) fn measure_hidden(&mut self, id: NodeId, constraints: Constraints) -> (f32, f32) {
+    pub(super) fn measure_hidden(&mut self, id: NodeId, mut constraints: Constraints) -> (f32, f32) {
+        constraints.hidden = true;
         self.node_mut(id).advanced_layout = None;
         let ids = self.node(id).children.clone();
         let children = ids
             .into_iter()
             .map(|child| {
-                self.measure_hidden(
+                self.measure(
                     child,
                     Constraints {
-                        force_width: Some(f32::NAN),
+                        hidden: true,
                         ..Constraints::default()
                     },
                 );
@@ -536,6 +537,7 @@ impl Scene {
                             percent_height: child_percent_height,
                             force_width: known.width,
                             force_height: known.height,
+                            hidden: false,
                         },
                     );
                     t::Size {
@@ -563,18 +565,9 @@ impl Scene {
                     percent_height: Some(inner_height),
                     force_width: Some(child_layout.size.width),
                     force_height: Some(child_layout.size.height),
+                    hidden: false,
                 };
-                if self
-                    .node(child)
-                    .style
-                    .layout_options
-                    .as_deref()
-                    .is_some_and(|options| options.display == Some(ViewDisplay::None))
-                {
-                    self.measure_hidden(child, child_constraints);
-                } else {
-                    self.measure(child, child_constraints);
-                }
+                self.measure(child, child_constraints);
                 (
                     child,
                     Rect::new(

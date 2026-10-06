@@ -398,17 +398,17 @@ impl Raster {
         for py in y0..y1 {
             for px in x0..x1 {
                 let (wx, wy) = (px as f32 + 0.5, py as f32 + 0.5);
-                if item
+                let coverage = item
                     .clip_regions
                     .iter()
-                    .any(|region| !region.contains(wx, wy))
-                {
+                    .fold(1., |alpha, region| alpha * region.coverage(wx, wy));
+                if coverage <= 0. {
                     continue;
                 }
                 let (lx, ly) = inverse.point(wx, wy);
                 let (mx, my) = item.fade_transform.point(wx, wy);
                 let _ = mx;
-                let opacity = item.effects.opacity * mask_alpha(my, item.mask);
+                let opacity = item.effects.opacity * coverage * mask_alpha(my, item.mask);
                 let inside = lx >= item.bounds.x
                     && ly >= item.bounds.y
                     && lx < item.bounds.x + item.bounds.width
@@ -529,16 +529,17 @@ impl Raster {
         for py in y0..y1 {
             for px in x0..x1 {
                 let (wx, wy) = (px as f32 + 0.5, py as f32 + 0.5);
-                if item
+                let coverage = item
                     .clip_regions
                     .iter()
-                    .any(|region| !region.contains(wx, wy))
-                {
+                    .fold(1., |alpha, region| alpha * region.coverage(wx, wy));
+                if coverage <= 0. {
                     continue;
                 }
                 let (_, fy) = item.fade_transform.point(wx, wy);
                 let (lx, ly) = inverse.point(wx, wy);
                 let opacity = item.effects.opacity
+                    * coverage
                     * edge_alpha(ly, item.bounds, item.effects.edge_fade)
                     * mask_alpha(fy, self.mask);
                 if let Some(backdrop) = &backdrop
@@ -1967,5 +1968,36 @@ mod hidden_effect_tests {
             raster.render(&scene, &damage);
             assert_eq!(raster.pixels, baseline);
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn rounded_overflow_masks_reference_raster_corners() {
+    use zgui::{compose::prelude::*, widgets::Ui};
+    for cached in [false, true] {
+        let mut ui = Ui::new(64., 64.);
+        ui.mount(
+            div()
+                .size(64., 64.)
+                .rounded(12.)
+                .overflow_hidden()
+                .isolated(cached)
+                .child(div().size(64., 64.).bg(rgb(0xff0000))),
+        );
+        ui.prepare_frame();
+        let mut scene = ui.scene.borrow_mut();
+        let damage = scene.flush().damage;
+        let mut raster = Raster::new(64, 64);
+        raster.render(&scene, &damage);
+        for i in [0, 63, 63 * 64, 64 * 64 - 1] {
+            assert_eq!(raster.pixels[i], 0x10141c);
+        }
+        assert_eq!(raster.pixels[32 * 64 + 32], 0xff0000);
+        assert!(
+            (0..12).any(
+                |y| (0..12).any(|x| ![0x10141c, 0xff0000].contains(&raster.pixels[y * 64 + x]))
+            )
+        );
     }
 }

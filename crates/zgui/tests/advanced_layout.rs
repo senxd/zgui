@@ -476,3 +476,46 @@ fn percent_children_keep_their_layout_after_a_flex_basis_probe() {
     ui.try_prepare_frame().unwrap();
     near(bounds(&ui, &view, "header").width, 1280.);
 }
+
+#[test]
+fn hidden_descendants_skip_measurement_and_restore_after_edits() {
+    use std::{cell::Cell, rc::Rc};
+    use zgui::style::Styles;
+    let mut ui = Ui::new(600., 400.);
+    let calls = Rc::new(Cell::new(0));
+    let counted = calls.clone();
+    ui.scene.borrow_mut().set_text_measurer(move |_: &str, _: f32, _: Option<f32>| {
+        counted.set(counted.get()+1);
+        (80., 20.)
+    });
+    let shown = ui.signal(false);
+    let visible = shown.clone();
+    let view = ui.mount(column().w_full().h_full().child(
+        column().id("hidden-parent").w_full().child(
+            column().id("inner").w(120.).h(80.).child(text("Hidden label").id("label"))
+        ).reactive_style(move || if visible.get() {Styles::new().flex()} else {Styles::new().hidden()})
+    ));
+    ui.prepare_frame();
+    assert_eq!(calls.get(),0,"hidden descendant text was measured");
+    for id in ["hidden-parent","inner","label"] {
+        let b=bounds(&ui,&view,id);
+        assert_eq!((b.width,b.height),(0.,0.),"{id} retained visible layout");
+    }
+    let inner=view.find("inner").unwrap();
+    let mut style=ui.scene.borrow().style(inner);style.width=Some(180.);
+    ui.scene.borrow_mut().set_style(inner,style);
+    ui.scene.borrow_mut().resize(800.,500.);
+    ui.prepare_frame();
+    assert_eq!(calls.get(),0,"hidden edits or resize triggered text layout");
+    shown.set(true);ui.prepare_frame();
+    near(bounds(&ui,&view,"inner").width,180.);
+    near(bounds(&ui,&view,"inner").height,80.);
+    assert!(calls.get()>0);
+    shown.set(false);ui.prepare_frame();
+    let count=calls.get();
+    ui.scene.borrow_mut().resize(900.,550.);ui.prepare_frame();
+    assert_eq!(calls.get(),count);
+    assert_eq!(bounds(&ui,&view,"label").height,0.);
+    shown.set(true);ui.prepare_frame();
+    near(bounds(&ui,&view,"label").height,20.);
+}

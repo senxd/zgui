@@ -381,6 +381,8 @@ struct Constraints {
     percent_height: Option<f32>,
     force_width: Option<f32>,
     force_height: Option<f32>,
+    // An ancestor with display:none suppresses this whole subtree's layout.
+    hidden: bool,
 }
 struct Measurement {
     constraints: Constraints,
@@ -466,12 +468,45 @@ pub struct PaintClip {
     pub bounds: Rect,
     pub inverse: Affine,
     pub axes: [bool; 2],
+    pub corners: [f32; 4],
 }
 impl PaintClip {
-    pub fn contains(self, x: f32, y: f32) -> bool {
+    fn distance(self, x: f32, y: f32) -> f32 {
         let (x, y) = self.inverse.point(x, y);
-        (!self.axes[0] || (x >= self.bounds.x && x < self.bounds.x + self.bounds.width))
-            && (!self.axes[1] || (y >= self.bounds.y && y < self.bounds.y + self.bounds.height))
+        let dx = x - self.bounds.x - self.bounds.width * 0.5;
+        let dy = y - self.bounds.y - self.bounds.height * 0.5;
+        let index = match (dx > 0., dy > 0.) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, true) => 3,
+        };
+        let r = self.corners[index];
+        let qx = dx.abs() - self.bounds.width * 0.5 + r;
+        let qy = dy.abs() - self.bounds.height * 0.5 + r;
+        qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - r
+    }
+    pub fn coverage(self, x: f32, y: f32) -> f32 {
+        let (qx, qy) = self.inverse.point(x, y);
+        if (!self.axes[0] || (qx >= self.bounds.x && qx < self.bounds.x + self.bounds.width))
+            && (!self.axes[1] || (qy >= self.bounds.y && qy < self.bounds.y + self.bounds.height))
+        {
+            if self.corners.iter().all(|r| *r == 0.) {
+                return 1.;
+            }
+            let pixel = (self.inverse.a.abs() + self.inverse.c.abs())
+                .max(self.inverse.b.abs() + self.inverse.d.abs())
+                .max(0.5);
+            (0.5 - self.distance(x, y) / pixel).clamp(0., 1.)
+        } else {
+            0.
+        }
+    }
+    pub fn contains(self, x: f32, y: f32) -> bool {
+        let (qx, qy) = self.inverse.point(x, y);
+        (!self.axes[0] || (qx >= self.bounds.x && qx < self.bounds.x + self.bounds.width))
+            && (!self.axes[1] || (qy >= self.bounds.y && qy < self.bounds.y + self.bounds.height))
+            && (self.corners.iter().all(|r| *r == 0.) || self.distance(x, y) <= 0.)
     }
 }
 #[derive(Clone)]
@@ -1869,8 +1904,10 @@ impl Scene {
             self.add_damage(bounds);
         }
     }
-    fn measure(&mut self, id: NodeId, constraints: Constraints) -> (f32, f32) {
+    fn measure(&mut self, id: NodeId, mut constraints: Constraints) -> (f32, f32) {
         let node = self.node(id);
+        constraints.hidden |= node.style.layout_options.as_deref()
+            .is_some_and(|options| options.display == Some(crate::layout::Display::None));
         let pass = self.layout_pass;
         let usable = |m: &Measurement| {
             m.constraints == constraints && (node.dirty & LAYOUT == 0 || m.pass == pass)
@@ -1890,6 +1927,9 @@ impl Scene {
             }
             node.arrange_dirty = true;
             return size;
+        }
+        if constraints.hidden {
+            return self.measure_hidden(id, constraints);
         }
         let node = self.node(id);
         if let NodeKind::Container(layout) | NodeKind::Panel { layout, .. } = node.kind
@@ -2109,6 +2149,7 @@ impl Scene {
                                     percent_height,
                                     force_width: horizontal.then_some(allocated),
                                     force_height: (!horizontal).then_some(allocated),
+                                    hidden: false,
                                 },
                             );
                         }
@@ -2139,6 +2180,7 @@ impl Scene {
                                     percent_height,
                                     force_width: horizontal.then_some(sizes[i].0),
                                     force_height: (!horizontal).then_some(sizes[i].1),
+                                    hidden: false,
                                 },
                             );
                         }
@@ -2234,6 +2276,7 @@ impl Scene {
                                     } else {
                                         None
                                     },
+                                    hidden: false,
                                 },
                             );
                         }
@@ -2847,7 +2890,7 @@ impl Scene {
             }
             let clip = clipped_affine_bounds(parent_clip, node.bounds, matrix, &node.style);
             let parent_regions = regions.clone();
-            let regions = transformed_clips(regions, node.bounds, matrix, &node.style);
+            let regions = transformed_clips(regions, node.bounds, matrix, &node.style, &node.kind);
             let (child_mask, child_fade_transform) =
                 transformed_fade(mask, fade_transform, clip, node.bounds, matrix, &node.style);
             if !isolated {
@@ -2874,7 +2917,9 @@ impl Scene {
                 id,
                 bounds,
                 transform,
-                clip_regions: if has_outer_shadow(&node.kind) {
+                clip_regions: if has_outer_shadow(&node.kind)
+                    || rounded_clip(&node.style, &node.kind).is_some()
+                {
                     parent_regions
                 } else {
                     regions
@@ -2973,7 +3018,7 @@ impl<'a> Iterator for PaintIter<'a> {
         let clip = clipped_affine_bounds(Some(parent_clip), node.bounds, matrix, &node.style)
             .unwrap_or(parent_clip);
         let parent_regions = regions.clone();
-        let regions = transformed_clips(regions, node.bounds, matrix, &node.style);
+        let regions = transformed_clips(regions, node.bounds, matrix, &node.style, &node.kind);
         let (child_mask, child_fade_transform) = transformed_fade(
             mask,
             fade_transform,
@@ -2998,7 +3043,9 @@ impl<'a> Iterator for PaintIter<'a> {
             id,
             bounds,
             transform,
-            clip_regions: if has_outer_shadow(&node.kind) {
+            clip_regions: if has_outer_shadow(&node.kind)
+                || rounded_clip(&node.style, &node.kind).is_some()
+            {
                 parent_regions
             } else {
                 regions
@@ -3033,14 +3080,38 @@ fn primitive_coordinates(bounds: Rect, matrix: Affine) -> (Rect, Affine) {
         (bounds, matrix)
     }
 }
+fn rounded_clip(style: &Style, kind: &NodeKind) -> Option<[f32; 4]> {
+    if clip_axes(style) != (true, true) {
+        return None;
+    }
+    let quad = match kind {
+        NodeKind::Quad(q) | NodeKind::Panel { quad: q, .. } => q,
+        _ => return None,
+    };
+    let corners = quad
+        .decoration
+        .as_ref()
+        .and_then(|d| d.corners)
+        .unwrap_or(crate::decoration::Corners::all(quad.radius));
+    let radii = [
+        corners.top_left,
+        corners.top_right,
+        corners.bottom_right,
+        corners.bottom_left,
+    ]
+    .map(|r| if r.is_finite() { r.max(0.) } else { 0. });
+    radii.iter().any(|r| *r > 0.).then_some(radii)
+}
 fn transformed_clips(
     inherited: std::rc::Rc<[PaintClip]>,
     bounds: Rect,
     matrix: Affine,
     style: &Style,
+    kind: &NodeKind,
 ) -> std::rc::Rc<[PaintClip]> {
     let axes = clip_axes(style);
-    if axes == (false, false) || matrix.is_translation() {
+    let rounded = rounded_clip(style, kind);
+    if axes == (false, false) || matrix.is_translation() && rounded.is_none() {
         return inherited;
     }
     let mut regions = inherited.to_vec();
@@ -3049,12 +3120,16 @@ fn transformed_clips(
             bounds,
             inverse,
             axes: [axes.0, axes.1],
+            corners: rounded
+                .unwrap_or([0.; 4])
+                .map(|r| r.min(bounds.width.min(bounds.height).max(0.) * 0.5)),
         });
     } else {
         regions.push(PaintClip {
             bounds: Rect::default(),
             inverse: Affine::IDENTITY,
             axes: [true, true],
+            corners: [0.; 4],
         });
     }
     regions.into()

@@ -1021,6 +1021,16 @@ impl InputDispatcher {
             if !scene.borrow().contains(id) {
                 continue;
             }
+            // Hover events describe boundaries. Moving between two descendants
+            // must not leave and re-enter their shared ancestors.
+            if matches!(ctx.event, InputEvent::PointerEnter | InputEvent::PointerLeave) && id != target {
+                let hovered = self.state.borrow().hovered;
+                let shared = hovered.is_some_and(|other| {
+                    let scene = scene.borrow();
+                    other == id || scene.ancestors(other).any(|ancestor| ancestor == id)
+                });
+                if matches!(ctx.event, InputEvent::PointerLeave) && shared { continue; }
+            }
             ctx.current_target = id;
             ctx.phase = phase;
             for (token, callback) in callbacks {
@@ -1648,6 +1658,25 @@ mod tests {
         );
         tracker.moved(f32::NAN, 0.);
         assert!(tracker.0.is_none());
+    }
+
+    #[test]
+    fn moving_between_children_does_not_leave_the_parent_hover() {
+        use crate::{compose::prelude::*, widgets::Ui};
+        let mut ui = Ui::new(200.,40.);
+        let leaves = Rc::new(std::cell::Cell::new(0));
+        let recorded = leaves.clone();
+        ui.mount(row().size(200.,40.).on_event(move |e| {
+            if e.phase != EventPhase::Capture && matches!(e.event,InputEvent::PointerLeave) {
+                recorded.set(recorded.get()+1);
+            }
+        }).child(button().size(100.,40.)).child(button().size(100.,40.)));
+        ui.prepare_frame();
+        ui.dispatch(InputEvent::PointerMove{x:20.,y:20.});
+        ui.dispatch(InputEvent::PointerMove{x:150.,y:20.});
+        assert_eq!(leaves.get(),0,"moving between child controls left the row");
+        ui.dispatch(InputEvent::PointerLeave);
+        assert_eq!(leaves.get(),1);
     }
 
     #[test]

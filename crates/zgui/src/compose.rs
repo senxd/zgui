@@ -3023,6 +3023,7 @@ mod image_fit_tests {
 #[cfg(test)]
 mod editor_mount_tests {
     use super::*;
+    use crate::input::Key;
     use crate::scene::Color;
 
     #[test]
@@ -3113,6 +3114,58 @@ mod editor_mount_tests {
     }
 
     #[test]
+    fn focus_border_policy_preserves_control_borders_and_keyboard_activation() {
+        for kind in 0..5 {
+            let mut ui = Ui::new(400., 100.);
+            ui.theme.focus_borders = false;
+            let activations = std::rc::Rc::new(std::cell::Cell::new(0));
+            let clicked = activations.clone();
+            let view = match kind {
+                0 | 1 => button().child(text("Button")).on_click(move || {
+                    clicked.set(clicked.get() + 1);
+                }),
+                2 => text_input("Editor", ui.signal("address".into())),
+                3 => checkbox("Checkbox", ui.signal(false)),
+                _ => slider("Slider", ui.signal(0.5), 0.0..=1.0),
+            };
+            let base_color = Color(30, 40, 50, 255);
+            let focus_color = Color(60, 70, 80, 255);
+            let view = if kind == 1 || kind == 2 {
+                view.border(2.).border_color(base_color)
+                    .focus(|s| s.border(4.).border_color(focus_color))
+            } else {
+                view
+            };
+            let mounted = ui.mount(view);
+            ui.prepare_frame();
+            ui.input.focus(&ui.scene, Some(mounted.node()));
+            ui.prepare_frame();
+            assert_eq!(ui.input.focused(), Some(mounted.node()));
+            let expected_border = if kind == 1 || kind == 2 { 2. } else { 0. };
+            if let NodeKind::Quad(quad) | NodeKind::Panel { quad, .. } = ui.scene.borrow().kind(mounted.node()) {
+                assert_eq!(quad.border_width, expected_border);
+                if expected_border > 0. {
+                    assert_eq!(quad.border_color, base_color);
+                }
+            } else {
+                assert_eq!(expected_border, 0.);
+            }
+            if kind == 0 || kind == 1 {
+                ui.dispatch(InputEvent::KeyDown {
+                    key: Key::Enter,
+                    modifiers: Default::default(),
+                    repeat: false,
+                });
+                ui.dispatch(InputEvent::KeyUp {
+                    key: Key::Enter,
+                    modifiers: Default::default(),
+                });
+                assert_eq!(activations.get(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn canonical_writeback_can_unmount_a_fully_registered_declarative_tree() {
         let mut ui = Ui::new(400., 300.);
         let model = ui.signal("a\r\nb".to_owned());
@@ -3189,4 +3242,22 @@ mod control_alignment_tests {
         assert_eq!(explicit_style.padding_edges.unwrap().top, 3.);
         assert_eq!(scene.style(root.find("auto").unwrap()).padding_edges.unwrap().top, 8.);
     }
+}
+
+/// Application bindings applied to both live and generated native view factories.
+/// The factory applies the source styles to the replacement returned by `create`.
+pub trait CompiledHost {
+    fn create(&self, _id: &str, fallback: impl FnOnce() -> View) -> View { fallback() }
+    fn decorate(&self, _id: &str, view: View) -> View { view }
+}
+impl CompiledHost for () {}
+#[cfg(feature = "codegen")]
+#[path = "compose_codegen.rs"]
+mod codegen;
+#[cfg(feature = "codegen")]
+pub use codegen::CompiledSource;
+
+impl View {
+    /// Replace an imported component's contents without changing its source styling.
+    pub fn without_children(mut self) -> Self { self.children.clear(); self }
 }

@@ -1679,6 +1679,12 @@ impl Host {
                     MouseButton::Forward => PointerButton::Other(5),
                     MouseButton::Other(n) => PointerButton::Other(n),
                 };
+                // Embedded native views may consume CursorMoved while the shell
+                // polls its own pointer. Sample AppKit again at the button event.
+                #[cfg(target_os = "macos")]
+                if let Some(position) = self.window.as_ref().and_then(|window| native_pointer_position(window)) {
+                    self.cursor = position;
+                }
                 let (x, y) = self.cursor;
                 self.dispatch(if state == ElementState::Pressed {
                     InputEvent::PointerDown { x, y, button }
@@ -2977,4 +2983,18 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<WindowHandle>();
     }
+}
+
+#[cfg(target_os = "macos")]
+fn native_pointer_position(window: &winit::window::Window) -> Option<(f32, f32)> {
+    use objc2_app_kit::NSView;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return None; };
+    // SAFETY: Winit retains this NSView, and window events run on AppKit's main thread.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let native = view.window()?;
+    let point = view.convertPoint_fromView(native.mouseLocationOutsideOfEventStream(), None);
+    let y = if view.isFlipped() { point.y } else { view.bounds().size.height - point.y };
+    Some((point.x as f32, y as f32))
 }

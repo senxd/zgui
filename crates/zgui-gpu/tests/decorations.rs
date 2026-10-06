@@ -196,3 +196,100 @@ fn flat_fill_with_per_corner_radii_draws_on_the_gpu_without_a_raster() {
     assert_eq!(at(98, 98)[3], 0, "rounded bottom-right corner is cut");
     assert_eq!(at(50, 50), &[255, 0, 0, 255]);
 }
+
+#[test]
+fn rounded_overflow_clips_descendant_pixels_and_hit_targets() {
+    use zgui::{compose::prelude::*, widgets::Ui};
+    for scale in [1., 1.5, 2.] {
+        let size = (96. * scale) as u32;
+        let mut gpu = GpuRenderer::new(size, size).unwrap();
+        gpu.set_scale_factor(scale);
+        for isolated in [false, true] {
+            let mut ui = Ui::new(96., 96.);
+            let root = ui.mount(
+                div().size(96., 96.).child(
+                    div()
+                        .absolute()
+                        .left(8.)
+                        .top(8.)
+                        .size(64., 64.)
+                        .rounded(12.)
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("child")
+                                .absolute()
+                                .size(80., 80.)
+                                .bg(Color(255, 0, 0, 255))
+                                .isolated(isolated),
+                        ),
+                ),
+            );
+            ui.prepare_frame();
+            let child = root.find("child").unwrap();
+            let mut scene = ui.scene.borrow_mut();
+            let damage = scene.flush().damage;
+            gpu.render(&scene, &damage).unwrap();
+            let pixels = gpu.readback().unwrap();
+            let at = |x: usize, y: usize| {
+                &pixels[(y * size as usize + x) * 4..(y * size as usize + x) * 4 + 4]
+            };
+            let lo = (8. * scale) as usize;
+            let hi = (72. * scale) as usize - 1;
+            for (x, y) in [(lo, lo), (hi, lo), (lo, hi), (hi, hi)] {
+                assert_eq!(
+                    at(x, y)[3],
+                    0,
+                    "descendant leaked through corner at scale {scale}"
+                );
+            }
+            let center = (40. * scale) as usize;
+            assert_eq!(at(center, center), &[255, 0, 0, 255]);
+            assert_eq!(
+                at((80. * scale) as usize, center)[3],
+                0,
+                "oversized child escaped clip"
+            );
+            let edge = (12. * scale) as usize;
+            assert!(
+                (lo..lo + edge)
+                    .any(|y| (lo..lo + edge).any(|x| at(x, y)[3] > 0 && at(x, y)[3] < 255)),
+                "missing corner antialiasing at {scale}"
+            );
+            assert!(!scene.hit_test_all(8.5, 8.5).contains(&child));
+            assert!(!scene.hit_test_all(80., 40.).contains(&child));
+            assert!(scene.hit_test_all(40., 40.).contains(&child));
+        }
+    }
+}
+
+#[test]
+fn caching_a_rounded_clip_preserves_corner_coverage() {
+    use zgui::{compose::prelude::*, widgets::Ui};
+    let mut gpu = GpuRenderer::new(64, 64).unwrap();
+    let mut direct = None;
+    for cached in [false, true] {
+        let mut ui = Ui::new(64., 64.);
+        ui.mount(
+            div()
+                .size(64., 64.)
+                .rounded(12.)
+                .overflow_hidden()
+                .isolated(cached)
+                .child(div().size(64., 64.).bg(Color(255, 0, 0, 255))),
+        );
+        ui.prepare_frame();
+        let mut scene = ui.scene.borrow_mut();
+        let damage = scene.flush().damage;
+        gpu.render(&scene, &damage).unwrap();
+        let pixels = gpu.readback().unwrap();
+        if let Some(expected) = &direct {
+            assert_eq!(
+                &pixels, expected,
+                "cached rounded root applied corner coverage twice"
+            );
+        } else {
+            direct = Some(pixels);
+        }
+    }
+}

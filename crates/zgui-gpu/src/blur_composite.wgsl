@@ -11,7 +11,8 @@ fn composite(p:vec4<f32>)->vec4<f32>{
   if geometry.metadata.w!=0u {
    let scale=bitcast<f32>(geometry.metadata.z);let world=p.xy/scale;
    let q=paint_point(geometry.inverse,world);let b=geometry.bounds;
-   if !paint_visible(world) || q.x<b.x || q.y<b.y || q.x>=b.x+b.z || q.y>=b.y+b.w {amount=0.;}
+   amount*=paint_coverage(world);
+   if q.x<b.x || q.y<b.y || q.x>=b.x+b.z || q.y>=b.y+b.w {amount=0.;}
    edge_y=q.y*scale;edge_bounds=b*scale;fade_y=paint_point(geometry.fade_inverse,world).y*scale;
   }
  if params.effect.y>0.{let d=min(edge_y-edge_bounds.y,edge_bounds.y+edge_bounds.w-edge_y);amount*=clamp(d/params.effect.y,0.,1.);}

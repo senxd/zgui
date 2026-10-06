@@ -131,6 +131,7 @@ impl InputDispatcher {
         self.update_drag(scene, x, y);
     }
     fn drag_hit(&self, scene: &Scene, x: f32, y: f32, preview: Option<NodeId>) -> Option<NodeId> {
+        let mut fallback = None;
         for hit in scene.hit_test_all(x, y) {
             if preview.is_some_and(|preview| {
                 hit == preview || scene.ancestors(hit).any(|id| id == preview)
@@ -143,12 +144,18 @@ impl InputDispatcher {
                     break;
                 }
                 if self.has_listeners(id) {
+                    // Match ordinary pointer hit testing: document capture
+                    // listeners must not make empty overlays obscure siblings.
+                    if id == scene.root() {
+                        fallback = Some(id);
+                        break;
+                    }
                     return Some(id);
                 }
                 node = scene.parent(id);
             }
         }
-        None
+        fallback
     }
     fn update_drag(&self, scene: &Rc<RefCell<Scene>>, x: f32, y: f32) {
         self.validate_drag(scene);

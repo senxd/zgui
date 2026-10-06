@@ -97,7 +97,7 @@ fn shade(v:Out)->vec4<f32> {
  if geometry.metadata.w!=0u {mask_y=paint_point(geometry.fade_inverse,v.world).y;}
  if v.mask.z>0. {let t=clamp((mask_y-v.mask.x)/v.mask.z,0.,1.); color.a*=t*t;}
  if v.mask.w>0. {let b=clamp((v.mask.y-mask_y)/v.mask.w,0.,1.); color.a*=b*b;}
- if !paint_visible(v.world){return vec4(0.);}
+ color.a*=paint_coverage(v.world);
  return vec4(color.rgb*color.a,color.a);
 }
 @fragment fn fs(v:Out)->@location(0) vec4<f32> { return shade(v); }

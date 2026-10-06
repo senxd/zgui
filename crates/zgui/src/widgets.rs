@@ -25,6 +25,8 @@ pub struct Theme {
     pub muted: Color,
     pub accent: Color,
     pub selection: Color,
+    /// Whether composed controls may change their border when focused.
+    pub focus_borders: bool,
     pub font_size: f32,
     pub control_height: f32,
     pub radius: f32,
@@ -39,6 +41,7 @@ impl Default for Theme {
             muted: Color(138, 154, 176, 255),
             accent: Color(94, 165, 255, 255),
             selection: Color(56, 98, 158, 170),
+            focus_borders: true,
             font_size: 16.,
             control_height: 36.,
             radius: 6.,

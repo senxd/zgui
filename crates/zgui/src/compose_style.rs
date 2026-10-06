@@ -78,7 +78,7 @@ pub(crate) fn mount_style_with_intrinsic(
     base: Styles,
     inherited: Signal<Typography>,
     mut dynamic: Option<Box<dyn FnMut() -> Styles>>,
-    variants: Variants,
+    mut variants: Variants,
     mut disabled: Option<Box<dyn FnMut() -> bool>>,
     interactive: bool,
     intrinsic: Option<Signal<(f32, f32)>>,
@@ -86,6 +86,14 @@ pub(crate) fn mount_style_with_intrinsic(
     object_fit: Option<Signal<crate::style::ObjectFit>>,
     projection: Option<Signal<crate::affine::Affine>>,
 ) -> Signal<Typography> {
+    // Preserve the base/hover border and all non-border focus feedback.
+    // Focus itself still drives keyboard input, semantics and editor carets.
+    if !ui.theme.focus_borders && let Some(focus) = &mut variants.focus {
+        focus.border_width = None;
+        focus.border_color = None;
+        focus.border_edges = None;
+        focus.border_style = None;
+    }
     let typography = ui.signal(inherited.with_untracked(Clone::clone));
     let output = typography.clone();
     let interaction = ui.signal(Interaction::default());
