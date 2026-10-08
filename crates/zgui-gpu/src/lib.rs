@@ -4251,15 +4251,12 @@ impl GpuRenderer {
             self.image_textures.remove(&old);
         }
     }
-    /// Metadata caches evict rasters independently of scene content revisions.
-    /// Reclaim their orphan uploads only under pressure, keeping assembled draws
-    /// intact. Mounted offscreen images can upload again when they become visible.
+    /// Reclaim uploads not sampled by this frame under pressure. Raster metadata
+    /// and mounted images can recreate their textures when they become visible.
     fn ensure_image_budget(&mut self, bytes: usize) -> Result<(), GpuError> {
         const BUDGET: usize = 64 * 1024 * 1024;
         if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > BUDGET {
-            let mut retained = self.frame_image_ids.clone();
-            retained.extend(self.canvases.image_ids());
-            retained.extend(self.svgs.image_ids());
+            let retained = self.frame_image_ids.clone();
             self.images.retain(|id, _| retained.contains(id));
             self.image_textures.retain(|id, _| retained.contains(id));
             #[cfg(target_os = "macos")]
