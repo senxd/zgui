@@ -62,7 +62,13 @@ fn scrollbar_design_gpu_playback_and_pen_master_parity() {
                     .unwrap()
                     .0;
                 let thumb = ui.scene.borrow().children(track)[0];
-                let mut time = Instant::now();
+                // Keep the test clock ahead of readback/setup work between samples.
+                let mut time = Instant::now() + Duration::from_secs(10);
+                frames.deliver(Frame {
+                    index: 0,
+                    time,
+                    interval: Duration::from_millis(16),
+                });
                 let mut index = 0;
                 let mut advance = |ui: &mut Ui, millis: u64| {
                     executor.borrow_mut().tick();
