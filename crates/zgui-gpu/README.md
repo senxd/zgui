@@ -81,8 +81,11 @@ and [SVG images/transforms](../../docs/affine-images.md). Canvas and SVG caches
 rasterize at device scale and reuse image identities for unchanged content;
 affine image changes reuse uploaded pixels. Their separate 32 MiB raster budgets
 are additional to the image-texture budget. Source data ownership and cache
-entry bounds are documented in those guides. Default solid/rounded rectangles
-continue using the direct quad shader.
+entry bounds are documented in those guides. The upload budget scales with four
+physical-window RGBA textures, with a 64 MiB minimum and 256 MiB maximum. Under
+pressure, uploads not sampled by the current frame are reclaimed; mounted
+images and cached raster metadata recreate them when needed. Default
+solid/rounded rectangles continue using the direct quad shader.
 
 On macOS, [CoreVideo surfaces](../../docs/native-surfaces.md) import BGRA or
 full-range NV12 planes on the renderer's Metal device without CPU readback.
