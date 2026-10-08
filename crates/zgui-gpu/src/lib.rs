@@ -1230,6 +1230,7 @@ pub struct GpuRenderer {
     config: Option<wgpu::SurfaceConfiguration>,
     width: u32,
     height: u32,
+    image_budget: usize,
     scale: f32,
     target: wgpu::Texture,
     view: wgpu::TextureView,
@@ -1504,6 +1505,7 @@ impl GpuRenderer {
             config,
             width,
             height,
+            image_budget: Self::image_budget_for(width, height),
             scale: 1.,
             target,
             view,
@@ -1729,6 +1731,7 @@ impl GpuRenderer {
         }
         self.width = width;
         self.height = height;
+        self.image_budget = Self::image_budget_for(width, height);
         self.spare = None;
         self.target_copy_bind = None;
         self.target = texture(&self.device, width, height, "retained output");
@@ -2777,7 +2780,8 @@ impl GpuRenderer {
                             };
                         self.ensure_image_budget(bytes).map_err(|_| {
                             GpuError(
-                                "visible image and native surface textures exceed 64 MiB".into(),
+                                format!("visible image and native surface textures exceed {} MiB",
+                                    self.image_budget / (1024 * 1024)),
                             )
                         })?;
                         if self.native_surfaces.is_none() {
@@ -4251,11 +4255,16 @@ impl GpuRenderer {
             self.image_textures.remove(&old);
         }
     }
+    // Four full-window RGBA textures allow layered HiDPI UI without unbounded caches.
+    fn image_budget_for(width: u32, height: u32) -> usize {
+        (width as usize).saturating_mul(height as usize).saturating_mul(16)
+            .clamp(64 * 1024 * 1024, 256 * 1024 * 1024)
+    }
     /// Reclaim uploads not sampled by this frame under pressure. Raster metadata
     /// and mounted images can recreate their textures when they become visible.
     fn ensure_image_budget(&mut self, bytes: usize) -> Result<(), GpuError> {
-        const BUDGET: usize = 64 * 1024 * 1024;
-        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > BUDGET {
+        let budget = self.image_budget;
+        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > budget {
             let retained = self.frame_image_ids.clone();
             self.images.retain(|id, _| retained.contains(id));
             self.image_textures.retain(|id, _| retained.contains(id));
@@ -4264,10 +4273,10 @@ impl GpuRenderer {
                 cache.retain(&retained);
             }
         }
-        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > BUDGET {
-            return Err(GpuError(
-                "visible image textures exceed the 64 MiB budget".into(),
-            ));
+        if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > budget {
+            return Err(GpuError(format!(
+                "visible image textures exceed the {} MiB budget", budget / (1024 * 1024)
+            )));
         }
         Ok(())
     }
