@@ -344,8 +344,9 @@ fn variable_list<K: Eq + std::hash::Hash + Clone + 'static>(
                 }
             });
             if scrollbar {
-                crate::compose_scrollbar::mount(
+                super::mount_scrollbar(
                     ui,
+                    &environment,
                     root,
                     offset.clone(),
                     size.clone(),

@@ -66,12 +66,15 @@ def main():
             key("r")
             screenshot=ImageGrab.grab(xdisplay=display)
             screenshot.save(args.output / f"scrollbars-{stage}.png")
-            thumb_colors=((94,165,255),(229,237,247))
-            vertical=[y for y in range(76,220) if screenshot.getpixel((origin_x+212,origin_y+y))[:3] in thumb_colors]
-            horizontal=[x for x in range(248,472) if screenshot.getpixel((origin_x+x,origin_y+136))[:3] in thumb_colors]
+            def is_thumb(pixel):
+                r, g, b = pixel[:3]
+                # White overlay at 20/35/50% on either blue example surface.
+                return r >= 70 and r <= g <= b and b - r < 30
+            vertical=[y for y in range(80,224) if is_thumb(screenshot.getpixel((origin_x+212,origin_y+y)))]
+            horizontal=[x for x in range(248,472) if is_thumb(screenshot.getpixel((origin_x+x,origin_y+139)))]
             samples.append({"stage":stage,"vertical_thumb_pixels":len(vertical),"horizontal_thumb_pixels":len(horizontal)})
             if stage==8:
-                empty_pixels = [screenshot.getpixel((origin_x+x,origin_y+y))[:3] for x,y in ((212,200),(460,136))]
+                empty_pixels = [screenshot.getpixel((origin_x+x,origin_y+y))[:3] for x,y in ((212,200),(460,139))]
                 if vertical or horizontal or any(pixel != (32,48,64) for pixel in empty_pixels):
                     raise AssertionError("scrollbar remained visible without overflow")
             elif len(vertical)<60 or len(horizontal)<74:
@@ -95,7 +98,7 @@ def main():
         report(5)
         key("Next")
         report(6)
-        drag(270,136,530,136)
+        drag(270,139,530,139)
         report(7)
         click(100,262)
         report(8)

@@ -5,7 +5,13 @@ use crate::{
     widgets::Ui,
 };
 
-pub(crate) fn mount(ui: &mut Ui, panel: NodeId, viewport: NodeId, content: NodeId) {
+pub(crate) fn mount(
+    ui: &mut Ui,
+    context: &mut crate::compose::Context,
+    panel: NodeId,
+    viewport: NodeId,
+    content: NodeId,
+) {
     // No explicit height: natural content sizes the menu until its maximum height
     // constrains this flex child. Shrinking content can then shrink the menu again.
     {
@@ -19,6 +25,21 @@ pub(crate) fn mount(ui: &mut Ui, panel: NodeId, viewport: NodeId, content: NodeI
     let size = ui.observe_content_size(viewport);
     let extent = ui.observe_content_size(content);
     let offset = ui.signal(0_f32);
+    let main_extent = ui.signal(extent.get().1);
+    let read = extent.clone();
+    let write = main_extent.clone();
+    ui.bind(viewport, move || {
+        write.set(read.get().1);
+    });
+    crate::compose_scrollbar::mount(
+        ui,
+        context,
+        viewport,
+        offset.clone(),
+        size.clone(),
+        main_extent,
+        false,
+    );
     let read_size = size.clone();
     let read_extent = extent.clone();
     let read_offset = offset.clone();

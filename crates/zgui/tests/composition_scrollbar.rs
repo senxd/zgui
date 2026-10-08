@@ -46,7 +46,7 @@ fn scrollbar_track_paging_thumb_capture_resize_and_cancel() {
     let bounds = ui.scene.borrow().bounds(bar);
     assert_eq!(
         (bounds.x, bounds.y, bounds.width, bounds.height),
-        (182., 10., 8., 100.)
+        (178., 10., 12., 100.)
     );
     down(&mut ui, 186., 90.);
     up(&mut ui, 186., 90.);
@@ -226,4 +226,175 @@ fn thumb_drag_survives_unrelated_button_release() {
     let settled = offset.get();
     ui.dispatch(InputEvent::PointerMove { x: 196., y: 100. });
     assert_eq!(offset.get(), settled);
+}
+
+#[test]
+fn scrollbars_are_default_for_both_axes_and_virtual_lists_with_explicit_opt_out() {
+    for horizontal in [false, true] {
+        let mut ui = Ui::new(500., 300.);
+        let offset = ui.signal(0.);
+        let view = if horizontal {
+            scroll_x(offset).size(200., 100.).child(div().w(600.))
+        } else {
+            scroll(offset).size(200., 100.).child(div().h(600.))
+        };
+        ui.mount(view);
+        ui.prepare_frame();
+        assert!(ui.semantics.borrow().get(bar(&ui)).is_some());
+    }
+    let mut ui = Ui::new(500., 300.);
+    let offset = ui.signal(0.);
+    ui.mount(
+        virtual_list(offset, 20., 1, || 100, |n| n, |_, n, _| text(n.to_string())).size(200., 100.),
+    );
+    ui.prepare_frame();
+    assert!(ui.semantics.borrow().get(bar(&ui)).is_some());
+
+    let mut ui = Ui::new(500., 300.);
+    let offset = ui.signal(0.);
+    ui.mount(
+        scroll(offset)
+            .size(200., 100.)
+            .scrollbar(false)
+            .child(div().h(600.)),
+    );
+    ui.prepare_frame();
+    assert!(
+        !ui.semantics
+            .borrow()
+            .iter()
+            .any(|(_, n)| n.role == Role::ScrollBar)
+    );
+}
+
+#[test]
+fn overlay_pill_keeps_content_width_and_grows_inward_during_hover_and_capture() {
+    use zgui::scene::{Color, NodeKind};
+    let mut ui = Ui::new(500., 300.);
+    let offset = ui.signal(0.);
+    let view = ui.mount(
+        scroll(offset)
+            .size(200., 100.)
+            .child(div().id("content").w_full().h(600.)),
+    );
+    ui.prepare_frame();
+    let track = bar(&ui);
+    let thumb = ui.scene.borrow().children(track)[0];
+    let pill = |ui: &Ui| {
+        let scene = ui.scene.borrow();
+        let NodeKind::Quad(quad) = scene.kind(thumb) else {
+            panic!("pill")
+        };
+        (scene.bounds(thumb), quad.fill, quad.radius)
+    };
+    let (rest, color, radius) = pill(&ui);
+    assert_eq!(
+        ui.scene
+            .borrow()
+            .bounds(view.find("content").unwrap())
+            .width,
+        200.
+    );
+    assert_eq!(
+        (rest.x, rest.y, rest.width, rest.height),
+        (193., 2., 4., 32.)
+    );
+    assert_eq!(color, Color(255, 255, 255, 0));
+    assert_eq!(radius, 2.);
+    ui.dispatch(InputEvent::PointerMove { x: 194., y: 10. });
+    ui.prepare_frame();
+    let (hover, color, radius) = pill(&ui);
+    assert_eq!((hover.x, hover.width), (191., 6.));
+    assert_eq!(hover.x + hover.width, rest.x + rest.width);
+    assert_eq!(color, Color(255, 255, 255, 89));
+    assert_eq!(radius, 3.);
+    down(&mut ui, 194., 10.);
+    ui.dispatch(InputEvent::PointerMove { x: 400., y: 50. });
+    ui.prepare_frame();
+    assert_eq!(pill(&ui).1, Color(255, 255, 255, 128));
+    assert_eq!(ui.input.captured(), Some(track));
+    up(&mut ui, 400., 50.);
+    ui.prepare_frame();
+    assert_eq!(pill(&ui).1.3, 0);
+}
+
+#[test]
+fn idle_fade_hover_growth_and_drag_hold_follow_the_display_clock() {
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+    use zgui::{
+        compose::TaskRunner,
+        frame::{Frame, FrameClock},
+        scene::NodeKind,
+        task::LocalExecutor,
+    };
+    let executor = Rc::new(RefCell::new(LocalExecutor::new()));
+    let frames = FrameClock::new();
+    let mut ui = Ui::new(500., 300.);
+    let offset = ui.signal(0.);
+    let view = ui.mount(provide(
+        TaskRunner::from_executor(executor.clone()),
+        provide(
+            frames.clone(),
+            scroll(offset.clone()).size(200., 100.).child(div().h(600.)),
+        ),
+    ));
+    ui.prepare_frame();
+    let track = bar(&ui);
+    let thumb = ui.scene.borrow().children(track)[0];
+    let sample = |ui: &Ui| {
+        let scene = ui.scene.borrow();
+        let NodeKind::Quad(q) = scene.kind(thumb) else {
+            panic!("pill")
+        };
+        (q.fill.3, scene.bounds(thumb).width)
+    };
+    let mut time = Instant::now();
+    let mut index = 0;
+    let mut advance = |ui: &mut Ui, millis: u64| {
+        executor.borrow_mut().tick();
+        time += Duration::from_millis(millis);
+        index += 1;
+        frames.deliver(Frame {
+            index,
+            time,
+            interval: Duration::from_millis(16),
+        });
+        executor.borrow_mut().tick();
+        ui.prepare_frame();
+    };
+    assert_eq!(sample(&ui), (0, 4.));
+    offset.set(100.);
+    advance(&mut ui, 45);
+    assert!((24..=27).contains(&sample(&ui).0));
+    advance(&mut ui, 50);
+    assert_eq!(sample(&ui), (51, 4.));
+    advance(&mut ui, 695);
+    assert_eq!(sample(&ui).0, 51);
+    advance(&mut ui, 110);
+    assert!((24..=27).contains(&sample(&ui).0));
+    advance(&mut ui, 110);
+    assert_eq!(sample(&ui).0, 0);
+    assert!(!frames.wants_frame());
+    ui.dispatch(InputEvent::PointerMove { x: 194., y: 35. });
+    advance(&mut ui, 70);
+    assert!(sample(&ui).1 > 4. && sample(&ui).1 < 6.);
+    advance(&mut ui, 80);
+    assert_eq!(sample(&ui), (89, 6.));
+    down(&mut ui, 194., 35.);
+    advance(&mut ui, 100);
+    assert_eq!(sample(&ui), (128, 6.));
+    ui.dispatch(InputEvent::PointerMove { x: 400., y: 50. });
+    advance(&mut ui, 1100);
+    assert_eq!(sample(&ui), (128, 6.));
+    assert_eq!(ui.input.captured(), Some(track));
+    up(&mut ui, 400., 50.);
+    advance(&mut ui, 1100);
+    assert_eq!(sample(&ui), (0, 4.));
+    view.unmount();
+    executor.borrow_mut().tick();
+    assert!(!frames.wants_frame());
 }

@@ -372,7 +372,7 @@ impl View {
             scroll_progress: None,
         }
     }
-    /// Show an interactive overlay scrollbar on a scroll viewport or virtual list.
+    /// Overlay scrollbars are enabled by default; pass false to hide one.
     pub fn scrollbar(mut self, visible: bool) -> Self {
         self.scrollbar = Some(visible);
         self
@@ -1051,8 +1051,9 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                 }
             });
             if scrollbar {
-                crate::compose_scrollbar::mount(
+                mount_scrollbar(
                     ui,
+                    &environment,
                     root,
                     offset.clone(),
                     size.clone(),
@@ -1499,7 +1500,9 @@ fn mount_portal(
         for child in menu_children {
             mount(ui, content, child, environment.clone());
         }
-        crate::compose_menu_scroll::mount(ui, panel, viewport, content);
+        let mut scrollbar_context = Context::new(ui.runtime.clone(), environment.clone());
+        crate::compose_menu_scroll::mount(ui, &mut scrollbar_context, panel, viewport, content);
+        scrollbar_context.finish(ui, viewport);
         crate::compose_menu::mount(
             ui,
             panel,
@@ -1575,7 +1578,7 @@ fn mount_element(
         view.scrollbar.is_none() || matches!(kind, Kind::Scroll { .. } | Kind::VirtualList(_)),
         "scrollbar is only supported on scroll, scroll_x, and virtual_list views"
     );
-    let scrollbar = view.scrollbar.unwrap_or(false);
+    let scrollbar = view.scrollbar.unwrap_or(true);
     // Decorated/padded text gets an actual layout box. Plain text stays a single
     // node, keeping common reactive labels small. Dynamic/state styles may add
     // decoration later, so reserve that box at mount rather than remount on hover.
@@ -2249,6 +2252,7 @@ fn mount_element(
             horizontal,
             scrollbar,
             view.scroll_progress,
+            &environment,
         );
     }
     if let Some(mut compute) = compute {
@@ -2311,6 +2315,7 @@ fn mount_scroll(
     horizontal: bool,
     scrollbar: bool,
     progress: Option<Signal<f32>>,
+    environment: &Environment,
 ) {
     use crate::scene::{Style, Transform};
     let main_size = move |size: (f32, f32)| if horizontal { size.0 } else { size.1 };
@@ -2330,8 +2335,9 @@ fn mount_scroll(
         ui.bind(root, move || {
             write_extent.set(main_size(read_extent.get()));
         });
-        crate::compose_scrollbar::mount(
+        mount_scrollbar(
             ui,
+            environment,
             root,
             offset.clone(),
             size.clone(),
@@ -3278,4 +3284,18 @@ pub use codegen::CompiledSource;
 impl View {
     /// Replace an imported component's contents without changing its source styling.
     pub fn without_children(mut self) -> Self { self.children.clear(); self }
+}
+
+fn mount_scrollbar(
+    ui: &mut Ui,
+    environment: &Environment,
+    owner: NodeId,
+    offset: Signal<f32>,
+    size: Signal<(f32, f32)>,
+    extent: Signal<f32>,
+    horizontal: bool,
+) {
+    let mut cx = Context::new(ui.runtime.clone(), environment.clone());
+    crate::compose_scrollbar::mount(ui, &mut cx, owner, offset, size, extent, horizontal);
+    cx.finish(ui, owner);
 }
