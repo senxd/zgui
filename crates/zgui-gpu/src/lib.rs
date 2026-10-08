@@ -4365,6 +4365,7 @@ impl GpuRenderer {
                 &mut encoder,
                 &self.context.inner.texture_layout,
                 image,
+                self.image_budget,
             );
             profiling::Profiler::end(&mut encoder, stamp);
             self.procedural_encoder = Some(encoder);

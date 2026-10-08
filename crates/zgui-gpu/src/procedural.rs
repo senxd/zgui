@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 use wgpu::util::DeviceExt;
+#[cfg(test)]
 const BUDGET: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
@@ -31,10 +32,10 @@ fn candidate(entries: &[Instance], revision: u64, live: &HashSet<u64>) -> Option
         .position(|e| e.revision == revision)
         .or_else(|| entries.iter().position(|e| !live.contains(&e.revision)))
 }
-fn fits(used: usize, replaced: usize, requested: usize) -> bool {
+fn fits(used: usize, replaced: usize, requested: usize, budget: usize) -> bool {
     used.saturating_sub(replaced)
         .checked_add(requested)
-        .is_some_and(|bytes| bytes <= BUDGET)
+        .is_some_and(|bytes| bytes <= budget)
 }
 impl Cache {
     // Keep live immutable snapshots and one recyclable slot per instance.
@@ -58,7 +59,7 @@ impl Cache {
     pub fn bytes(&self) -> usize {
         self.instances.values().flatten().map(Instance::bytes).sum()
     }
-    fn reserve_capacity(&mut self, data: &zgui::image::ImageData) -> Result<(), &'static str> {
+    fn reserve_capacity(&mut self, data: &zgui::image::ImageData, budget: usize) -> Result<(), &'static str> {
         let image = data.procedural().expect("procedural source");
         let requested =
             data.width() as usize * data.height() as usize * 4 + image.parameters.len() * 4;
@@ -74,7 +75,7 @@ impl Cache {
         let existing = replaced(self);
         // Animated uniforms normally keep the allocation unchanged. The
         // already-bounded cache cannot grow, so avoid scanning every instance.
-        if requested <= existing || fits(self.bytes(), existing, requested) {
+        if requested <= existing || fits(self.bytes(), existing, requested, budget) {
             return Ok(());
         }
         // Retired snapshots are only recycling spares; discard them before
@@ -83,10 +84,10 @@ impl Cache {
             entries.retain(|entry| self.live.contains(&entry.revision));
             !entries.is_empty()
         });
-        if fits(self.bytes(), replaced(self), requested) {
+        if fits(self.bytes(), replaced(self), requested, budget) {
             Ok(())
         } else {
-            Err("procedural image resources exceed the 64 MiB budget")
+            Err("procedural image resources exceed the renderer image budget")
         }
     }
     pub fn render(
@@ -96,8 +97,9 @@ impl Cache {
         encoder: &mut wgpu::CommandEncoder,
         display_layout: &wgpu::BindGroupLayout,
         data: &zgui::image::ImageData,
+        budget: usize,
     ) -> Result<(wgpu::Texture, wgpu::BindGroup), &'static str> {
-        self.reserve_capacity(data)?;
+        self.reserve_capacity(data, budget)?;
         let revision = data.id();
         let width = data.width();
         let height = data.height();
@@ -224,10 +226,10 @@ mod tests {
     use super::*;
     #[test]
     fn aggregate_capacity_counts_uniform_buffers_and_replaced_resources() {
-        assert!(fits(32 * 1024 * 1024, 0, 32 * 1024 * 1024));
-        assert!(!fits(32 * 1024 * 1024 + 4, 0, 32 * 1024 * 1024));
-        assert!(fits(48 * 1024 * 1024, 32 * 1024 * 1024, 40 * 1024 * 1024));
-        assert!(!fits(48 * 1024 * 1024, 8 * 1024 * 1024, 40 * 1024 * 1024));
-        assert!(!fits(usize::MAX, 0, usize::MAX));
+        assert!(fits(32 * 1024 * 1024, 0, 32 * 1024 * 1024, BUDGET));
+        assert!(!fits(32 * 1024 * 1024 + 4, 0, 32 * 1024 * 1024, BUDGET));
+        assert!(fits(48 * 1024 * 1024, 32 * 1024 * 1024, 40 * 1024 * 1024, BUDGET));
+        assert!(!fits(48 * 1024 * 1024, 8 * 1024 * 1024, 40 * 1024 * 1024, BUDGET));
+        assert!(!fits(usize::MAX, 0, usize::MAX, BUDGET));
     }
 }
