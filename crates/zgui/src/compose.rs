@@ -282,6 +282,7 @@ pub struct View {
     menu_trigger: Option<Signal<bool>>,
     menu_checked: Option<bool>,
     visibility: Vec<Signal<bool>>,
+    bounds: Vec<Signal<crate::scene::Rect>>,
     layout_motion: Option<crate::motion::Transition>,
     layout_id: Option<String>,
     scroll_progress: Option<Signal<f32>>,
@@ -365,6 +366,7 @@ impl View {
             menu_trigger: None,
             menu_checked: None,
             visibility: Vec::new(),
+            bounds: Vec::new(),
             layout_motion: None,
             layout_id: None,
             scroll_progress: None,
@@ -379,6 +381,11 @@ impl View {
     /// updates on geometry/presentation changes, without per-frame scene walks.
     pub fn observe_visibility(mut self, visible: Signal<bool>) -> Self {
         self.visibility.push(visible);
+        self
+    }
+    /// Observe settled world bounds, published by layout without per-frame scene walks.
+    pub fn observe_bounds(mut self, bounds: Signal<crate::scene::Rect>) -> Self {
+        self.bounds.push(bounds);
         self
     }
     /// Project from previous layout position and size without per-frame layout.
@@ -538,6 +545,7 @@ impl View {
     // Wrapper properties refine the component's actual root without an extra layout box.
     fn refine(self, mut inner: View) -> View {
         inner.visibility.extend(self.visibility);
+        inner.bounds.extend(self.bounds);
         inner.layout_motion = self.layout_motion.or(inner.layout_motion);
         inner.layout_id = self.layout_id.or(inner.layout_id);
         inner.scroll_progress = self.scroll_progress.or(inner.scroll_progress);
@@ -2278,6 +2286,16 @@ fn mount_element(
             let presented = presented.get();
             for observer in &observers {
                 observer.set(visible && presented);
+            }
+        });
+    }
+    if !view.bounds.is_empty() {
+        let bounds = ui.observe_bounds(root);
+        let observers = view.bounds;
+        ui.bind(root, move || {
+            let bounds = bounds.get();
+            for observer in &observers {
+                observer.set(bounds);
             }
         });
     }
