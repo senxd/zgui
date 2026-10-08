@@ -18,7 +18,7 @@ use zgui_gpu::GpuRenderer;
 #[test]
 fn scrollbar_design_gpu_playback_and_pen_master_parity() {
     let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../artifacts/scrollbar");
+        .join("../../../artifacts/scrollbar");
     std::fs::create_dir_all(&output).unwrap();
     for width in [240., 400.] {
         for scale in [1., 1.5, 2.] {
