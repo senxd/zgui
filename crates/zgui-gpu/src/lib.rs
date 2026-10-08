@@ -1210,8 +1210,6 @@ pub struct GpuRenderer {
     /// resized or restyled node gets a new raster; the old texture goes at
     /// once instead of waiting for a structural prune.
     node_images: FxHashMap<NodeId, u64>,
-    /// Mounted direct images and their chain inputs, rebuilt on content changes.
-    direct_image_ids: std::collections::HashSet<u64>,
     /// Textures referenced by draws already assembled during this outer frame.
     frame_image_ids: std::collections::HashSet<u64>,
     /// The viewport of the target currently being rendered.
@@ -1489,7 +1487,6 @@ impl GpuRenderer {
             pending: RefCell::new(None),
             viewports: FxHashMap::default(),
             node_images: FxHashMap::default(),
-            direct_image_ids: Default::default(),
             frame_image_ids: Default::default(),
             viewport_bind: None,
             belt: RefCell::new(wgpu::util::StagingBelt::new(device.clone(), 256 * 1024)),
@@ -2003,7 +2000,6 @@ impl GpuRenderer {
                 snapshots.insert(frame.id());
             }
         }
-        self.direct_image_ids.clone_from(&snapshots);
         self.procedural.retain(snapshots.clone(), &instances);
         self.chain_cache.retain(snapshots.clone(), &chains);
         self.node_images.retain(|id, _| scene.contains(*id));
@@ -4257,12 +4253,11 @@ impl GpuRenderer {
     }
     /// Metadata caches evict rasters independently of scene content revisions.
     /// Reclaim their orphan uploads only under pressure, keeping assembled draws
-    /// and mounted direct/chain images intact.
+    /// intact. Mounted offscreen images can upload again when they become visible.
     fn ensure_image_budget(&mut self, bytes: usize) -> Result<(), GpuError> {
         const BUDGET: usize = 64 * 1024 * 1024;
         if bytes + self.images.values().map(|entry| entry.1).sum::<usize>() > BUDGET {
-            let mut retained = self.direct_image_ids.clone();
-            retained.extend(self.frame_image_ids.iter().copied());
+            let mut retained = self.frame_image_ids.clone();
             retained.extend(self.canvases.image_ids());
             retained.extend(self.svgs.image_ids());
             self.images.retain(|id, _| retained.contains(id));
